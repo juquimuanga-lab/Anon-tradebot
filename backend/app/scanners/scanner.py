@@ -38,13 +38,13 @@ class ScannerService:
         try:
             meta = await self._solscan.get_token_meta(token.mint)
         except SolscanAPIError as exc:
-            metrics.error_count += 1
+            metrics.degraded_count += 1
             logger.warning("solscan_meta_failed", extra={"mint": token.mint, "error": str(exc)})
             meta = None
         try:
             holders = await self._solscan.get_token_holders(token.mint)
         except SolscanAPIError as exc:
-            metrics.error_count += 1
+            metrics.degraded_count += 1
             logger.warning("solscan_holders_failed", extra={"mint": token.mint, "error": str(exc)})
             holders = None
         return apply_solscan_enrichment(token, meta, holders)
