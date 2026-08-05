@@ -1,0 +1,15 @@
+fastapi
+uvicorn[standard]
+python-telegram-bot[job-queue]>=21,<22
+httpx
+sqlalchemy>=2.0
+aiosqlite
+greenlet
+pydantic>=2
+pydantic-settings
+cryptography
+python-dotenv
+tenacity
+pytest
+pytest-asyncio
+respx

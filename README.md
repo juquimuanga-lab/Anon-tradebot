@@ -1,1 +1,144 @@
-# Anon-tradebot
+# Anoncoin Sniper Bot
+
+A Telegram-controlled trading assistant for the Anoncoin.it ecosystem. It watches
+newly created tokens, enriches them with Solscan on-chain data, applies your
+rules, and (once Anoncoin ships a public trade-execution endpoint) places
+automated buys/sells through your Anoncoin profile API key. **Paper trading
+works today end-to-end; live trading is intentionally isolated and blocked
+until Anoncoin publishes a real trade endpoint (see "Known upstream
+limitation" below).**
+
+## Why some things are simulated right now
+
+At the time this was built, Anoncoin's public docs (`docs.anoncoin.it`) marked
+`Coins`, `Coin Details`, `My Profile`, and `Create Coin` as **"Coming Soon"**,
+and there is **no documented buy/sell trade endpoint at all**. So the bot:
+
+- Tries the real Anoncoin discovery/detail endpoints first.
+- Falls back to a clearly-labelled simulated token feed (`source=mock_simulated`,
+  every Telegram alert prefixed `[SIMULATED]`) so scanning, scoring, paper
+  trading, and position management all work end to end today.
+- Isolates trade execution behind `app/execution/` so a real
+  `ANONCOIN_TRADE_ENDPOINT` can be plugged in later without touching
+  scanning, scoring, or Telegram code at all.
+- Never fakes a live fill: if you switch to `/live` and Anoncoin still hasn't
+  published a trade endpoint, buys/sells fail loudly with a clear Telegram
+  message instead of pretending to succeed.
+
+## Architecture
+
+```
+app/
+  bot/          Telegram command handlers, /setrule wizard, confirmations, notifications
+  config/       Pydantic settings (env-driven)
+  connectors/   Anoncoin + Solscan HTTP clients
+  scanners/     Launch detection loop, mock fallback feed, normalization
+  scoring/      Rule schema, hard filters, weighted scoring model
+  execution/    Execution adapter interface + paper/live implementations
+  positions/    Open-position monitoring, TP/SL/trailing/time exits
+  storage/      SQLAlchemy models + repository helpers (SQLite)
+  security/     Secret encryption, redaction, admin allowlist
+server.py       FastAPI app: embeds the Telegram bot (polling) + /api/health, /api/metrics
+```
+
+## Security model
+
+- All secrets (Telegram token, Anoncoin key, Solscan key, encryption key) come
+  from environment variables only - never hardcoded.
+- The Anoncoin API key can also be set at runtime via `/connect` in Telegram;
+  it is encrypted with Fernet (`SECRET_ENCRYPTION_KEY`) and stored in SQLite.
+  The message containing your raw key is deleted immediately after storage.
+- A logging filter redacts anything that looks like a bot token, JWT, or long
+  API key from every log line before it's written.
+- Telegram messages never include raw keys - only a masked `****last4` on
+  confirmation.
+- Admin-only commands (`/connect`, `/setrule`, `/enable`, `/disable`,
+  `/paper`, `/live`, manual position close) are restricted to the numeric
+  Telegram user IDs in `TELEGRAM_ADMIN_IDS`. Everyone else gets read-only
+  commands (`/status`, `/rules`, `/balance`, `/positions`, `/history`).
+- Destructive actions (`/disable`, `/paper`, `/live`, manual close, rule
+  activation) require an inline-button confirmation that expires in 2 minutes.
+
+## Setup
+
+1. `cp .env.example backend/.env` and fill in:
+   - `TELEGRAM_BOT_TOKEN` - from @BotFather.
+   - `TELEGRAM_ADMIN_IDS` - your numeric Telegram user ID(s) from @userinfobot.
+   - `SOLSCAN_API_KEY` - from solscan.io -> Account -> API Management.
+   - `ANONCOIN_API_KEY` - optional here; you can also set it later from
+     Telegram with `/connect`.
+   - `SECRET_ENCRYPTION_KEY` - generate with:
+     `python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"`
+2. Install dependencies: `pip install -r backend/requirements.txt`
+3. Run: `cd backend && uvicorn server:app --host 0.0.0.0 --port 8001`
+
+The bot starts in **paper trading mode** by default. Talk to your bot on
+Telegram and send `/start`, then `/setrule` to create your first rule set,
+then watch `/status` and `/positions`.
+
+## Running with Docker
+
+```bash
+cp .env.example .env   # fill in the same values as above
+docker compose up --build
+```
+
+## Telegram commands
+
+Read-only (anyone can use): `/status`, `/rules`, `/listrules`, `/balance`,
+`/positions`, `/history`, `/help`.
+
+Admin-only (`TELEGRAM_ADMIN_IDS`): `/connect`, `/setrule`, `/enable`,
+`/disable`, `/paper`, `/live`, `/positions close <id>`.
+
+`/setrule` walks you through all 18 parameters step by step (max buy size,
+min liquidity, min holders, max age, creator allow/denylist, bonding curve
+phase, market cap range, max slippage, max trades/hour, cooldown, take-profit
+levels, stop loss, trailing stop, sell-on-volume-drop, time-based exit) with
+`/skip` for optional fields and `/cancel` anytime.
+
+## Paper mode first
+
+**Always validate your rules in paper mode before going live.** `/paper` is
+the default. `/live` requires an explicit confirmation and - since Anoncoin
+has not published a trade endpoint yet - will currently fail safely on any
+real buy/sell attempt rather than risk funds.
+
+## Creator watchlist
+
+`CREATOR_WATCHLIST` (comma-separated wallet addresses) gets a scoring bonus
+when a new token's creator wallet matches. It defaults to:
+`7AbRGzM3NBvvUXi7j1Mga2SraTfjpPBMzGpyHcXSzV3v`.
+
+## Tests
+
+```bash
+cd backend
+pytest -q
+```
+
+Covers rule hard-filter evaluation, the weighted scoring model, the Anoncoin
+and Solscan connectors against mocked HTTP responses (respx), and the paper
+execution adapter.
+
+## Observability
+
+- `GET /api/health` - mode, trading_enabled.
+- `GET /api/metrics` - tokens scanned/qualified, trades placed, win rate,
+  total PnL, error count.
+- A minimal read-only status dashboard (React) polls both endpoints every 5s.
+- A daily summary is posted to Telegram admins at `DAILY_SUMMARY_HOUR_UTC`.
+
+## Known upstream limitations (as of writing)
+
+- Anoncoin's `coins`, `coin-details`, `my-profile`, and `create-coin`
+  endpoints are marked "Coming Soon" in their public docs -> the bot falls
+  back to a simulated feed, clearly labelled, until Anoncoin ships them.
+- Anoncoin has no public buy/sell trade endpoint -> live execution is stubbed
+  behind `app/execution/anoncoin_live.py` and fails safely with a clear
+  message until `ANONCOIN_TRADE_ENDPOINT` is configured.
+- The provided Solscan key authenticates against `pro-api.solscan.io` but
+  its plan does not include `token/meta` / `token/holders` (401 "please
+  upgrade your api key level"). The bot logs this as a warning and continues
+  with Anoncoin-only data; upgrading the Solscan plan unlocks full enrichment
+  with no code changes.
