@@ -54,6 +54,13 @@ class ScannerService:
         if not state.trading_enabled:
             return
 
+        if state.mode == "live" and token.source == "mock_simulated":
+            await repo.save_trade_decision(
+                token.mint, rule_row.id, "skip",
+                "simulated token has no real on-chain mint - skipped in live mode", score_result.score,
+            )
+            return
+
         if await repo.has_open_or_pending_position(token.mint):
             return
 
