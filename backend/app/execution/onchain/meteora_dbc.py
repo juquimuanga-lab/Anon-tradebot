@@ -48,3 +48,25 @@ async def build_unsigned_swap(
     if not result.get("success"):
         raise DbcBuildError(result.get("error", "unknown Meteora DBC build error"))
     return result
+
+
+async def get_pool_info(base_mint: str, rpc_url: str) -> dict:
+    proc = await asyncio.create_subprocess_exec(
+        "node",
+        "pool_info.js",
+        cwd=_BUILDER_DIR,
+        stdin=asyncio.subprocess.PIPE,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    payload = json.dumps({"baseMint": base_mint, "rpcUrl": rpc_url}).encode()
+    stdout, stderr = await asyncio.wait_for(proc.communicate(payload), timeout=30)
+
+    if not stdout.strip():
+        raise DbcBuildError(f"pool_info produced no output (stderr: {stderr.decode()[:300]})")
+
+    last_line = stdout.decode().strip().splitlines()[-1]
+    result = json.loads(last_line)
+    if not result.get("success"):
+        raise DbcBuildError(result.get("error", "unknown Meteora DBC pool_info error"))
+    return result

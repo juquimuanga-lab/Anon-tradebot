@@ -25,6 +25,40 @@ and there is **no documented buy/sell trade endpoint at all**. So the bot:
   published a trade endpoint, buys/sells fail loudly with a clear Telegram
   message instead of pretending to succeed.
 
+## Real launch detection today (no Anoncoin API, no Solscan upgrade needed)
+
+Anoncoin's discovery API isn't live, and the Solscan key's plan returns 401
+"please upgrade your api key level" on **every** `pro-api.solscan.io/v2.0`
+endpoint (confirmed - not just token/meta/holders). So the bot watches
+`CREATOR_WATCHLIST` wallets directly on-chain, for free, via the public
+Solana RPC:
+
+- `app/scanners/onchain_watcher.py` polls `getSignaturesForAddress` for each
+  watched wallet and diffs `preTokenBalances`/`postTokenBalances` on each new
+  transaction to spot freshly-created SPL mints - this is exactly how a new
+  Anoncoin pool creation shows up on-chain (confirmed by inspecting real
+  transactions from `7AbRGz...V3v`, which fires
+  `InitializeVirtualPoolWithToken2022` on Meteora's DBC program for every new
+  Anoncoin token).
+- For each newly detected mint, `app/execution/onchain/dbc_builder/pool_info.js`
+  reads the live Meteora DBC pool account (price, reserves, supply,
+  migration status) directly from chain - no Anoncoin/Solscan call needed.
+- SOL amounts are converted to USD via Jupiter's free price API so existing
+  USD-denominated rules (min liquidity, market cap, etc.) work unmodified.
+- Freshly-detected tokens are re-screened every scan cycle (not just once)
+  for up to `max_age_seconds`, since a bonding-curve pool starts at ~0
+  liquidity and only qualifies once real buys start flowing in.
+- Tokens sourced this way get `source=anoncoin_onchain` (real, not
+  `[SIMULATED]`) and can trigger real paper or live trades.
+- The bot only alerts on launches that happen *after* it starts watching -
+  it does not backfill each wallet's full history on first boot.
+- The free public RPC can rate-limit under bursty activity; if you see
+  frequent `get_transaction_failed` warnings, set `SOLANA_RPC_URL` to a
+  dedicated provider (Helius/QuickNode/Triton) for more reliable detection.
+
+Anoncoin's own discovery API (once live) and the simulated feed remain as
+fallbacks/demo data for everything outside the watched wallets.
+
 ## Live trading: two ways to execute
 
 1. **Anoncoin trade API (future)** - isolated in `app/execution/`, ready the
@@ -169,7 +203,9 @@ execution adapter.
   still be added later behind the same adapter interface with no changes
   elsewhere.
 - The provided Solscan key authenticates against `pro-api.solscan.io` but
-  its plan does not include `token/meta` / `token/holders` (401 "please
-  upgrade your api key level"). The bot logs this as a warning and continues
-  with Anoncoin-only data; upgrading the Solscan plan unlocks full enrichment
-  with no code changes.
+  its plan blocks every v2.0 endpoint tested, including `token/meta`,
+  `token/holders`, `account/transactions`, and `account/defi/activities`
+  (all return 401 "please upgrade your api key level"). Real launch
+  detection therefore comes from watching wallets on-chain (see above)
+  instead of Solscan; enrichment (holders/meta) stays degraded until the
+  plan is upgraded, with no code changes needed once it is.

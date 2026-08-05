@@ -1,0 +1,22 @@
+{
+  "summary": "Third test pass focused on new on-chain launch detection feature (onchain_watcher, price_feed, pool_info.js sidecar). All 41 pytest tests pass. /api/health and /api/metrics return expected JSON shape. Backend has been running stably ~7 min post-hot-reload with periodic scan cycles hitting real Solana mainnet RPC and no tracebacks/crash loops. Node.js pool_info.js sidecar returns real mainnet DBC pool data (success:true with all numeric fields incl. price_sol_per_token, supply_tokens, market_cap_sol, quote_reserve_sol, is_migrated) for the known mainnet pool BPQQsb... Real poll_new_mints() against watched wallet 7AbRGzM... returns [] cleanly (no new mints since watermark, no exception). Telegram bot getMe returns ok:true, username anoncoinsniper_bot. No raw secrets (Telegram token, Anoncoin key, Solscan key, wallet private key) found in supervisor logs. Frontend status_terminal dashboard renders correctly with live metrics (MODE PAPER, TRADING ENABLED, TOKENS SCANNED 8) - no regression. pool_info.js, build_tx.js, and node_modules all present in dbc_builder folder.",
+  "backend_issues": {"critical": [], "minor": []},
+  "frontend_issues": {"ui_bugs": [], "integration_issues": [], "design_issues": []},
+  "test_report_links": [
+    "/app/backend/tests/test_onchain_watcher.py",
+    "/app/backend/tests/test_price_feed.py",
+    "/app/test_reports/pytest/pytest_results.xml"
+  ],
+  "action_items": [],
+  "critical_code_review_comments": [
+    "Non-blocking: scanner still fires solscan_meta_failed / solscan_holders_failed warnings every cycle (Solscan plan returns 401 - known/expected per problem statement). Consider gating those calls behind a config flag or backing them off after N consecutive 401s to reduce log noise.",
+    "Non-blocking: uvicorn --reload picked up onchain_watcher.py changes and restarted a few times before settling; production deployment should not run with --reload."
+  ],
+  "updated_files": [],
+  "success_rate": {"backend": "100%", "frontend": "100%"},
+  "test_credentials": "N/A - Telegram-controlled, no web auth",
+  "seed_data_creation": "None",
+  "retest_needed": false,
+  "main_agent_can_self_test": true,
+  "context_for_next_testing_agent": "All 3 iterations green. On-chain detection stack (Python watcher + Node sidecar + Jupiter price feed) is verified against real mainnet. Watched wallet 7AbRGzM3NBvvUXi7j1Mga2SraTfjpPBMzGpyHcXSzV3v is live and polled every ~30s. Trading mode remains 'paper' by default - no live buy path was exercised. If retesting, remember Solscan 401 warnings are expected noise, not bugs."
+}

@@ -52,7 +52,6 @@ class JupiterClient:
         if resp.status_code != 200:
             raise JupiterError(f"swap build failed with status {resp.status_code}")
         return resp.json()
-
     async def build_unsigned_swap(
         self, input_mint: str, output_mint: str, amount: int, slippage_bps: int, user_pubkey: str
     ) -> dict:

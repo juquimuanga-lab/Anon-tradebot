@@ -45,7 +45,8 @@ class Settings(BaseSettings):
 
     # On-chain wallet execution
     solana_rpc_url: str = "https://api.mainnet-beta.solana.com"
-    jupiter_base_url: str = "https://quote-api.jup.ag/v6"
+    jupiter_base_url: str = "https://lite-api.jup.ag/swap/v1"
+    jupiter_price_url: str = "https://lite-api.jup.ag/price/v3"
     default_slippage_bps: int = 300
 
     # Timers
