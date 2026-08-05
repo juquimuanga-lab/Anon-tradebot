@@ -80,6 +80,12 @@ the primary control surface.
 - Multi-user / multi-account rule sets not implemented (one active rule set
   at a time; wallets ARE per-admin already).
 
+## Ops note
+- Wallet private keys and the Anoncoin API key share the same
+  `SECRET_ENCRYPTION_KEY` (Fernet). Rotating that key means every connected
+  admin wallet and the Anoncoin key must be re-registered via
+  `/connectwallet` / `/connect` afterwards.
+
 ## Next tasks
 - User to message @anoncoinsniper_bot on Telegram and run through /start,
   /setrule, /connectwallet, /paper, /status themselves to confirm the live
