@@ -13,3 +13,6 @@ tenacity
 pytest
 pytest-asyncio
 respx
+solders
+solana
+base58

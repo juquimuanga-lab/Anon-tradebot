@@ -67,7 +67,28 @@ the primary control surface.
 - Docker support (`backend/Dockerfile`, root `docker-compose.yml`), `.env.example`.
 
 ## Known limitations / backlog
-- Live trading cannot place real orders until Anoncoin publishes a trade
+- Wallet-based live execution against Meteora DBC has NOT been exercised
+  against a real live pool end-to-end (no real Anoncoin token was available
+  to test against, and doing so would require spending real SOL) - the
+  Node.js builder was validated to run cleanly and return clean errors for a
+  non-existent pool; a real fire-drill with a small amount on a genuine
+  Anoncoin launch is recommended before trusting it with meaningful size.
+- Solscan enrichment is degraded until the user's Solscan plan is upgraded.
+- Telegram interaction flows could not be end-to-end tested by an automated
+  agent (no Telegram user session available to simulate incoming commands) -
+  code-level tests + manual verification of bot liveness (getMe) done instead.
+- Multi-user / multi-account rule sets not implemented (one active rule set
+  at a time; wallets ARE per-admin already).
+
+## Next tasks
+- User to message @anoncoinsniper_bot on Telegram and run through /start,
+  /setrule, /connectwallet, /paper, /status themselves to confirm the live
+  Telegram UX.
+- Do a small real-money fire-drill (tiny SOL amount) on /live once a genuine
+  Anoncoin pre-graduation token is available, to validate the Meteora DBC
+  path end-to-end on-chain.
+- Consider upgrading Solscan plan for full token/meta + holders enrichment.
+hes a trade
   endpoint (isolated adapter ready to receive it via `ANONCOIN_TRADE_ENDPOINT`).
 - Solscan enrichment is degraded until the user's Solscan plan is upgraded.
 - Telegram interaction flows could not be end-to-end tested by an automated

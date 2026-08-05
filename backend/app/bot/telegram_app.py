@@ -8,7 +8,7 @@ from telegram.ext import (
     filters,
 )
 
-from app.bot import handlers_admin, handlers_basic
+from app.bot import handlers_admin, handlers_basic, handlers_wallet
 from app.bot.setrule_wizard import COLLECTING, setrule_collect, setrule_start
 from app.config.settings import settings
 
@@ -29,6 +29,7 @@ def build_application() -> Application:
     application.add_handler(CommandHandler("disable", handlers_admin.disable_cmd))
     application.add_handler(CommandHandler("paper", handlers_admin.paper_cmd))
     application.add_handler(CommandHandler("live", handlers_admin.live_cmd))
+    application.add_handler(CommandHandler("disconnectwallet", handlers_wallet.disconnectwallet_cmd))
 
     connect_conv = ConversationHandler(
         entry_points=[CommandHandler("connect", handlers_admin.connect_start)],
@@ -41,6 +42,18 @@ def build_application() -> Application:
         name="connect_conversation",
     )
     application.add_handler(connect_conv)
+
+    connectwallet_conv = ConversationHandler(
+        entry_points=[CommandHandler("connectwallet", handlers_wallet.connectwallet_start)],
+        states={
+            handlers_wallet.CONNECT_WALLET_WAITING: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND | filters.Regex("^/cancel$"), handlers_wallet.connectwallet_receive)
+            ]
+        },
+        fallbacks=[CommandHandler("cancel", handlers_wallet.connectwallet_receive)],
+        name="connectwallet_conversation",
+    )
+    application.add_handler(connectwallet_conv)
 
     setrule_conv = ConversationHandler(
         entry_points=[CommandHandler("setrule", setrule_start)],

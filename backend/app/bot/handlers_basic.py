@@ -19,6 +19,8 @@ HELP_TEXT = (
     "/help - this message\n\n"
     "*Admin only:*\n"
     "/connect - register your Anoncoin API key\n"
+    "/connectwallet - register a wallet for live on-chain trading (base58 or JSON key)\n"
+    "/disconnectwallet - remove your stored wallet key (confirm)\n"
     "/setrule - create a rule set step by step\n"
     "/enable - resume automated trading\n"
     "/disable - pause automated trading (confirm)\n"
@@ -50,6 +52,9 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     anoncoin_connected = "yes" if anoncoin_key else "no (use /connect)"
     solscan_connected = "yes" if settings.solscan_api_key else "no"
 
+    wallet_key = await secrets_manager.get_wallet_private_key(update.effective_user.id)
+    wallet_line = "connected (use /balance to check funds)" if wallet_key else "not connected (use /connectwallet for live trading)"
+
     rule_line = f"`{active_rule.name}` (id {active_rule.id})" if active_rule else "none - use /setrule"
     recent_lines = "\n".join(
         f"  - {o.side} {o.mint[:6]}... [{o.status}]" for o in orders
@@ -59,6 +64,7 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         f"*Mode:* {state.mode} | *Trading enabled:* {state.trading_enabled}\n"
         f"*Active rule:* {rule_line}\n"
         f"*Connected APIs:* Anoncoin: {anoncoin_connected}, Solscan: {solscan_connected}\n"
+        f"*Your wallet:* {wallet_line}\n"
         f"*Paper balance:* {state.paper_balance_sol:.3f} SOL\n"
         f"*Open positions:* {len(positions)}\n"
         f"*Recent trades:*\n{recent_lines}"
@@ -108,10 +114,21 @@ async def balance(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if state.mode == "paper":
         await update.message.reply_text(f"Paper balance: {state.paper_balance_sol:.3f} SOL")
         return
-    await update.message.reply_text(
-        "Live balance lookup depends on Anoncoin's /my-profile endpoint, which their public docs "
-        "currently mark as 'Coming Soon'. It will appear here automatically once Anoncoin ships it."
-    )
+
+    wallet_key = await secrets_manager.get_wallet_private_key(update.effective_user.id)
+    if not wallet_key:
+        await update.message.reply_text("No wallet connected. Use /connectwallet to trade live.")
+        return
+
+    from app.execution.onchain.solana_rpc import get_sol_balance
+    from app.execution.onchain.wallet_keys import load_keypair
+
+    try:
+        keypair = load_keypair(wallet_key)
+        sol_balance = await get_sol_balance(settings.solana_rpc_url, str(keypair.pubkey()))
+        await update.message.reply_text(f"Wallet balance: {sol_balance:.4f} SOL\nAddress: `{keypair.pubkey()}`", parse_mode="Markdown")
+    except Exception as exc:
+        await update.message.reply_text(f"Could not fetch wallet balance right now: {exc}")
 
 
 async def positions_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:

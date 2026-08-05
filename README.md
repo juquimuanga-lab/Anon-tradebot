@@ -25,6 +25,33 @@ and there is **no documented buy/sell trade endpoint at all**. So the bot:
   published a trade endpoint, buys/sells fail loudly with a clear Telegram
   message instead of pretending to succeed.
 
+## Live trading: two ways to execute
+
+1. **Anoncoin trade API (future)** - isolated in `app/execution/`, ready the
+   moment Anoncoin publishes one.
+2. **Direct wallet execution (available now)** - each admin can run
+   `/connectwallet` with a **dedicated/burner wallet's private key** (base58
+   secret key or JSON byte array). The bot signs and broadcasts trades
+   on-chain directly:
+   - **Pre-graduation tokens** trade against **Meteora's public Dynamic
+     Bonding Curve program** - Anoncoin's own API reveals a `meteoraConfigKey`
+     on coin creation, confirming they build on this open, documented
+     program. There's no official Python SDK, so a small Node.js sidecar
+     (`app/execution/onchain/dbc_builder/`, using Meteora's official
+     TypeScript SDK) builds the *unsigned* transaction; Python then signs it
+     locally with the wallet's key, which never leaves the Python process.
+   - **Post-graduation (migrated) tokens** trade through the **Jupiter**
+     aggregator (`app/execution/onchain/jupiter.py`), pure Python/HTTP.
+   - Each rule executes through its creator's connected wallet
+     (`Rule.created_by` / `Position.owner_user_id`) - per-admin wallets, not
+     one shared wallet.
+   - `/disconnectwallet` deletes the stored key (confirmation required).
+
+**Use a burner wallet funded only with what you're willing to risk - never
+your main wallet.** The key is encrypted at rest (Fernet) the same way as the
+Anoncoin key, and the message containing it is deleted from the chat
+immediately after storage.
+
 ## Architecture
 
 ```
@@ -88,8 +115,9 @@ docker compose up --build
 Read-only (anyone can use): `/status`, `/rules`, `/listrules`, `/balance`,
 `/positions`, `/history`, `/help`.
 
-Admin-only (`TELEGRAM_ADMIN_IDS`): `/connect`, `/setrule`, `/enable`,
-`/disable`, `/paper`, `/live`, `/positions close <id>`.
+Admin-only (`TELEGRAM_ADMIN_IDS`): `/connect`, `/connectwallet`,
+`/disconnectwallet`, `/setrule`, `/enable`, `/disable`, `/paper`, `/live`,
+`/positions close <id>`.
 
 `/setrule` walks you through all 18 parameters step by step (max buy size,
 min liquidity, min holders, max age, creator allow/denylist, bonding curve
@@ -134,9 +162,12 @@ execution adapter.
 - Anoncoin's `coins`, `coin-details`, `my-profile`, and `create-coin`
   endpoints are marked "Coming Soon" in their public docs -> the bot falls
   back to a simulated feed, clearly labelled, until Anoncoin ships them.
-- Anoncoin has no public buy/sell trade endpoint -> live execution is stubbed
-  behind `app/execution/anoncoin_live.py` and fails safely with a clear
-  message until `ANONCOIN_TRADE_ENDPOINT` is configured.
+- Anoncoin has no public buy/sell trade endpoint -> live execution defaults to
+  **direct on-chain wallet trading** instead (see "Live trading" above):
+  Meteora's Dynamic Bonding Curve for pre-graduation tokens, Jupiter for
+  post-graduation. `app/execution/anoncoin_live.py`-style API execution can
+  still be added later behind the same adapter interface with no changes
+  elsewhere.
 - The provided Solscan key authenticates against `pro-api.solscan.io` but
   its plan does not include `token/meta` / `token/holders` (401 "please
   upgrade your api key level"). The bot logs this as a warning and continues

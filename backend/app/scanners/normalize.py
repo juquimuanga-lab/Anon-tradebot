@@ -49,6 +49,8 @@ def apply_solscan_enrichment(token: TokenSnapshot, meta: Optional[dict], holders
     if meta and isinstance(meta.get("data"), dict):
         supply_info = meta["data"]
         token.raw_solscan["meta"] = supply_info
+        if isinstance(supply_info.get("decimals"), int):
+            token.decimals = supply_info["decimals"]
     if holders and isinstance(holders.get("data"), dict):
         total = holders["data"].get("total")
         if isinstance(total, int) and total > token.holders:

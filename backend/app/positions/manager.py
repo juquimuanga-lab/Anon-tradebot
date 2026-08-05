@@ -4,8 +4,8 @@ import logging
 
 from app.config.settings import settings
 from app.connectors.anoncoin import AnoncoinClient
-from app.execution.base import ExecutionAdapter
 from app.execution.price_source import get_current_price_usd
+from app.execution.router import ExecutionRouter
 from app.scoring.rules import RuleParams, TokenSnapshot
 from app.storage import repository as repo
 
@@ -13,10 +13,10 @@ logger = logging.getLogger("app.positions.manager")
 
 
 class PositionManager:
-    def __init__(self, notifier, anoncoin: AnoncoinClient, execution_by_mode: dict[str, ExecutionAdapter]):
+    def __init__(self, notifier, anoncoin: AnoncoinClient, execution_router: ExecutionRouter):
         self._notifier = notifier
         self._anoncoin = anoncoin
-        self._execution_by_mode = execution_by_mode
+        self._execution_router = execution_router
         self._tick = 0
 
     async def _rule_for_position(self, position) -> RuleParams:
@@ -35,7 +35,7 @@ class PositionManager:
         return (current_price - entry_price) / entry_price * 100
 
     async def _close_position(self, position, token: TokenSnapshot, current_price: float, sell_pct: float, reason: str):
-        adapter = self._execution_by_mode[position.mode]
+        adapter = await self._execution_router.get_adapter(position.mode, position.owner_user_id)
         amount_to_sell = position.amount_tokens * (sell_pct / 100)
         result = await adapter.sell(token, amount_to_sell, sell_pct)
 

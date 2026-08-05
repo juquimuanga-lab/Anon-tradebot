@@ -6,7 +6,7 @@ from datetime import datetime, timezone
 from app.config.settings import settings
 from app.connectors.anoncoin import AnoncoinClient, AnoncoinUnavailable
 from app.connectors.solscan import SolscanAPIError, SolscanClient
-from app.execution.base import ExecutionAdapter
+from app.execution.router import ExecutionRouter
 from app.metrics import metrics
 from app.scanners import mock_feed
 from app.scanners.normalize import apply_solscan_enrichment, from_anoncoin_coin
@@ -19,12 +19,12 @@ logger = logging.getLogger("app.scanners.scanner")
 
 class ScannerService:
     def __init__(self, notifier, position_manager, anoncoin: AnoncoinClient, solscan: SolscanClient,
-                 execution_by_mode: dict[str, ExecutionAdapter]):
+                 execution_router: ExecutionRouter):
         self._notifier = notifier
         self._position_manager = position_manager
         self._anoncoin = anoncoin
         self._solscan = solscan
-        self._execution_by_mode = execution_by_mode
+        self._execution_router = execution_router
 
     async def _fetch_new_tokens(self):
         try:
@@ -68,7 +68,7 @@ class ScannerService:
             return
 
         amount_sol = min(rule_row.max_buy_size_sol, state.paper_balance_sol if state.mode == "paper" else rule_row.max_buy_size_sol)
-        adapter = self._execution_by_mode[state.mode]
+        adapter = await self._execution_router.get_adapter(state.mode, rule_row.created_by)
         order = await repo.create_order(token.mint, "buy", state.mode, "pending", amount_sol, token.price_usd)
         await self._notifier.buy_placed(token.ticker_symbol or token.mint[:8], amount_sol, state.mode)
 
@@ -76,7 +76,10 @@ class ScannerService:
         if result.success:
             fill_price = result.price_usd or token.price_usd
             amount_tokens = amount_sol / max(fill_price, 1e-12)
-            await repo.create_position(token.mint, rule_row.id, state.mode, fill_price, amount_tokens, amount_sol)
+            await repo.create_position(
+                token.mint, rule_row.id, state.mode, fill_price, amount_tokens, amount_sol,
+                owner_user_id=rule_row.created_by,
+            )
             await repo.save_trade_decision(token.mint, rule_row.id, "buy", "passed rules", score_result.score)
             metrics.trades_placed += 1
             await self._notifier.buy_filled(token.ticker_symbol or token.mint[:8], fill_price, state.mode)

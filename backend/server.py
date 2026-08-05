@@ -13,8 +13,8 @@ from app.bot.telegram_app import build_application
 from app.config.settings import settings
 from app.connectors.anoncoin import AnoncoinClient
 from app.connectors.solscan import SolscanClient
-from app.execution.anoncoin_live import AnoncoinLiveExecutionAdapter
-from app.execution.paper import PaperExecutionAdapter
+from app.execution.onchain.jupiter import JupiterClient
+from app.execution.router import ExecutionRouter
 from app.metrics import metrics
 from app.positions.manager import PositionManager
 from app.scanners.scanner import ScannerService
@@ -35,6 +35,7 @@ async def lifespan(app: FastAPI):
 
     anoncoin_client = AnoncoinClient(settings.anoncoin_base_url, secrets_manager.get_anoncoin_api_key)
     solscan_client = SolscanClient(settings.solscan_base_url, settings.solscan_api_key)
+    jupiter_client = JupiterClient(settings.jupiter_base_url)
 
     telegram_app = build_application()
     await telegram_app.initialize()
@@ -42,12 +43,9 @@ async def lifespan(app: FastAPI):
     await telegram_app.updater.start_polling(drop_pending_updates=True)
 
     notifier = Notifier(telegram_app.bot)
-    execution_by_mode = {
-        "paper": PaperExecutionAdapter(),
-        "live": AnoncoinLiveExecutionAdapter(anoncoin_client),
-    }
-    position_manager = PositionManager(notifier, anoncoin_client, execution_by_mode)
-    scanner_service = ScannerService(notifier, position_manager, anoncoin_client, solscan_client, execution_by_mode)
+    execution_router = ExecutionRouter(jupiter_client)
+    position_manager = PositionManager(notifier, anoncoin_client, execution_router)
+    scanner_service = ScannerService(notifier, position_manager, anoncoin_client, solscan_client, execution_router)
 
     telegram_app.bot_data["position_manager"] = position_manager
 
@@ -69,6 +67,7 @@ async def lifespan(app: FastAPI):
         await telegram_app.shutdown()
         await anoncoin_client.aclose()
         await solscan_client.aclose()
+        await jupiter_client.aclose()
 
 
 app = FastAPI(title="Anoncoin Sniper Bot", lifespan=lifespan)

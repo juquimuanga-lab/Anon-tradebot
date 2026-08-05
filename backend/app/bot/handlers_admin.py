@@ -91,9 +91,10 @@ async def live_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
           InlineKeyboardButton("Cancel", callback_data=f"confirm:{token}:no")]]
     )
     await update.message.reply_text(
-        "*Warning:* LIVE mode places real trades. Anoncoin has not published a public "
-        "trade-execution endpoint yet, so live buys/sells will safely fail until they do - "
-        "but the mode switch itself is real. Confirm switch to LIVE?",
+        "*Warning:* LIVE mode places real on-chain trades using the wallet each rule's "
+        "creator has connected with /connectwallet (real funds, real risk). If no wallet "
+        "is connected for a rule's owner, its buys/sells will fail safely with a clear "
+        "message instead of doing nothing silently. Confirm switch to LIVE?",
         parse_mode="Markdown",
         reply_markup=keyboard,
     )
@@ -146,3 +147,8 @@ async def confirmation_callback(update: Update, context: ContextTypes.DEFAULT_TY
         ok = await position_manager.close_position_manually(position_id) if position_manager else False
         await repo.write_audit_log(str(update.effective_user.id), "manual_close_position", {"position_id": position_id, "ok": ok})
         await query.edit_message_text(f"Position {position_id} closed." if ok else "Position not found or already closed.")
+
+    elif entry.action == "disconnect_wallet":
+        await secrets_manager.delete_wallet_private_key(entry.payload["user_id"])
+        await repo.write_audit_log(str(update.effective_user.id), "disconnect_wallet", {})
+        await query.edit_message_text("Wallet disconnected and key deleted.")

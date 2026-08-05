@@ -49,6 +49,7 @@ class TokenSnapshot:
     holders: int = 0
     volume_24h_usd: float = 0.0
     is_migrated: bool = False
+    decimals: int = 6
     source: str = "anoncoin"
     raw_anoncoin: dict = field(default_factory=dict)
     raw_solscan: dict = field(default_factory=dict)

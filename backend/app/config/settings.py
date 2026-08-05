@@ -43,6 +43,11 @@ class Settings(BaseSettings):
     paper_starting_balance_sol: float = 10.0
     qualify_score_threshold: float = 50.0
 
+    # On-chain wallet execution
+    solana_rpc_url: str = "https://api.mainnet-beta.solana.com"
+    jupiter_base_url: str = "https://quote-api.jup.ag/v6"
+    default_slippage_bps: int = 300
+
     # Timers
     scan_interval_seconds: int = 30
     position_check_interval_seconds: int = 20

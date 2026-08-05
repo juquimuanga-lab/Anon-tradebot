@@ -1,0 +1,38 @@
+{
+  "summary": "Second-pass regression + focused test of the new wallet-execution refactor (ExecutionRouter, WalletExecutionAdapter, Node.js Meteora DBC sidecar, per-user encrypted wallet keys). All 35 pytest tests pass, health & metrics endpoints return expected JSON, backend restarted cleanly with no import errors, Node sidecar returns clean JSON (`pool_not_found_for_mint`) for a SOL mint sanity input, Telegram bot getMe returns ok:true username=anoncoinsniper_bot, no secret leakage detected in logs or HTTP responses, and the read-only dashboard renders unchanged (dashboard-root/mode-card/trading-card present). No regressions found.",
+  "backend_issues": {"critical": [], "minor": []},
+  "frontend_issues": {"ui_bugs": [], "integration_issues": [], "design_issues": []},
+  "test_report_links": [
+    "/app/backend/tests/test_wallet_keys.py",
+    "/app/backend/tests/test_execution_router.py",
+    "/app/backend/tests/test_rules.py",
+    "/app/backend/tests/test_scoring.py",
+    "/app/backend/tests/test_connector_anoncoin.py",
+    "/app/backend/tests/test_connector_solscan.py",
+    "/app/backend/tests/test_execution_paper.py"
+  ],
+  "action_items": [],
+  "critical_code_review_comments": [
+    "dbc_builder sidecar correctly returns structured JSON errors (success:false, error:code) rather than throwing/hanging — good pattern for subprocess IPC.",
+    ".gitignore in dbc_builder correctly excludes node_modules; node_modules is present locally (npm install ran).",
+    "Secrets manager reuses the same Fernet key for wallet private keys as for bot secrets; this is acceptable but the operational blast-radius of that key is now higher — worth documenting in ops notes (rotation requires re-connecting every admin wallet).",
+    "InvalidWalletKeyError does not echo the raw input, verified by test_wallet_keys.py."
+  ],
+  "updated_files": [],
+  "success_rate": {"backend": "100%", "frontend": "100%"},
+  "test_credentials": "N/A (Telegram-only control, no web auth). /app/memory/test_credentials.md not required for this pass.",
+  "seed_data_creation": "None",
+  "retest_needed": false,
+  "main_agent_can_self_test": true,
+  "context_for_next_testing_agent": "Backend on port 8001 via supervisor. Preview URL: https://7a6c74f6-7d35-4d44-b9e4-758a2fa317d6.preview.emergentagent.com. Trading mode defaults to paper. Node sidecar path: /app/backend/app/execution/onchain/dbc_builder/build_tx.js — invoke via stdin JSON. Pytest suite at /app/backend runs in <1s with 35 tests. Do not attempt to fund a real wallet or broadcast a live tx. Wallet key encryption uses secrets_manager.set_wallet_private_key (Fernet). Scanner logs benign anoncoin_discovery_unavailable_using_mock_feed / solscan_meta_failed warnings — intentional fallback to mock feed.",
+  "verification_details": {
+    "pytest": "35 passed in 0.76s",
+    "GET /api/health": "{\"status\":\"ok\",\"mode\":\"paper\",\"trading_enabled\":true} (200)",
+    "GET /api/metrics": "{tokens_scanned,tokens_qualified,trades_placed,error_count,degraded_count,win_rate_pct,total_pnl} present (200)",
+    "supervisor backend status": "RUNNING, uvicorn reloaded cleanly, no crash loop",
+    "secret_leak_scan": "No TELEGRAM_BOT_TOKEN / ANONCOIN_API_KEY / SOLSCAN_API_KEY literals found in backend logs; no long base58 blobs; no secrets in /api/health or /api/metrics response bodies",
+    "node_sidecar": "echo <valid JSON> | node build_tx.js -> {\"success\":false,\"error\":\"pool_not_found_for_mint\"} exit 0",
+    "telegram_getMe": "ok=True username=anoncoinsniper_bot",
+    "frontend": "dashboard-root, mode-card, trading-card render; MODE=PAPER, TRADING=ENABLED shown correctly"
+  }
+}

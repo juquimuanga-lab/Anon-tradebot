@@ -14,6 +14,10 @@ logger = logging.getLogger("app.security.secrets")
 ANONCOIN_API_KEY_NAME = "anoncoin_api_key"
 
 
+def _wallet_key_name(user_id: int) -> str:
+    return f"wallet_privkey_{user_id}"
+
+
 class SecretsManager:
     def __init__(self):
         self._fernet = Fernet(settings.secret_encryption_key.encode())
@@ -57,6 +61,17 @@ class SecretsManager:
             return value
         return None
 
+    async def delete_secret(self, name: str) -> None:
+        self._cache.pop(name, None)
+        async with async_session_scope() as session:
+            existing = (
+                await session.execute(select(Secret).where(Secret.key_name == name))
+            ).scalar_one_or_none()
+            if existing:
+                await session.delete(existing)
+                await session.commit()
+        logger.info("secret_deleted", extra={"key_name": name})
+
     async def get_anoncoin_api_key(self) -> Optional[str]:
         stored = await self.get_secret(ANONCOIN_API_KEY_NAME)
         if stored:
@@ -65,6 +80,15 @@ class SecretsManager:
 
     async def set_anoncoin_api_key(self, raw_key: str) -> None:
         await self.set_secret(ANONCOIN_API_KEY_NAME, raw_key)
+
+    async def set_wallet_private_key(self, user_id: int, raw_key: str) -> None:
+        await self.set_secret(_wallet_key_name(user_id), raw_key)
+
+    async def get_wallet_private_key(self, user_id: int) -> Optional[str]:
+        return await self.get_secret(_wallet_key_name(user_id))
+
+    async def delete_wallet_private_key(self, user_id: int) -> None:
+        await self.delete_secret(_wallet_key_name(user_id))
 
 
 secrets_manager = SecretsManager()
