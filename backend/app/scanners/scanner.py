@@ -10,7 +10,7 @@ Detection has three layers, tried in this priority order per cycle:
 """
 import asyncio
 import logging
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 from app.config.settings import settings
 from app.connectors.anoncoin import AnoncoinClient, AnoncoinUnavailable
@@ -39,6 +39,8 @@ class ScannerService:
         self._watermarks = onchain_watcher.WatermarkStore()
         self._pending_watch: dict[str, datetime] = {}
         self._notified_fail: set[str] = set()
+        self._solscan_failure_count = 0
+        self._solscan_backoff_until: datetime | None = None
 
     async def _fetch_new_tokens(self):
         try:
@@ -152,7 +154,7 @@ class ScannerService:
             amount_tokens = amount_sol / max(fill_price, 1e-12)
             await repo.create_position(
                 token.mint, rule_row.id, state.mode, fill_price, amount_tokens, amount_sol,
-                owner_user_id=rule_row.created_by,
+                owner_user_id=rule_row.created_by, entry_volume_24h_usd=token.volume_24h_usd,
             )
             await repo.save_trade_decision(token.mint, rule_row.id, "buy", "passed rules", score_result.score)
             metrics.trades_placed += 1

@@ -118,6 +118,8 @@ class Position(Base):
     amount_sol_invested: Mapped[float] = mapped_column(Float, default=0.0)
     remaining_pct: Mapped[float] = mapped_column(Float, default=100.0)
     peak_price_usd: Mapped[float] = mapped_column(Float, default=0.0)
+    entry_volume_24h_usd: Mapped[float] = mapped_column(Float, default=0.0)
+    peak_volume_24h_usd: Mapped[float] = mapped_column(Float, default=0.0)
     tp_hit_indexes: Mapped[list] = mapped_column(JSON, default=list)
     realized_pnl_usd: Mapped[float] = mapped_column(Float, default=0.0)
     opened_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now_utc)

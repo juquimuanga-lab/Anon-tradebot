@@ -22,6 +22,16 @@ def _walk_price(mint: str, base_price: float, tick: int) -> float:
     return max(base_price * 1e-6, base_price * (1 + drift))
 
 
+def _walk_volume(mint: str, base_volume: float, tick: int) -> float:
+    """Simulated 24h volume: meme-coin hype fades over time, so decay the
+    baseline with a noisy multiplier that trends down (floors at 15% of the
+    original) while still available for rule evaluation end to end."""
+    rng = random.Random(f"{mint}:vol:{tick}")
+    decay = max(0.15, 1 - tick * 0.03)
+    noise = rng.uniform(0.85, 1.15)
+    return max(0.0, base_volume * decay * noise)
+
+
 async def get_current_price_usd(client: AnoncoinClient, token: TokenSnapshot, tick: int = 0) -> tuple[float, bool]:
     """Returns (price_usd, is_simulated)."""
     if token.source == "anoncoin":
@@ -41,3 +51,20 @@ async def get_current_price_usd(client: AnoncoinClient, token: TokenSnapshot, ti
             logger.warning("live_pool_price_lookup_failed", extra={"mint": token.mint, "error": str(exc)})
 
     return _walk_price(token.mint, token.price_usd or 0.000001, tick), True
+
+
+async def get_current_volume_usd(client: AnoncoinClient, token: TokenSnapshot, tick: int = 0) -> tuple[float, bool]:
+    """Returns (volume_24h_usd, is_simulated). Anoncoin's coin-details endpoint
+    reports live volume when available; Meteora pool reads don't expose 24h
+    volume, so on-chain and unavailable-API tokens fall back to a labelled
+    simulated decay walk seeded from the position's entry volume."""
+    if token.source == "anoncoin":
+        try:
+            details = await client.get_coin_details(token.mint)
+            volume = details.get("volume24HrsUsd")
+            if volume is not None:
+                return float(volume), False
+        except AnoncoinUnavailable:
+            pass
+
+    return _walk_volume(token.mint, token.volume_24h_usd or 0.0, tick), True

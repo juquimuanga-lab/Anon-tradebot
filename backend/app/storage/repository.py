@@ -157,7 +157,7 @@ async def create_order(mint: str, side: str, mode: str, status: str, requested_a
 
 async def create_position(mint: str, rule_id: Optional[int], mode: str, entry_price_usd: float,
                            amount_tokens: float, amount_sol_invested: float,
-                           owner_user_id: Optional[int] = None) -> Position:
+                           owner_user_id: Optional[int] = None, entry_volume_24h_usd: float = 0.0) -> Position:
     async with async_session_scope() as session:
         position = Position(
             mint=mint,
@@ -168,6 +168,8 @@ async def create_position(mint: str, rule_id: Optional[int], mode: str, entry_pr
             amount_tokens=amount_tokens,
             amount_sol_invested=amount_sol_invested,
             peak_price_usd=entry_price_usd,
+            entry_volume_24h_usd=entry_volume_24h_usd,
+            peak_volume_24h_usd=entry_volume_24h_usd,
         )
         session.add(position)
         await session.commit()

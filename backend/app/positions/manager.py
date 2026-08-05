@@ -4,7 +4,7 @@ import logging
 
 from app.config.settings import settings
 from app.connectors.anoncoin import AnoncoinClient
-from app.execution.price_source import get_current_price_usd
+from app.execution.price_source import get_current_price_usd, get_current_volume_usd
 from app.execution.router import ExecutionRouter
 from app.scoring.rules import RuleParams, TokenSnapshot
 from app.storage import repository as repo
@@ -84,25 +84,35 @@ class PositionManager:
             ticker_name=token_row.ticker_name,
             creator_wallet=token_row.creator_wallet,
             price_usd=position.entry_price_usd,
+            volume_24h_usd=position.entry_volume_24h_usd,
             source=token_row.source,
         )
         current_price, _is_sim = await get_current_price_usd(self._anoncoin, token, self._tick)
         token.price_usd = current_price
+        current_volume, _is_sim_vol = await get_current_volume_usd(self._anoncoin, token, self._tick)
+        token.volume_24h_usd = current_volume
 
         rule = await self._rule_for_position(position)
         pnl_pct = self._pnl_pct(position.entry_price_usd, current_price)
 
-        peak = max(position.peak_price_usd, current_price)
-        if peak != position.peak_price_usd:
-            await repo.update_position(position.id, peak_price_usd=peak)
-            position.peak_price_usd = peak
+        peak_price = max(position.peak_price_usd, current_price)
+        peak_volume = max(position.peak_volume_24h_usd, current_volume)
+        peak_updates = {}
+        if peak_price != position.peak_price_usd:
+            peak_updates["peak_price_usd"] = peak_price
+        if peak_volume != position.peak_volume_24h_usd:
+            peak_updates["peak_volume_24h_usd"] = peak_volume
+        if peak_updates:
+            await repo.update_position(position.id, **peak_updates)
+            position.peak_price_usd = peak_price
+            position.peak_volume_24h_usd = peak_volume
 
         if rule.stop_loss_pct and pnl_pct <= -abs(rule.stop_loss_pct):
             await self._close_position(position, token, current_price, position.remaining_pct, "stop loss hit")
             return
 
         if rule.trailing_stop_pct and pnl_pct > 0:
-            drop_from_peak = (peak - current_price) / peak * 100 if peak > 0 else 0
+            drop_from_peak = (peak_price - current_price) / peak_price * 100 if peak_price > 0 else 0
             if drop_from_peak >= rule.trailing_stop_pct:
                 await self._close_position(position, token, current_price, position.remaining_pct, "trailing stop hit")
                 return
@@ -113,6 +123,12 @@ class PositionManager:
             age = (_dt.datetime.now(_dt.timezone.utc) - position.opened_at.replace(tzinfo=_dt.timezone.utc)).total_seconds()
             if age >= rule.time_based_exit_seconds:
                 await self._close_position(position, token, current_price, position.remaining_pct, "time-based exit")
+                return
+
+        if rule.sell_on_volume_drop_pct and peak_volume > 0:
+            volume_drop_pct = (peak_volume - current_volume) / peak_volume * 100
+            if volume_drop_pct >= rule.sell_on_volume_drop_pct:
+                await self._close_position(position, token, current_price, position.remaining_pct, "volume drop exit")
                 return
 
         for idx, level in enumerate(rule.take_profit_levels):
