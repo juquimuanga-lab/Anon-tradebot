@@ -1,19 +1,24 @@
 """Launch detection + screening + trade decision loop.
 
-Detection has three layers, tried in this priority order per cycle:
+Detection has up to three layers, tried in this priority order per cycle:
 1. On-chain watcher: polls wallets in CREATOR_WATCHLIST directly via the free
    public Solana RPC for brand-new SPL mint creations (real data, no paid API
-   needed) - this is the primary real signal today.
+   needed) - this is the primary real signal today, and the only one needed
+   to trigger real paper/live trades against the Anoncoin.it creator wallet.
 2. Anoncoin's own coin-discovery API, once it's live.
-3. A clearly-labelled simulated feed as a last-resort fallback so the
-   pipeline stays demoable while both of the above are unavailable/rate-limited.
+3. A clearly-labelled simulated feed - OFF by default (see
+   settings.enable_mock_feed). It used to run unconditionally every cycle
+   whenever step 2 was unavailable, which drowned real on-chain detections
+   in constant [SIMULATED] alerts since Anoncoin's discovery API has no
+   live endpoint yet. Now it only runs if explicitly enabled, purely for
+   demoing the pipeline; mock tokens are still always skipped in live mode.
 """
 import asyncio
 import logging
 from datetime import datetime, timedelta, timezone
 
 from app.config.settings import settings
-from app.connectors.anoncoin import AnoncoinClient, AnoncoinUnavailable
+from app.connectors.anoncoin import AnoncoinAPIError, AnoncoinClient
 from app.connectors.solscan import SolscanAPIError, SolscanClient
 from app.execution.onchain import meteora_dbc
 from app.execution.onchain.meteora_dbc import DbcBuildError
@@ -46,9 +51,21 @@ class ScannerService:
         try:
             raw_coins = await self._anoncoin.get_coins(sort_by="new", limit=20)
             return [from_anoncoin_coin(c) for c in raw_coins]
-        except AnoncoinUnavailable as exc:
-            logger.info("anoncoin_discovery_unavailable_using_mock_feed", extra={"detail": str(exc)})
-            return mock_feed.generate()
+        except AnoncoinAPIError as exc:
+            # Covers both AnoncoinUnavailable (endpoint not live / network
+            # error) and a missing/invalid API key - either way, Anoncoin's
+            # discovery API isn't usable right now. Previously this always
+            # fell back to the simulated feed, which fired 0-2 fake
+            # [SIMULATED] tokens every scan_interval_seconds (~every 30s)
+            # regardless of trading mode - completely drowning out the real,
+            # comparatively rare on-chain detections from CREATOR_WATCHLIST.
+            # Real detection doesn't depend on this at all (see
+            # _watch_wallets_for_new_mints), so the safe default is to
+            # contribute nothing here rather than synthetic noise.
+            logger.info("anoncoin_discovery_unavailable", extra={"detail": str(exc)})
+            if settings.enable_mock_feed:
+                return mock_feed.generate()
+            return []
 
     async def _watch_wallets_for_new_mints(self):
         for wallet in settings.creator_watchlist:
