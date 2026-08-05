@@ -87,18 +87,33 @@ class ScannerService:
         )
 
     async def _enrich_with_solscan(self, token):
+        now = datetime.now(timezone.utc)
+        if self._solscan_backoff_until and now < self._solscan_backoff_until:
+            return token
+
         try:
             meta = await self._solscan.get_token_meta(token.mint)
+            self._solscan_failure_count = 0
         except SolscanAPIError as exc:
             metrics.degraded_count += 1
+            self._solscan_failure_count += 1
             logger.warning("solscan_meta_failed", extra={"mint": token.mint, "error": str(exc)})
             meta = None
         try:
             holders = await self._solscan.get_token_holders(token.mint)
+            self._solscan_failure_count = 0
         except SolscanAPIError as exc:
             metrics.degraded_count += 1
+            self._solscan_failure_count += 1
             logger.warning("solscan_holders_failed", extra={"mint": token.mint, "error": str(exc)})
             holders = None
+
+        if self._solscan_failure_count >= 3 and not self._solscan_backoff_until:
+            self._solscan_backoff_until = now + timedelta(minutes=10)
+            logger.warning("solscan_disabled_temporarily", extra={"minutes": 10})
+        elif self._solscan_failure_count == 0:
+            self._solscan_backoff_until = None
+
         return apply_solscan_enrichment(token, meta, holders)
 
     async def _maybe_trade(self, token, rule_row, score_result) -> bool:
