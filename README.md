@@ -15,15 +15,46 @@ At the time this was built, Anoncoin's public docs (`docs.anoncoin.it`) marked
 and there is **no documented buy/sell trade endpoint at all**. So the bot:
 
 - Tries the real Anoncoin discovery/detail endpoints first.
-- Falls back to a clearly-labelled simulated token feed (`source=mock_simulated`,
+- Can fall back to a clearly-labelled simulated token feed (`source=mock_simulated`,
   every Telegram alert prefixed `[SIMULATED]`) so scanning, scoring, paper
-  trading, and position management all work end to end today.
+  trading, and position management can be demoed end to end without waiting
+  on Anoncoin or a watched wallet to act. **Off by default** - set
+  `ENABLE_MOCK_FEED=true` to turn it on. It used to run unconditionally
+  every scan cycle whenever the Anoncoin API call failed (i.e. always, since
+  that API isn't live), which flooded Telegram with `[SIMULATED]` alerts and
+  buried the real, comparatively rare on-chain detections from
+  `CREATOR_WATCHLIST` - see "Troubleshooting" below. Detection from the
+  on-chain watcher never depended on this feed and is unaffected either way.
 - Isolates trade execution behind `app/execution/` so a real
   `ANONCOIN_TRADE_ENDPOINT` can be plugged in later without touching
   scanning, scoring, or Telegram code at all.
 - Never fakes a live fill: if you switch to `/live` and Anoncoin still hasn't
   published a trade endpoint, buys/sells fail loudly with a clear Telegram
-  message instead of pretending to succeed.
+  message instead of pretending to succeed. Mock-simulated tokens are always
+  skipped in live mode too, regardless of `ENABLE_MOCK_FEED`.
+
+## Troubleshooting: only seeing [SIMULATED] alerts / live mode not trading
+
+If every alert is tagged `[SIMULATED]` even with `/live` active and a real
+creator wallet in `CREATOR_WATCHLIST`, check, in order:
+
+1. **`ENABLE_MOCK_FEED`** - should be unset or `false`. Earlier versions of
+   this bot had no such switch and generated 0-2 fake tokens every
+   `SCAN_INTERVAL_SECONDS` unconditionally, which is almost certainly what
+   you were seeing - real launches from a single watched wallet are far
+   rarer than one every 30 seconds.
+2. **Wallet connection** - `/live` trades execute through whichever admin's
+   wallet owns the active rule (`/connectwallet`). No wallet connected means
+   real on-chain detections still fire and still get scored, but the buy
+   fails with an explicit "Live trading needs a connected wallet" message
+   instead of a silent no-op or a simulated fill.
+3. **RPC reliability** - the default `SOLANA_RPC_URL` is the free public
+   Solana RPC, which can rate-limit under load. Frequent
+   `get_transaction_failed` warnings in the logs mean some on-chain activity
+   from the watched wallet may be getting missed; point `SOLANA_RPC_URL` at
+   a dedicated provider (Helius/QuickNode/Triton) if so.
+4. **`/status`** in Telegram shows current mode and whether trading is
+   enabled - confirm it says `live`, not `paper`.
 
 ## Real launch detection today (no Anoncoin API, no Solscan upgrade needed)
 
