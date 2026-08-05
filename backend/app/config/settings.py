@@ -43,6 +43,13 @@ class Settings(BaseSettings):
     paper_starting_balance_sol: float = 10.0
     qualify_score_threshold: float = 50.0
 
+    # Simulated feed fallback (see scanners/scanner.py _fetch_new_tokens).
+    # Off by default: the on-chain watcher against CREATOR_WATCHLIST is the
+    # real signal source. Only turn this on for a demo - it will never place
+    # live trades (mock_simulated tokens are always skipped in live mode),
+    # but it will spam Telegram alerts if left on during normal operation.
+    enable_mock_feed: bool = False
+
     # On-chain wallet execution
     solana_rpc_url: str = "https://api.mainnet-beta.solana.com"
     jupiter_base_url: str = "https://lite-api.jup.ag/swap/v1"
