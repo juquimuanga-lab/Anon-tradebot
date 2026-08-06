@@ -45,15 +45,32 @@ def from_anoncoin_coin(raw: dict) -> TokenSnapshot:
     )
 
 
-def apply_solscan_enrichment(token: TokenSnapshot, meta: Optional[dict], holders: Optional[dict]) -> TokenSnapshot:
+def apply_solscan_enrichment(
+    token: TokenSnapshot,
+    meta: Optional[dict],
+    holders: Optional[dict],
+) -> TokenSnapshot:
+
     if meta and isinstance(meta.get("data"), dict):
-        supply_info = meta["data"]
-        token.raw_solscan["meta"] = supply_info
-        if isinstance(supply_info.get("decimals"), int):
-            token.decimals = supply_info["decimals"]
+        data = meta["data"]
+
+        token.raw_solscan["meta"] = data
+
+        decimals = data.get("decimals")
+        if isinstance(decimals, int):
+            token.decimals = decimals
+
     if holders and isinstance(holders.get("data"), dict):
-        total = holders["data"].get("total")
-        if isinstance(total, int) and total > token.holders:
-            token.holders = total
-        token.raw_solscan["holders"] = holders["data"]
+        data = holders["data"]
+
+        token.raw_solscan["holders"] = data
+
+        total = data.get("total")
+
+        if isinstance(total, int):
+            if token.holders is None:
+                token.holders = total
+            else:
+                token.holders = max(token.holders, total)
+
     return token
