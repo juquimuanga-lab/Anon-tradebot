@@ -19,13 +19,13 @@ from datetime import datetime, timedelta, timezone
 
 from app.config.settings import settings
 from app.connectors.anoncoin import AnoncoinAPIError, AnoncoinClient
-from app.connectors.solscan import SolscanAPIError, SolscanClient
+from app.connectors.helius import HeliusAPIError, HeliusClient
 from app.execution.onchain import meteora_dbc
 from app.execution.onchain.meteora_dbc import DbcBuildError
 from app.execution.router import ExecutionRouter
 from app.metrics import metrics
 from app.scanners import mock_feed, onchain_watcher, price_feed
-from app.scanners.normalize import apply_solscan_enrichment, from_anoncoin_coin
+from app.scanners.normalize import apply_holder_enrichment, from_anoncoin_coin
 from app.scoring.rules import TokenSnapshot, evaluate_hard_filters
 from app.scoring.scorer import compute_score
 from app.storage import repository as repo
@@ -34,18 +34,18 @@ logger = logging.getLogger("app.scanners.scanner")
 
 
 class ScannerService:
-    def __init__(self, notifier, position_manager, anoncoin: AnoncoinClient, solscan: SolscanClient,
+    def __init__(self, notifier, position_manager, anoncoin: AnoncoinClient, holders_client: HeliusClient,
                  execution_router: ExecutionRouter):
         self._notifier = notifier
         self._position_manager = position_manager
         self._anoncoin = anoncoin
-        self._solscan = solscan
+        self._holders_client = holders_client
         self._execution_router = execution_router
         self._watermarks = onchain_watcher.WatermarkStore()
         self._pending_watch: dict[str, datetime] = {}
         self._notified_fail: set[str] = set()
-        self._solscan_failure_count = 0
-        self._solscan_backoff_until: datetime | None = None
+        self._holders_failure_count = 0
+        self._holders_backoff_until: datetime | None = None
 
     async def _fetch_new_tokens(self):
         try:
@@ -105,35 +105,27 @@ class ScannerService:
             source="anoncoin_onchain",
         )
 
-    async def _enrich_with_solscan(self, token):
+    async def _enrich_holders(self, token):
         now = datetime.now(timezone.utc)
-        if self._solscan_backoff_until and now < self._solscan_backoff_until:
+        if self._holders_backoff_until and now < self._holders_backoff_until:
             return token
 
         try:
-            meta = await self._solscan.get_token_meta(token.mint)
-            self._solscan_failure_count = 0
-        except SolscanAPIError as exc:
+            holder_count = await self._holders_client.get_token_holder_count(token.mint)
+            self._holders_failure_count = 0
+        except HeliusAPIError as exc:
             metrics.degraded_count += 1
-            self._solscan_failure_count += 1
-            logger.warning("solscan_meta_failed", extra={"mint": token.mint, "error": str(exc)})
-            meta = None
-        try:
-            holders = await self._solscan.get_token_holders(token.mint)
-            self._solscan_failure_count = 0
-        except SolscanAPIError as exc:
-            metrics.degraded_count += 1
-            self._solscan_failure_count += 1
-            logger.warning("solscan_holders_failed", extra={"mint": token.mint, "error": str(exc)})
-            holders = None
+            self._holders_failure_count += 1
+            logger.warning("holders_enrichment_failed", extra={"mint": token.mint, "error": str(exc)})
+            holder_count = None
 
-        if self._solscan_failure_count >= 3 and not self._solscan_backoff_until:
-            self._solscan_backoff_until = now + timedelta(minutes=10)
-            logger.warning("solscan_disabled_temporarily", extra={"minutes": 10})
-        elif self._solscan_failure_count == 0:
-            self._solscan_backoff_until = None
+        if self._holders_failure_count >= 3 and not self._holders_backoff_until:
+            self._holders_backoff_until = now + timedelta(minutes=10)
+            logger.warning("holders_enrichment_disabled_temporarily", extra={"minutes": 10})
+        elif self._holders_failure_count == 0:
+            self._holders_backoff_until = None
 
-        return apply_solscan_enrichment(token, meta, holders)
+        return apply_holder_enrichment(token, holder_count)
 
     async def _maybe_trade(self, token, rule_row, score_result) -> bool:
         state = await repo.get_or_create_bot_state()
@@ -189,27 +181,9 @@ class ScannerService:
         from app.storage.repository import rule_row_to_params
 
         rule_params = rule_row_to_params(active_rule)
-
         passed, reasons = evaluate_hard_filters(token, rule_params)
-        score_result = compute_score(
-            token,
-            rule_params,
-            settings.creator_watchlist,
-        )
+        score_result = compute_score(token, rule_params, settings.creator_watchlist)
 
-        logger.info(
-            "screening_result",
-            extra={
-                "mint": token.mint,
-                "passed": passed,
-                "reasons": reasons,
-                "holders": token.holders,
-                "volume": token.volume_24h_usd,
-                "liquidity": token.liquidity_usd,
-                "marketcap": token.market_cap_usd,
-                "score": score_result.score,
-            },
-        )
         await repo.save_screening_result(
             token.mint, passed, score_result.score, reasons, token.liquidity_usd,
             token.holders, token.market_cap_usd, score_result.creator_match,
@@ -244,7 +218,7 @@ class ScannerService:
             if token is None:
                 continue
             await repo.save_token(token)
-            token = await self._enrich_with_solscan(token)
+            token = await self._enrich_holders(token)
 
             done = await self._screen_and_maybe_trade(token, active_rule, notify_on_fail=(mint not in self._notified_fail))
             self._notified_fail.add(mint)
@@ -263,7 +237,7 @@ class ScannerService:
                 continue
             await repo.save_token(token)
             metrics.tokens_scanned += 1
-            token = await self._enrich_with_solscan(token)
+            token = await self._enrich_holders(token)
             await self._screen_and_maybe_trade(token, active_rule, notify_on_fail=True)
 
     async def run_forever(self):
