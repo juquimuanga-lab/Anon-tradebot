@@ -37,7 +37,7 @@ def from_anoncoin_coin(raw: dict) -> TokenSnapshot:
         price_usd=_parse_money(raw.get("priceUsd")),
         market_cap_usd=_parse_money(raw.get("marketCapUsd")),
         liquidity_usd=_parse_money(raw.get("liquidityUsd")),
-        holders=int(raw.get("holders") or 0),
+        holders=(int(raw["holders"])if raw.get("holders") is not None else None),
         volume_24h_usd=_parse_money(raw.get("volume24HrsUsd")),
         is_migrated=bool(raw.get("isMigrated", False)),
         source="anoncoin",
@@ -45,8 +45,18 @@ def from_anoncoin_coin(raw: dict) -> TokenSnapshot:
     )
 
 
-def apply_holder_enrichment(token: TokenSnapshot, holder_count: Optional[int]) -> TokenSnapshot:
-    if isinstance(holder_count, int) and holder_count > token.holders:
-        token.holders = holder_count
+def apply_holder_enrichment(
+    token: TokenSnapshot,
+    holder_count: Optional[int],
+) -> TokenSnapshot:
+
+    if isinstance(holder_count, int):
+
+        if token.holders is None:
+            token.holders = holder_count
+        else:
+            token.holders = max(token.holders, holder_count)
+
         token.raw_enrichment["holders"] = holder_count
+
     return token
