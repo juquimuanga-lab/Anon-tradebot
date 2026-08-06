@@ -190,6 +190,19 @@ class ScannerService:
 
         rule_params = rule_row_to_params(active_rule)
         passed, reasons = evaluate_hard_filters(token, rule_params)
+       logger.info(
+    "screening_result",
+    extra={
+        "mint": token.mint,
+        "passed": passed,
+        "reasons": reasons,
+        "holders": token.holders,
+        "volume": token.volume_24h_usd,
+        "liquidity": token.liquidity_usd,
+        "marketcap": token.market_cap_usd,
+        "score": score_result.score,
+    }
+       )
         score_result = compute_score(token, rule_params, settings.creator_watchlist)
 
         await repo.save_screening_result(
