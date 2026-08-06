@@ -12,7 +12,7 @@ from app.bot.notifications import Notifier
 from app.bot.telegram_app import build_application
 from app.config.settings import settings
 from app.connectors.anoncoin import AnoncoinClient
-from app.connectors.solscan import SolscanClient
+from app.connectors.helius import HeliusClient
 from app.execution.onchain.jupiter import JupiterClient
 from app.execution.router import ExecutionRouter
 from app.metrics import metrics
@@ -34,7 +34,7 @@ async def lifespan(app: FastAPI):
     await init_db()
 
     anoncoin_client = AnoncoinClient(settings.anoncoin_base_url, secrets_manager.get_anoncoin_api_key)
-    solscan_client = SolscanClient(settings.solscan_base_url, settings.solscan_api_key)
+    holders_client = HeliusClient(settings.helius_base_url, settings.helius_api_key)
     jupiter_client = JupiterClient(settings.jupiter_base_url)
 
     telegram_app = build_application()
@@ -45,7 +45,7 @@ async def lifespan(app: FastAPI):
     notifier = Notifier(telegram_app.bot)
     execution_router = ExecutionRouter(jupiter_client)
     position_manager = PositionManager(notifier, anoncoin_client, execution_router)
-    scanner_service = ScannerService(notifier, position_manager, anoncoin_client, solscan_client, execution_router)
+    scanner_service = ScannerService(notifier, position_manager, anoncoin_client, holders_client, execution_router)
 
     telegram_app.bot_data["position_manager"] = position_manager
 
@@ -54,7 +54,7 @@ async def lifespan(app: FastAPI):
     _background_tasks.append(asyncio.create_task(scanner_service.daily_summary_loop()))
 
     app.state.anoncoin_client = anoncoin_client
-    app.state.solscan_client = solscan_client
+    app.state.helius_client = holders_client
     logger.info("bot_started")
 
     try:
@@ -66,7 +66,7 @@ async def lifespan(app: FastAPI):
         await telegram_app.stop()
         await telegram_app.shutdown()
         await anoncoin_client.aclose()
-        await solscan_client.aclose()
+        await holders_client.aclose()
         await jupiter_client.aclose()
 
 
