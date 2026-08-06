@@ -22,9 +22,14 @@ class Settings(BaseSettings):
     anoncoin_api_key: Optional[str] = None
     anoncoin_trade_endpoint: Optional[str] = None
 
-    # Solscan
+    # Solscan (unused by default - required an active paid Pro API plan;
+    # kept configurable in case it's ever reactivated)
     solscan_base_url: str = "https://pro-api.solscan.io/v2.0"
     solscan_api_key: Optional[str] = None
+
+    # Helius - holder-count enrichment (replaces Solscan; free tier works)
+    helius_base_url: str = "https://mainnet.helius-rpc.com"
+    helius_api_key: Optional[str] = None
 
     # Creator watchlist (strong launch signal)
     creator_watchlist_raw: str = Field(
