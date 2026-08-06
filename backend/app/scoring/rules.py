@@ -46,7 +46,7 @@ class TokenSnapshot:
     price_usd: float = 0.0
     market_cap_usd: float = 0.0
     liquidity_usd: float = 0.0
-    holders: int = 0
+    holders: Optional[int] = None
     volume_24h_usd: float = 0.0
     is_migrated: bool = False
     decimals: int = 6
@@ -81,8 +81,12 @@ def evaluate_hard_filters(token: TokenSnapshot, rule: RuleParams) -> tuple[bool,
     if token.liquidity_usd < rule.min_liquidity_usd:
         reasons.append(f"liquidity ${token.liquidity_usd:,.0f} below min ${rule.min_liquidity_usd:,.0f}")
 
-    if token.holders < rule.min_holders:
-        reasons.append(f"holders {token.holders} below min {rule.min_holders}")
+    if token.holders is None:
+    reasons.append("holder count unavailable")
+elif token.holders < rule.min_holders:
+    reasons.append(
+        f"holders {token.holders} below min {rule.min_holders}"
+    )
 
     if token.age_seconds > rule.max_age_seconds:
         reasons.append(f"age {token.age_seconds:.0f}s exceeds max {rule.max_age_seconds}s")
