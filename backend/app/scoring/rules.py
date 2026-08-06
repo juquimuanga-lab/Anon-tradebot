@@ -82,11 +82,9 @@ def evaluate_hard_filters(token: TokenSnapshot, rule: RuleParams) -> tuple[bool,
         reasons.append(f"liquidity ${token.liquidity_usd:,.0f} below min ${rule.min_liquidity_usd:,.0f}")
 
     if token.holders is None:
-    reasons.append("holder count unavailable")
-elif token.holders < rule.min_holders:
-    reasons.append(
-        f"holders {token.holders} below min {rule.min_holders}"
-    )
+        reasons.append("holder count unavailable")
+    elif token.holders < rule.min_holders:
+        reasons.append(f"holders {token.holders} below min {rule.min_holders}")
 
     if token.age_seconds > rule.max_age_seconds:
         reasons.append(f"age {token.age_seconds:.0f}s exceeds max {rule.max_age_seconds}s")
