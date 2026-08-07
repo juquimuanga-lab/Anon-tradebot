@@ -11,8 +11,8 @@ HELP_TEXT = (
     "*Anoncoin Sniper Bot*\n\n"
     "*Read-only (anyone):*\n"
     "/status - mode, rules, balance, positions\n"
-    "/rules - show active rule set\n"
-    "/listrules - list saved rule sets\n"
+    "/rules - show your active rule\n"
+    "/listrules - list your saved rule sets (with IDs)\n"
     "/balance - wallet / paper balance\n"
     "/positions - open positions\n"
     "/history - recent trades\n"
@@ -22,10 +22,13 @@ HELP_TEXT = (
     "/connectwallet - register a wallet for live on-chain trading (base58 or JSON key)\n"
     "/disconnectwallet - remove your stored wallet key (confirm)\n"
     "/setrule - create a rule set step by step\n"
+    "/activaterule <id> - switch which of your own rules is active (see /listrules for IDs)\n"
     "/enable - resume automated trading\n"
     "/disable - pause automated trading (confirm)\n"
     "/paper - switch to paper mode (confirm)\n"
     "/live - switch to live mode (confirm)\n"
+    "\nEach admin's rules run independently - activating or editing your rule "
+    "never affects another admin's."
 )
 
 
@@ -44,13 +47,13 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 async def status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     state = await repo.get_or_create_bot_state()
-    active_rule = await repo.get_active_rule()
+    active_rule = await repo.get_active_rule_for(update.effective_user.id)
     positions = await repo.get_open_positions()
     orders = await repo.get_recent_orders(3)
 
     anoncoin_key = await secrets_manager.get_anoncoin_api_key()
     anoncoin_connected = "yes" if anoncoin_key else "no (use /connect)"
-    solscan_connected = "yes" if settings.solscan_api_key else "no"
+    helius_connected = "yes" if settings.helius_api_key else "no"
 
     wallet_key = await secrets_manager.get_wallet_private_key(update.effective_user.id)
     wallet_line = "connected (use /balance to check funds)" if wallet_key else "not connected (use /connectwallet for live trading)"
@@ -62,8 +65,8 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
     text = (
         f"*Mode:* {state.mode} | *Trading enabled:* {state.trading_enabled}\n"
-        f"*Active rule:* {rule_line}\n"
-        f"*Connected APIs:* Anoncoin: {anoncoin_connected}, Solscan: {solscan_connected}\n"
+        f"*Your active rule:* {rule_line}\n"
+        f"*Connected APIs:* Anoncoin: {anoncoin_connected}, Helius: {helius_connected}\n"
         f"*Your wallet:* {wallet_line}\n"
         f"*Paper balance:* {state.paper_balance_sol:.3f} SOL\n"
         f"*Open positions:* {len(positions)}\n"
@@ -73,7 +76,7 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def rules(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    active_rule = await repo.get_active_rule()
+    active_rule = await repo.get_active_rule_for(update.effective_user.id)
     if not active_rule:
         await update.message.reply_text("No active rule set yet. Use /setrule to create one.")
         return
@@ -81,7 +84,7 @@ async def rules(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
     p = rule_row_to_params(active_rule)
     text = (
-        f"*Active rule: {p.name}*\n"
+        f"*Your active rule: {p.name}* (id {active_rule.id})\n"
         f"Max buy: {p.max_buy_size_sol} SOL\n"
         f"Min liquidity: ${p.min_liquidity_usd:,.0f}\n"
         f"Min holders: {p.min_holders}\n"
@@ -101,12 +104,40 @@ async def rules(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def listrules(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    all_rules = await repo.get_all_rules()
-    if not all_rules:
-        await update.message.reply_text("No rule sets saved yet. Use /setrule to create one.")
+    my_rules = await repo.get_rules_for_admin(update.effective_user.id)
+    if not my_rules:
+        await update.message.reply_text("You haven't saved any rule sets yet. Use /setrule to create one.")
         return
-    lines = [f"- {'[ACTIVE] ' if r.is_active else ''}{r.name} (id {r.id})" for r in all_rules]
-    await update.message.reply_text("*Saved rule sets:*\n" + "\n".join(lines), parse_mode="Markdown")
+    lines = [f"- {'[ACTIVE] ' if r.is_active else ''}{r.name} (id {r.id})" for r in my_rules]
+    await update.message.reply_text(
+        "*Your saved rule sets:*\n" + "\n".join(lines) + "\n\nSwitch with `/activaterule <id>`.",
+        parse_mode="Markdown",
+    )
+
+
+async def activaterule(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not is_admin(update.effective_user.id):
+        await update.message.reply_text("This action is restricted to the bot admin(s).")
+        return
+    args = context.args or []
+    if not args or not args[0].isdigit():
+        await update.message.reply_text("Usage: `/activaterule <id>` - see /listrules for your rule IDs.", parse_mode="Markdown")
+        return
+
+    rule_id = int(args[0])
+    rule = await repo.activate_rule_for_admin(rule_id, update.effective_user.id)
+    if not rule:
+        await update.message.reply_text(
+            f"No rule with id {rule_id} found among your own rule sets. Check /listrules - "
+            "you can only activate rules you created yourself."
+        )
+        return
+    await repo.write_audit_log(str(update.effective_user.id), "activate_rule", {"rule_id": rule.id})
+    await update.message.reply_text(
+        f"Activated `{rule.name}` (id {rule.id}) as your active rule. This only affects your own trading, "
+        "not other admins'.",
+        parse_mode="Markdown",
+    )
 
 
 async def balance(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
