@@ -43,7 +43,7 @@ class ScannerService:
         self._execution_router = execution_router
         self._watermarks = onchain_watcher.WatermarkStore()
         self._pending_watch: dict[str, datetime] = {}
-        self._notified_fail: set[str] = set()
+        self._notified_fail: set[tuple[str, int]] = set()
         self._holders_failure_count = 0
         self._holders_backoff_until: datetime | None = None
 
@@ -139,22 +139,25 @@ class ScannerService:
             )
             return True  # nothing more to do with this one, ever
 
-        if await repo.has_open_or_pending_position(token.mint):
+        if await repo.has_open_or_pending_position(token.mint, rule_row.created_by):
             return True
 
-        recent_buys = await repo.recent_buy_count(hours=1.0)
+        recent_buys = await repo.recent_buy_count(hours=1.0, owner_user_id=rule_row.created_by)
         if recent_buys >= rule_row.max_trades_per_hour:
             await repo.save_trade_decision(token.mint, rule_row.id, "skip", "max trades per hour reached", score_result.score)
             return False
 
-        seconds_since = await repo.seconds_since_last_buy()
+        seconds_since = await repo.seconds_since_last_buy(owner_user_id=rule_row.created_by)
         if seconds_since is not None and seconds_since < rule_row.cooldown_seconds:
             await repo.save_trade_decision(token.mint, rule_row.id, "skip", "cooldown active", score_result.score)
             return False
 
         amount_sol = min(rule_row.max_buy_size_sol, state.paper_balance_sol if state.mode == "paper" else rule_row.max_buy_size_sol)
         adapter = await self._execution_router.get_adapter(state.mode, rule_row.created_by)
-        await repo.create_order(token.mint, "buy", state.mode, "pending", amount_sol, token.price_usd)
+        await repo.create_order(
+            token.mint, "buy", state.mode, "pending", amount_sol, token.price_usd,
+            rule_id=rule_row.id, owner_user_id=rule_row.created_by,
+        )
         await self._notifier.buy_placed(token.ticker_symbol or token.mint[:8], amount_sol, state.mode)
 
         result = await adapter.buy(token, amount_sol)
@@ -174,20 +177,20 @@ class ScannerService:
         await self._notifier.buy_failed(token.ticker_symbol or token.mint[:8], result.error_message or "unknown error")
         return False
 
-    async def _screen_and_maybe_trade(self, token, active_rule, notify_on_fail: bool) -> bool:
-        if not active_rule:
+    async def _screen_and_maybe_trade(self, token, rule, notify_on_fail: bool) -> bool:
+        if not rule:
             return False
 
         from app.storage.repository import rule_row_to_params
 
-        rule_params = rule_row_to_params(active_rule)
+        rule_params = rule_row_to_params(rule)
         passed, reasons = evaluate_hard_filters(token, rule_params)
         score_result = compute_score(token, rule_params, settings.creator_watchlist)
 
         await repo.save_screening_result(
             token.mint, passed, score_result.score, reasons, token.liquidity_usd,
             token.holders, token.market_cap_usd, score_result.creator_match,
-            {"source": token.source, "breakdown": score_result.breakdown},
+            {"source": token.source, "breakdown": score_result.breakdown, "rule_id": rule.id},
         )
 
         if not passed:
@@ -202,35 +205,61 @@ class ScannerService:
         await self._notifier.new_qualified_token(
             token.ticker_symbol or token.mint[:8], token.mint, score_result.score, token.source
         )
-        return await self._maybe_trade(token, active_rule, score_result)
+        return await self._maybe_trade(token, rule, score_result)
 
-    async def _process_watched_wallet_pending(self, active_rule):
-        max_age = active_rule.max_age_seconds if active_rule else 3600
+    async def _process_watched_wallet_pending(self, active_rules: list):
+        """Each admin's rule ages a pending mint out independently (its own
+        max_age_seconds), and each is screened/traded independently - one
+        admin's rule matching or failing never affects another's. A mint
+        only leaves _pending_watch once every active rule has either traded
+        it or aged out on it.
+        """
         now = datetime.now(timezone.utc)
-
-        expired = [m for m, first_seen in self._pending_watch.items() if (now - first_seen).total_seconds() > max_age]
-        for mint in expired:
-            del self._pending_watch[mint]
-            self._notified_fail.discard(mint)
+        fallback_max_age = 3600  # only used if no admin has an active rule at all
 
         for mint in list(self._pending_watch.keys()):
+            first_seen = self._pending_watch[mint]
+            age_seconds = (now - first_seen).total_seconds()
+
+            if not active_rules:
+                if age_seconds > fallback_max_age:
+                    del self._pending_watch[mint]
+                continue
+
+            due_rules = [r for r in active_rules if age_seconds <= r.max_age_seconds]
+            if not due_rules:
+                # every active rule has aged out on this mint
+                del self._pending_watch[mint]
+                for r in active_rules:
+                    self._notified_fail.discard((mint, r.id))
+                continue
+
             token = await self._build_onchain_snapshot(mint)
             if token is None:
                 continue
             await repo.save_token(token)
             token = await self._enrich_holders(token)
 
-            done = await self._screen_and_maybe_trade(token, active_rule, notify_on_fail=(mint not in self._notified_fail))
-            self._notified_fail.add(mint)
-            if done:
+            all_settled = True
+            for rule in due_rules:
+                key = (mint, rule.id)
+                done = await self._screen_and_maybe_trade(token, rule, notify_on_fail=(key not in self._notified_fail))
+                self._notified_fail.add(key)
+                if done:
+                    self._notified_fail.discard(key)
+                else:
+                    all_settled = False
+
+            if all_settled:
                 del self._pending_watch[mint]
-                self._notified_fail.discard(mint)
+                for rule in active_rules:
+                    self._notified_fail.discard((mint, rule.id))
 
     async def scan_once(self):
-        active_rule = await repo.get_active_rule()
+        active_rules = await repo.get_all_active_rules()
 
         await self._watch_wallets_for_new_mints()
-        await self._process_watched_wallet_pending(active_rule)
+        await self._process_watched_wallet_pending(active_rules)
 
         for token in await self._fetch_new_tokens():
             if await repo.token_already_seen(token.mint):
@@ -238,7 +267,8 @@ class ScannerService:
             await repo.save_token(token)
             metrics.tokens_scanned += 1
             token = await self._enrich_holders(token)
-            await self._screen_and_maybe_trade(token, active_rule, notify_on_fail=True)
+            for rule in active_rules:
+                await self._screen_and_maybe_trade(token, rule, notify_on_fail=True)
 
     async def run_forever(self):
         while True:
