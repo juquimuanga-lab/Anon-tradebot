@@ -154,6 +154,36 @@ async def test_healthy_position_with_no_triggers_stays_open(manager, monkeypatch
     assert len(await _closed_for(mint)) == 0
 
 
+async def test_failed_sell_leaves_position_open_instead_of_closing_it(manager, monkeypatch):
+    """Regression test: a sell that fails on-chain (adapter returns
+    success=False) used to still reduce remaining_pct and close the
+    position anyway, permanently losing track of tokens that were never
+    actually sold. It should now leave the position untouched so it gets
+    retried on the next check_position cycle."""
+    from app.execution.base import OrderResult
+    from app.execution.paper import PaperExecutionAdapter
+
+    mint = "FailedSellMint666"
+    await _make_token(mint)
+    rule = await _make_rule(stop_loss_pct=20.0)
+    position = await repo.create_position(mint, rule.id, "paper", entry_price_usd=1.0, amount_tokens=100, amount_sol_invested=1.0)
+
+    monkeypatch.setattr("app.positions.manager.get_current_price_usd", _fixed_price(0.75))
+    monkeypatch.setattr("app.positions.manager.get_current_volume_usd", _fixed_volume(0.0))
+
+    async def _failing_sell(self, token, amount_tokens, sell_pct):
+        return OrderResult(success=False, status="failed", error_message="slippage tolerance exceeded")
+
+    monkeypatch.setattr(PaperExecutionAdapter, "sell", _failing_sell)
+
+    await manager.check_position(position)
+
+    still_open = await _open_for(mint)
+    assert len(still_open) == 1
+    assert still_open[0].remaining_pct == 100.0
+    assert len(await _closed_for(mint)) == 0
+
+
 def _fixed_price(price: float):
     async def _fn(client, token, tick=0):
         return price, False
