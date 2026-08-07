@@ -21,6 +21,7 @@ def build_application() -> Application:
     application.add_handler(CommandHandler("status", handlers_basic.status))
     application.add_handler(CommandHandler("rules", handlers_basic.rules))
     application.add_handler(CommandHandler("listrules", handlers_basic.listrules))
+    application.add_handler(CommandHandler("activaterule", handlers_basic.activaterule))
     application.add_handler(CommandHandler("balance", handlers_basic.balance))
     application.add_handler(CommandHandler("positions", handlers_basic.positions_cmd))
     application.add_handler(CommandHandler("history", handlers_basic.history))
