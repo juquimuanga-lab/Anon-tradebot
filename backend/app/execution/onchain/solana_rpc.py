@@ -43,13 +43,40 @@ async def send_and_confirm(rpc_url: str, signed_tx_bytes: bytes, last_valid_bloc
             raise SolanaTxError(redact_text(f"broadcast failed: {exc}"))
 
         signature = resp.value
+        solscan_link = f"https://solscan.io/tx/{signature}"
+
         try:
-            await asyncio.wait_for(
+            confirm_resp = await asyncio.wait_for(
                 client.confirm_transaction(signature, last_valid_block_height=last_valid_block_height),
                 timeout=45,
             )
         except asyncio.TimeoutError:
-            logger.warning("confirmation_timed_out", extra={"signature": str(signature)})
+            # Previously: logged a warning and fell through to `return
+            # str(signature)` as if it succeeded. A timeout means we
+            # genuinely don't know the outcome - the safe default for a
+            # trading bot is to NOT report success when unconfirmed.
+            raise SolanaTxError(
+                f"confirmation timed out after 45s - unknown outcome, check manually: {solscan_link}"
+            )
+        except Exception as exc:
+            raise SolanaTxError(redact_text(f"confirmation failed: {exc}")) from exc
+
+        # This was the actual bug: send_raw_transaction accepting a tx just
+        # means the RPC relayed it, not that it succeeded on-chain - and
+        # confirm_transaction returning without raising only means the
+        # signature reached the target commitment level, NOT that it
+        # succeeded (a transaction that fails on-chain - e.g. slippage
+        # exceeded, which is common on a token this fresh/thin - still gets
+        # included in a block with a non-null `err`). The old code never
+        # looked at `err` at all, so every broadcast that didn't outright
+        # throw was reported as a successful, filled trade regardless of
+        # what actually happened on-chain.
+        status = confirm_resp.value[0] if confirm_resp.value else None
+        if status is None:
+            raise SolanaTxError(f"no confirmation status returned, unknown outcome: {solscan_link}")
+        if status.err is not None:
+            raise SolanaTxError(f"transaction landed but failed on-chain: {status.err} - {solscan_link}")
+
         return str(signature)
 
 
