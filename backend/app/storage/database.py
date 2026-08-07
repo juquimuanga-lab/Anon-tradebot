@@ -23,6 +23,25 @@ async def init_db() -> None:
 
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
+        await conn.run_sync(_migrate_add_missing_columns)
+
+
+def _migrate_add_missing_columns(conn) -> None:
+    """create_all only creates tables that don't exist yet - it never alters
+    an existing table. This adds columns introduced after the table already
+    existed on a deployed database (e.g. Railway's persistent volume).
+    Safe to run on every startup: checks each column before adding it.
+    """
+    from sqlalchemy import inspect, text
+
+    inspector = inspect(conn)
+    if "orders" not in inspector.get_table_names():
+        return
+    existing = {col["name"] for col in inspector.get_columns("orders")}
+    if "rule_id" not in existing:
+        conn.execute(text("ALTER TABLE orders ADD COLUMN rule_id INTEGER"))
+    if "owner_user_id" not in existing:
+        conn.execute(text("ALTER TABLE orders ADD COLUMN owner_user_id INTEGER"))
 
 
 @asynccontextmanager
