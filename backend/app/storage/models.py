@@ -93,6 +93,8 @@ class Order(Base):
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     mint: Mapped[str] = mapped_column(ForeignKey("tokens.mint"), index=True)
+    rule_id: Mapped[int | None] = mapped_column(ForeignKey("rules.id"), nullable=True)
+    owner_user_id: Mapped[int | None] = mapped_column(Integer, nullable=True, index=True)
     side: Mapped[str] = mapped_column(String)
     mode: Mapped[str] = mapped_column(String)
     status: Mapped[str] = mapped_column(String, default="pending")
@@ -110,7 +112,7 @@ class Position(Base):
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     mint: Mapped[str] = mapped_column(ForeignKey("tokens.mint"), index=True)
     rule_id: Mapped[int | None] = mapped_column(ForeignKey("rules.id"), nullable=True)
-    owner_user_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    owner_user_id: Mapped[int | None] = mapped_column(Integer, nullable=True, index=True)
     status: Mapped[str] = mapped_column(String, default="open")
     mode: Mapped[str] = mapped_column(String, default="paper")
     entry_price_usd: Mapped[float] = mapped_column(Float, default=0.0)
