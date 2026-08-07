@@ -52,8 +52,22 @@ class PositionManager:
             invested_portion, exit_price, result.tx_signature, result.error_message,
         )
 
+        if not result.success:
+            # The sell never actually executed - leave the position exactly
+            # as it was (same remaining_pct, still open) so it gets
+            # re-attempted on the next check_position cycle. Previously this
+            # fell through to the same remaining_pct-reduction/close logic
+            # as a successful sell, which would mark tokens as sold (and,
+            # for a full exit, close the position entirely) even though
+            # nothing was ever sold on-chain.
+            await self._notifier.sell_triggered(position.owner_user_id, token.ticker_symbol or token.mint[:8], reason, sell_pct)
+            await self._notifier.sell_failed(
+                position.owner_user_id, token.ticker_symbol or token.mint[:8], result.error_message or "unknown error"
+            )
+            return
+
         remaining_pct = max(0.0, position.remaining_pct - sell_pct)
-        if position.mode == "paper" and result.success:
+        if position.mode == "paper":
             from app.execution.paper import PaperExecutionAdapter
 
             if isinstance(adapter, PaperExecutionAdapter):
@@ -71,8 +85,10 @@ class PositionManager:
                 position.id, remaining_pct=remaining_pct, realized_pnl_usd=position.realized_pnl_usd + pnl_amount,
             )
 
-        await self._notifier.sell_triggered(token.ticker_symbol or token.mint[:8], reason, sell_pct)
-        await self._notifier.sell_filled(token.ticker_symbol or token.mint[:8], exit_price, pnl_amount)
+        await self._notifier.sell_triggered(position.owner_user_id, token.ticker_symbol or token.mint[:8], reason, sell_pct)
+        await self._notifier.sell_filled(
+            position.owner_user_id, token.ticker_symbol or token.mint[:8], exit_price, pnl_amount, result.tx_signature
+        )
 
     async def check_position(self, position):
         token_row = await repo.get_token(position.mint)
