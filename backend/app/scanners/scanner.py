@@ -158,7 +158,7 @@ class ScannerService:
             token.mint, "buy", state.mode, "pending", amount_sol, token.price_usd,
             rule_id=rule_row.id, owner_user_id=rule_row.created_by,
         )
-        await self._notifier.buy_placed(token.ticker_symbol or token.mint[:8], amount_sol, state.mode)
+        await self._notifier.buy_placed(rule_row.created_by, token.ticker_symbol or token.mint[:8], amount_sol, state.mode)
 
         result = await adapter.buy(token, amount_sol)
         if result.success:
@@ -170,11 +170,13 @@ class ScannerService:
             )
             await repo.save_trade_decision(token.mint, rule_row.id, "buy", "passed rules", score_result.score)
             metrics.trades_placed += 1
-            await self._notifier.buy_filled(token.ticker_symbol or token.mint[:8], fill_price, state.mode)
+            await self._notifier.buy_filled(
+                rule_row.created_by, token.ticker_symbol or token.mint[:8], fill_price, state.mode, result.tx_signature
+            )
             return True
 
         await repo.save_trade_decision(token.mint, rule_row.id, "buy_failed", result.error_message or "unknown error", score_result.score)
-        await self._notifier.buy_failed(token.ticker_symbol or token.mint[:8], result.error_message or "unknown error")
+        await self._notifier.buy_failed(rule_row.created_by, token.ticker_symbol or token.mint[:8], result.error_message or "unknown error")
         return False
 
     async def _screen_and_maybe_trade(self, token, rule, notify_on_fail: bool) -> bool:
@@ -195,7 +197,7 @@ class ScannerService:
 
         if not passed:
             if notify_on_fail:
-                await self._notifier.rule_violation(token.ticker_symbol or token.mint[:8], reasons)
+                await self._notifier.rule_violation(rule.created_by, token.ticker_symbol or token.mint[:8], reasons)
             return False
 
         if score_result.score < settings.qualify_score_threshold:
@@ -203,7 +205,7 @@ class ScannerService:
 
         metrics.tokens_qualified += 1
         await self._notifier.new_qualified_token(
-            token.ticker_symbol or token.mint[:8], token.mint, score_result.score, token.source
+            rule.created_by, token.ticker_symbol or token.mint[:8], token.mint, score_result.score, token.source
         )
         return await self._maybe_trade(token, rule, score_result)
 
