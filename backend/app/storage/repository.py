@@ -39,11 +39,56 @@ async def update_bot_state(**kwargs) -> BotState:
         return state
 
 
-async def get_active_rule() -> Optional[Rule]:
+async def get_active_rule_for(admin_id: int) -> Optional[Rule]:
     async with async_session_scope() as session:
         return (
-            await session.execute(select(Rule).where(Rule.is_active.is_(True)).order_by(Rule.id.desc()))
+            await session.execute(
+                select(Rule).where(Rule.is_active.is_(True), Rule.created_by == admin_id)
+                .order_by(Rule.id.desc())
+            )
         ).scalars().first()
+
+
+async def get_all_active_rules() -> list[Rule]:
+    """One row per admin at most (create_rule/activate_rule_for_admin only ever
+    deactivate that same admin's other rules), so this is effectively 'the
+    current active rule for every admin who has one'."""
+    async with async_session_scope() as session:
+        rows = (
+            await session.execute(select(Rule).where(Rule.is_active.is_(True)))
+        ).scalars().all()
+        return list(rows)
+
+
+async def get_rules_for_admin(admin_id: int) -> list[Rule]:
+    async with async_session_scope() as session:
+        rows = (
+            await session.execute(
+                select(Rule).where(Rule.created_by == admin_id).order_by(Rule.id.desc())
+            )
+        ).scalars().all()
+        return list(rows)
+
+
+async def activate_rule_for_admin(rule_id: int, admin_id: int) -> Optional[Rule]:
+    """Activates one of admin_id's own past rules, deactivating only that
+    same admin's other rules. Returns None (no-op) if rule_id doesn't exist
+    or belongs to a different admin - never touches another admin's rules."""
+    async with async_session_scope() as session:
+        target = (
+            await session.execute(select(Rule).where(Rule.id == rule_id, Rule.created_by == admin_id))
+        ).scalars().first()
+        if not target:
+            return None
+        await session.execute(
+            Rule.__table__.update()
+            .where(Rule.is_active.is_(True), Rule.created_by == admin_id)
+            .values(is_active=False)
+        )
+        target.is_active = True
+        await session.commit()
+        await session.refresh(target)
+        return target
 
 
 async def token_already_seen(mint: str) -> bool:
@@ -53,33 +98,32 @@ async def token_already_seen(mint: str) -> bool:
         ).scalar_one_or_none() is not None
 
 
-async def has_open_or_pending_position(mint: str) -> bool:
+async def has_open_or_pending_position(mint: str, owner_user_id: Optional[int] = None) -> bool:
     async with async_session_scope() as session:
-        existing = (
-            await session.execute(
-                select(Position).where(Position.mint == mint, Position.status == "open")
-            )
-        ).scalar_one_or_none()
+        conditions = [Position.mint == mint, Position.status == "open"]
+        if owner_user_id is not None:
+            conditions.append(Position.owner_user_id == owner_user_id)
+        existing = (await session.execute(select(Position).where(*conditions))).scalar_one_or_none()
         return existing is not None
 
 
-async def recent_buy_count(hours: float = 1.0) -> int:
+async def recent_buy_count(hours: float = 1.0, owner_user_id: Optional[int] = None) -> int:
     since = datetime.now(timezone.utc) - timedelta(hours=hours)
     async with async_session_scope() as session:
-        rows = (
-            await session.execute(
-                select(Order).where(Order.side == "buy", Order.created_at >= since, Order.status == "filled")
-            )
-        ).scalars().all()
+        conditions = [Order.side == "buy", Order.created_at >= since, Order.status == "filled"]
+        if owner_user_id is not None:
+            conditions.append(Order.owner_user_id == owner_user_id)
+        rows = (await session.execute(select(Order).where(*conditions))).scalars().all()
         return len(rows)
 
 
-async def seconds_since_last_buy() -> Optional[float]:
+async def seconds_since_last_buy(owner_user_id: Optional[int] = None) -> Optional[float]:
     async with async_session_scope() as session:
+        conditions = [Order.side == "buy", Order.status == "filled"]
+        if owner_user_id is not None:
+            conditions.append(Order.owner_user_id == owner_user_id)
         last = (
-            await session.execute(
-                select(Order).where(Order.side == "buy", Order.status == "filled").order_by(Order.created_at.desc())
-            )
+            await session.execute(select(Order).where(*conditions).order_by(Order.created_at.desc()))
         ).scalars().first()
         if not last:
             return None
@@ -137,7 +181,8 @@ async def save_trade_decision(mint: str, rule_id: Optional[int], decision: str, 
 
 async def create_order(mint: str, side: str, mode: str, status: str, requested_amount_sol: float,
                         price_usd: float, tx_signature: Optional[str] = None,
-                        error_message: Optional[str] = None) -> Order:
+                        error_message: Optional[str] = None, rule_id: Optional[int] = None,
+                        owner_user_id: Optional[int] = None) -> Order:
     async with async_session_scope() as session:
         order = Order(
             mint=mint,
@@ -148,6 +193,8 @@ async def create_order(mint: str, side: str, mode: str, status: str, requested_a
             price_usd=price_usd,
             tx_signature=tx_signature,
             error_message=error_message,
+            rule_id=rule_id,
+            owner_user_id=owner_user_id,
         )
         session.add(order)
         await session.commit()
@@ -242,7 +289,9 @@ async def create_rule(params: RuleParams, created_by: int, activate: bool = True
     async with async_session_scope() as session:
         if activate:
             await session.execute(
-                Rule.__table__.update().where(Rule.is_active.is_(True)).values(is_active=False)
+                Rule.__table__.update()
+                .where(Rule.is_active.is_(True), Rule.created_by == created_by)
+                .values(is_active=False)
             )
         rule = Rule(
             name=params.name,
