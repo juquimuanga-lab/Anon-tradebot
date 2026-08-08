@@ -38,7 +38,14 @@ async def build_unsigned_swap(
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
     )
-    stdout, stderr = await asyncio.wait_for(proc.communicate(json.dumps(payload).encode()), timeout=30)
+    try:
+        stdout, stderr = await asyncio.wait_for(proc.communicate(json.dumps(payload).encode()), timeout=30)
+    except asyncio.TimeoutError:
+        # wait_for cancels the communicate() call but does NOT kill the
+        # underlying OS process - without this it keeps running orphaned.
+        proc.kill()
+        await proc.wait()
+        raise DbcBuildError("dbc builder timed out after 30s (node process killed)")
 
     if not stdout.strip():
         raise DbcBuildError(f"dbc builder produced no output (stderr: {stderr.decode()[:300]})")
@@ -60,7 +67,12 @@ async def get_pool_info(base_mint: str, rpc_url: str) -> dict:
         stderr=asyncio.subprocess.PIPE,
     )
     payload = json.dumps({"baseMint": base_mint, "rpcUrl": rpc_url}).encode()
-    stdout, stderr = await asyncio.wait_for(proc.communicate(payload), timeout=30)
+    try:
+        stdout, stderr = await asyncio.wait_for(proc.communicate(payload), timeout=30)
+    except asyncio.TimeoutError:
+        proc.kill()
+        await proc.wait()
+        raise DbcBuildError("pool_info timed out after 30s (node process killed)")
 
     if not stdout.strip():
         raise DbcBuildError(f"pool_info produced no output (stderr: {stderr.decode()[:300]})")
