@@ -154,7 +154,7 @@ class ScannerService:
 
         amount_sol = min(rule_row.max_buy_size_sol, state.paper_balance_sol if state.mode == "paper" else rule_row.max_buy_size_sol)
         adapter = await self._execution_router.get_adapter(state.mode, rule_row.created_by)
-        await repo.create_order(
+        order = await repo.create_order(
             token.mint, "buy", state.mode, "pending", amount_sol, token.price_usd,
             rule_id=rule_row.id, owner_user_id=rule_row.created_by,
         )
@@ -169,6 +169,7 @@ class ScannerService:
                 token.mint, rule_row.id, state.mode, fill_price, amount_tokens, amount_sol,
                 owner_user_id=rule_row.created_by, entry_volume_24h_usd=token.volume_24h_usd,
             )
+            await repo.update_order(order.id, "filled", tx_signature=result.tx_signature)
             await repo.save_trade_decision(token.mint, rule_row.id, "buy", "passed rules", score_result.score)
             metrics.trades_placed += 1
             logger.info("buy_filled", extra={"mint": token.mint, "rule_id": rule_row.id, "tx_signature": result.tx_signature})
@@ -177,6 +178,7 @@ class ScannerService:
             )
             return True
 
+        await repo.update_order(order.id, "failed", error_message=result.error_message)
         await repo.save_trade_decision(token.mint, rule_row.id, "buy_failed", result.error_message or "unknown error", score_result.score)
         logger.warning("buy_failed", extra={"mint": token.mint, "rule_id": rule_row.id, "error": result.error_message})
         await self._notifier.buy_failed(rule_row.created_by, token.ticker_symbol or token.mint[:8], result.error_message or "unknown error")
