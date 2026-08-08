@@ -202,6 +202,22 @@ async def create_order(mint: str, side: str, mode: str, status: str, requested_a
         return order
 
 
+async def update_order(order_id: int, status: str, tx_signature: Optional[str] = None,
+                        error_message: Optional[str] = None) -> None:
+    """Buys are created with status='pending' before the actual on-chain
+    attempt (so /history and Telegram both show something immediately) -
+    this is what was missing to ever move it to 'filled'/'failed'
+    afterward. Without this, every order stayed 'pending' forever
+    regardless of what actually happened on-chain."""
+    async with async_session_scope() as session:
+        await session.execute(
+            Order.__table__.update().where(Order.id == order_id).values(
+                status=status, tx_signature=tx_signature, error_message=error_message,
+            )
+        )
+        await session.commit()
+
+
 async def create_position(mint: str, rule_id: Optional[int], mode: str, entry_price_usd: float,
                            amount_tokens: float, amount_sol_invested: float,
                            owner_user_id: Optional[int] = None, entry_volume_24h_usd: float = 0.0) -> Position:
