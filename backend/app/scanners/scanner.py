@@ -158,6 +158,7 @@ class ScannerService:
             token.mint, "buy", state.mode, "pending", amount_sol, token.price_usd,
             rule_id=rule_row.id, owner_user_id=rule_row.created_by,
         )
+        logger.info("buy_placed", extra={"mint": token.mint, "rule_id": rule_row.id, "amount_sol": amount_sol, "mode": state.mode})
         await self._notifier.buy_placed(rule_row.created_by, token.ticker_symbol or token.mint[:8], amount_sol, state.mode)
 
         result = await adapter.buy(token, amount_sol)
@@ -170,12 +171,14 @@ class ScannerService:
             )
             await repo.save_trade_decision(token.mint, rule_row.id, "buy", "passed rules", score_result.score)
             metrics.trades_placed += 1
+            logger.info("buy_filled", extra={"mint": token.mint, "rule_id": rule_row.id, "tx_signature": result.tx_signature})
             await self._notifier.buy_filled(
                 rule_row.created_by, token.ticker_symbol or token.mint[:8], fill_price, state.mode, result.tx_signature
             )
             return True
 
         await repo.save_trade_decision(token.mint, rule_row.id, "buy_failed", result.error_message or "unknown error", score_result.score)
+        logger.warning("buy_failed", extra={"mint": token.mint, "rule_id": rule_row.id, "error": result.error_message})
         await self._notifier.buy_failed(rule_row.created_by, token.ticker_symbol or token.mint[:8], result.error_message or "unknown error")
         return False
 
@@ -204,6 +207,7 @@ class ScannerService:
             return False
 
         metrics.tokens_qualified += 1
+        logger.info("token_qualified", extra={"mint": token.mint, "rule_id": rule.id, "score": score_result.score})
         await self._notifier.new_qualified_token(
             rule.created_by, token.ticker_symbol or token.mint[:8], token.mint, score_result.score, token.source
         )
