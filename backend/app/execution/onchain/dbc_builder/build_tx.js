@@ -34,7 +34,7 @@ async function main() {
   const poolAddress = poolAccount.publicKey;
   const virtualPool = poolAccount.account;
 
-  const config = await client.state.getPoolConfig(virtualPool.config);
+  const config = await client.state.getPoolConfig(virtualPool.poolState.config);
   if (!config) {
     throw new Error('pool_config_not_found');
   }
