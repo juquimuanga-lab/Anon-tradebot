@@ -20,6 +20,7 @@ from datetime import datetime, timedelta, timezone
 from app.config.settings import settings
 from app.connectors.anoncoin import AnoncoinAPIError, AnoncoinClient
 from app.connectors.helius import HeliusAPIError, HeliusClient
+from app.execution.base import OrderResult
 from app.execution.onchain import meteora_dbc
 from app.execution.onchain.meteora_dbc import DbcBuildError
 from app.execution.router import ExecutionRouter
@@ -161,7 +162,22 @@ class ScannerService:
         logger.info("buy_placed", extra={"mint": token.mint, "rule_id": rule_row.id, "amount_sol": amount_sol, "mode": state.mode})
         await self._notifier.buy_placed(rule_row.created_by, token.ticker_symbol or token.mint[:8], amount_sol, state.mode)
 
-        result = await adapter.buy(token, amount_sol)
+        try:
+            result = await asyncio.wait_for(adapter.buy(token, amount_sol), timeout=settings.execution_timeout_seconds)
+        except asyncio.TimeoutError:
+            # Belt-and-suspenders: every await inside adapter.buy() is already
+            # either try/excepted or bounded by its own timeout, but this
+            # guarantees the order can never sit in 'pending' forever (visible
+            # via /history) with no Telegram follow-up if something inside
+            # still manages to hang - e.g. a cancelled task on redeploy.
+            logger.error("buy_execution_timeout", extra={"mint": token.mint, "rule_id": rule_row.id})
+            result = OrderResult(
+                success=False, status="failed",
+                error_message=(
+                    f"execution did not resolve within {settings.execution_timeout_seconds}s - "
+                    "outcome unknown, verify wallet balance / Solscan manually"
+                ),
+            )
         if result.success:
             fill_price = result.price_usd or token.price_usd
             amount_tokens = amount_sol / max(fill_price, 1e-12)
