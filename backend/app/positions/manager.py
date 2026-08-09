@@ -4,6 +4,7 @@ import logging
 
 from app.config.settings import settings
 from app.connectors.anoncoin import AnoncoinClient
+from app.execution.base import OrderResult
 from app.execution.price_source import get_current_price_usd, get_current_volume_usd
 from app.execution.router import ExecutionRouter
 from app.scoring.rules import RuleParams, TokenSnapshot
@@ -37,7 +38,19 @@ class PositionManager:
     async def _close_position(self, position, token: TokenSnapshot, current_price: float, sell_pct: float, reason: str):
         adapter = await self._execution_router.get_adapter(position.mode, position.owner_user_id)
         amount_to_sell = position.amount_tokens * (sell_pct / 100)
-        result = await adapter.sell(token, amount_to_sell, sell_pct)
+        try:
+            result = await asyncio.wait_for(
+                adapter.sell(token, amount_to_sell, sell_pct), timeout=settings.execution_timeout_seconds
+            )
+        except asyncio.TimeoutError:
+            logger.error("sell_execution_timeout", extra={"mint": token.mint, "position_id": position.id})
+            result = OrderResult(
+                success=False, status="failed",
+                error_message=(
+                    f"execution did not resolve within {settings.execution_timeout_seconds}s - "
+                    "outcome unknown, verify wallet balance / Solscan manually"
+                ),
+            )
 
         exit_price = result.price_usd if result.success else current_price
         invested_portion = position.amount_sol_invested * (sell_pct / 100)
