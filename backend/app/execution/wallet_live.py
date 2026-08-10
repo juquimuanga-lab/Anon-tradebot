@@ -54,7 +54,7 @@ class WalletExecutionAdapter(ExecutionAdapter):
 
     async def _execute(self, action: str, token: TokenSnapshot, amount_in_base_units: int) -> OrderResult:
         slippage_bps = self._default_slippage_bps
-        for attempt in range(2):  # 1 retry, only for a stale/unrecognized blockhash - see _is_stale_blockhash_error
+        for attempt in range(3):  # up to 2 retries, only for a stale/unrecognized blockhash - see _is_stale_blockhash_error
             try:
                 if not token.is_migrated:
                     built = await meteora_dbc.build_unsigned_swap(
@@ -78,9 +78,10 @@ class WalletExecutionAdapter(ExecutionAdapter):
 
                 return OrderResult(success=True, status="filled", price_usd=token.price_usd, tx_signature=signature)
             except (DbcBuildError, JupiterError, SolanaTxError) as exc:
-                if attempt == 0 and _is_stale_blockhash_error(exc):
+                if attempt < 2 and _is_stale_blockhash_error(exc):
                     logger.warning(
-                        "retrying_with_fresh_blockhash", extra={"mint": token.mint, "action": action, "error": str(exc)}
+                        "retrying_with_fresh_blockhash",
+                        extra={"mint": token.mint, "action": action, "attempt": attempt, "error": str(exc)},
                     )
                     continue
                 logger.warning("onchain_execution_failed", extra={"mint": token.mint, "action": action, "error": str(exc)})
