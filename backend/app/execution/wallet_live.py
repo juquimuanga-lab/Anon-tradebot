@@ -28,6 +28,17 @@ logger = logging.getLogger("app.execution.wallet_live")
 LAMPORTS_PER_SOL = 1_000_000_000
 
 
+def _is_stale_blockhash_error(exc: Exception) -> bool:
+    """True for a preflight BlockhashNotFound (or similarly-worded expiry).
+    Safe to retry: a preflight rejection means the RPC node refused to even
+    broadcast the transaction, so it never reached the network - there's no
+    risk of the original later landing after we've already sent a fresh one.
+    Common with load-balanced public RPC endpoints where the node that built
+    the blockhash and the node that simulates the send aren't in sync."""
+    text = str(exc).lower()
+    return "blockhashnotfound" in text.replace(" ", "") or "blockhash not found" in text
+
+
 class WalletExecutionAdapter(ExecutionAdapter):
     mode = "live"
 
@@ -43,34 +54,40 @@ class WalletExecutionAdapter(ExecutionAdapter):
 
     async def _execute(self, action: str, token: TokenSnapshot, amount_in_base_units: int) -> OrderResult:
         slippage_bps = self._default_slippage_bps
-        try:
-            if not token.is_migrated:
-                built = await meteora_dbc.build_unsigned_swap(
-                    action, token.mint, self._pubkey, amount_in_base_units, slippage_bps, self._rpc_url
-                )
-                signed = sign_legacy_transaction(built["transaction_b64"], built["blockhash"], self._keypair)
-                signature = await send_and_confirm(
-                    self._rpc_url, signed, built.get("last_valid_block_height")
-                )
-            else:
-                if action == "buy":
-                    built = await self._jupiter.buy_quote_tx(
-                        token.mint, amount_in_base_units, slippage_bps, self._pubkey
+        for attempt in range(2):  # 1 retry, only for a stale/unrecognized blockhash - see _is_stale_blockhash_error
+            try:
+                if not token.is_migrated:
+                    built = await meteora_dbc.build_unsigned_swap(
+                        action, token.mint, self._pubkey, amount_in_base_units, slippage_bps, self._rpc_url
+                    )
+                    signed = sign_legacy_transaction(built["transaction_b64"], built["blockhash"], self._keypair)
+                    signature = await send_and_confirm(
+                        self._rpc_url, signed, built.get("last_valid_block_height")
                     )
                 else:
-                    built = await self._jupiter.sell_quote_tx(
-                        token.mint, amount_in_base_units, slippage_bps, self._pubkey
-                    )
-                signed = sign_versioned_transaction(built["transaction_b64"], self._keypair)
-                signature = await send_and_confirm(self._rpc_url, signed)
+                    if action == "buy":
+                        built = await self._jupiter.buy_quote_tx(
+                            token.mint, amount_in_base_units, slippage_bps, self._pubkey
+                        )
+                    else:
+                        built = await self._jupiter.sell_quote_tx(
+                            token.mint, amount_in_base_units, slippage_bps, self._pubkey
+                        )
+                    signed = sign_versioned_transaction(built["transaction_b64"], self._keypair)
+                    signature = await send_and_confirm(self._rpc_url, signed)
 
-            return OrderResult(success=True, status="filled", price_usd=token.price_usd, tx_signature=signature)
-        except (DbcBuildError, JupiterError, SolanaTxError) as exc:
-            logger.warning("onchain_execution_failed", extra={"mint": token.mint, "action": action, "error": str(exc)})
-            return OrderResult(success=False, status="failed", error_message=str(exc))
-        except Exception as exc:  # defensive: never let a swap crash the bot
-            logger.exception("onchain_execution_unexpected_error")
-            return OrderResult(success=False, status="failed", error_message=f"unexpected error: {exc}")
+                return OrderResult(success=True, status="filled", price_usd=token.price_usd, tx_signature=signature)
+            except (DbcBuildError, JupiterError, SolanaTxError) as exc:
+                if attempt == 0 and _is_stale_blockhash_error(exc):
+                    logger.warning(
+                        "retrying_with_fresh_blockhash", extra={"mint": token.mint, "action": action, "error": str(exc)}
+                    )
+                    continue
+                logger.warning("onchain_execution_failed", extra={"mint": token.mint, "action": action, "error": str(exc)})
+                return OrderResult(success=False, status="failed", error_message=str(exc))
+            except Exception as exc:  # defensive: never let a swap crash the bot
+                logger.exception("onchain_execution_unexpected_error")
+                return OrderResult(success=False, status="failed", error_message=f"unexpected error: {exc}")
 
     async def buy(self, token: TokenSnapshot, amount_sol: float) -> OrderResult:
         amount_lamports = int(amount_sol * LAMPORTS_PER_SOL)
