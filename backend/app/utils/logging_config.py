@@ -32,4 +32,5 @@ def configure_logging() -> None:
     root.setLevel(getattr(logging, settings.log_level.upper(), logging.INFO))
     # Quiet noisy third-party loggers
     logging.getLogger("httpx").setLevel(logging.WARNING)
+    logging.getLogger("httpx2").setLevel(logging.WARNING)  # solana-py's internal alias for httpx - logs full request URLs (incl. ?api-key=...) at INFO otherwise
     logging.getLogger("telegram").setLevel(logging.WARNING)
