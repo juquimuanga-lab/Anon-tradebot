@@ -2,11 +2,10 @@
 
 Responsibilities:
 - Sign legacy and versioned Solana transactions.
-- Broadcast signed transactions through raw JSON-RPC.
-- Use explicit Solana send options without relying on TxOpts.
-- Keep retrying while the transaction's blockhash is valid.
-- Detect actual on-chain execution failures.
-- Detect blockhash expiration.
+- Broadcast signed transactions.
+- Keep checking a submitted transaction until it confirms or expires.
+- Detect transactions that landed but failed on-chain.
+- Provide useful transaction diagnostics.
 - Provide SOL balance lookups.
 
 The wallet Keypair only exists in this Python process.
@@ -43,23 +42,19 @@ logger = logging.getLogger(
 
 RPC_COMMITMENT = "confirmed"
 
-# How often we check whether the transaction has landed.
+# How frequently we check the transaction status.
 STATUS_POLL_INTERVAL_SECONDS = 0.25
 
-# How often we resend a still-valid transaction.
+# Minimum time between rebroadcasts.
 RESEND_INTERVAL_SECONDS = 0.50
 
-# HTTP timeout for an individual RPC request.
+# Timeout for an individual JSON-RPC request.
 RPC_REQUEST_TIMEOUT_SECONDS = 8.0
 
-# We control retries ourselves so we can continue until blockhash expiry.
+# We control rebroadcasting ourselves.
 RPC_MAX_RETRIES = 0
 
-# Keep preflight enabled for now.
-#
-# This is intentional while we are diagnosing the sniper. If preflight
-# passes, we know the RPC was able to verify the signature and simulate the
-# transaction before forwarding it.
+# Keep preflight enabled while we establish reliable execution.
 SKIP_PREFLIGHT = False
 
 
@@ -68,7 +63,7 @@ class SolanaTxError(Exception):
 
 
 # ---------------------------------------------------------------------------
-# Generic JSON-RPC helper
+# Generic JSON-RPC
 # ---------------------------------------------------------------------------
 
 async def _rpc_request(
@@ -89,6 +84,7 @@ async def _rpc_request(
         async with httpx.AsyncClient(
             timeout=RPC_REQUEST_TIMEOUT_SECONDS
         ) as client:
+
             response = await client.post(
                 rpc_url,
                 json=payload,
@@ -109,11 +105,9 @@ async def _rpc_request(
         ) from exc
 
     if "error" in body:
-        error = body["error"]
-
         raise SolanaTxError(
             redact_text(
-                f"RPC {method} error: {error}"
+                f"RPC {method} error: {body['error']}"
             )
         )
 
@@ -129,14 +123,12 @@ def sign_legacy_transaction(
     blockhash_str: str,
     keypair: Keypair,
 ) -> bytes:
-    """Decode and sign a legacy Solana transaction.
+    """Decode and sign a legacy transaction.
 
     Used by the Meteora DBC path.
 
-    build_tx.js has already constructed the transaction, including the
-    Compute Budget priority-fee instruction and final blockhash.
-
-    Signing preserves those instructions.
+    The transaction has already been constructed by build_tx.js, including
+    its Compute Budget priority-fee instruction and recent blockhash.
     """
 
     try:
@@ -163,7 +155,7 @@ def sign_versioned_transaction(
     tx_b64: str,
     keypair: Keypair,
 ) -> bytes:
-    """Decode and sign a versioned Solana transaction.
+    """Decode and sign a versioned transaction.
 
     Used by the Jupiter execution path.
     """
@@ -238,7 +230,7 @@ def _extract_signature(
 async def _get_block_height(
     rpc_url: str,
 ) -> Optional[int]:
-    """Get the current confirmed Solana block height."""
+    """Get the current confirmed block height."""
 
     try:
         result = await _rpc_request(
@@ -275,10 +267,10 @@ async def _get_signature_status(
     rpc_url: str,
     signature: str,
 ) -> Optional[dict]:
-    """Get the transaction status from the RPC.
+    """Get the current status for a transaction signature.
 
-    searchTransactionHistory=True is intentional. Solana documents that
-    getSignatureStatuses otherwise only searches the recent status cache.
+    searchTransactionHistory=True allows the RPC to look beyond its recent
+    status cache.
     """
 
     try:
@@ -323,10 +315,10 @@ async def _get_transaction_details(
     rpc_url: str,
     signature: str,
 ) -> Optional[dict]:
-    """Fetch confirmed transaction details for diagnostics."""
+    """Retrieve confirmed transaction details for diagnostics."""
 
     try:
-        result = await _rpc_request(
+        return await _rpc_request(
             rpc_url,
             "getTransaction",
             [
@@ -338,8 +330,6 @@ async def _get_transaction_details(
             ],
         )
 
-        return result
-
     except SolanaTxError:
         return None
 
@@ -348,15 +338,15 @@ def _format_transaction_error(
     status: Optional[dict],
     transaction: Optional[dict],
 ) -> str:
-    """Create a useful on-chain failure message."""
+    """Format useful on-chain error information."""
 
-    pieces = []
+    parts = []
 
     if status:
         status_error = status.get("err")
 
         if status_error is not None:
-            pieces.append(
+            parts.append(
                 f"status.err={status_error}"
             )
 
@@ -366,47 +356,44 @@ def _format_transaction_error(
         transaction_error = meta.get("err")
 
         if transaction_error is not None:
-            pieces.append(
+            parts.append(
                 f"transaction.meta.err={transaction_error}"
             )
 
         logs = meta.get("logMessages")
 
         if logs:
-            useful_logs = [
-                str(line)
-                for line in logs[-20:]
-            ]
-
-            pieces.append(
-                "logs:\n" +
-                "\n".join(useful_logs)
+            parts.append(
+                "program logs:\n" +
+                "\n".join(
+                    str(line)
+                    for line in logs[-20:]
+                )
             )
 
-    if not pieces:
+    if not parts:
         return "unknown on-chain transaction error"
 
-    return "\n".join(pieces)
+    return "\n".join(parts)
 
 
 # ---------------------------------------------------------------------------
-# Broadcast
+# Send transaction
 # ---------------------------------------------------------------------------
 
 async def _send_transaction(
     rpc_url: str,
     signed_tx_bytes: bytes,
 ) -> str:
-    """Send a signed transaction using explicit Solana RPC options.
+    """Submit a signed transaction through Solana JSON-RPC.
 
-    We use:
-        encoding = base64
-        skipPreflight = False
-        preflightCommitment = confirmed
-        maxRetries = 0
+    We explicitly control:
+    - base64 encoding
+    - preflight
+    - preflight commitment
+    - RPC retry behavior
 
-    maxRetries=0 is deliberate because this module controls resubmission
-    itself and can continue doing so until lastValidBlockHeight expires.
+    The application itself handles rebroadcasting.
     """
 
     encoded_transaction = base64.b64encode(
@@ -444,23 +431,21 @@ async def send_and_confirm(
     signed_tx_bytes: bytes,
     last_valid_block_height: int | None = None,
 ) -> str:
-    """Broadcast and confirm a signed Solana transaction.
+    """Send and track a Solana transaction until success or expiration.
 
-    The transaction is repeatedly checked and resent while its original
-    blockhash remains valid.
+    IMPORTANT:
 
-    We NEVER declare success merely because sendTransaction returned a
-    signature.
+    sendTransaction returning a signature is NOT considered a successful
+    trade.
 
-    Success requires:
-        confirmationStatus = confirmed/finalized
+    The transaction is considered successful only when:
+        confirmationStatus == confirmed/finalized
         AND
-        err = null
+        err == None
 
-    Failure requires:
-        an actual on-chain error
-        OR
-        blockhash expiration
+    The transaction is considered failed when:
+        - it lands with an on-chain error, OR
+        - its blockhash actually expires without confirmation.
     """
 
     if not signed_tx_bytes:
@@ -480,17 +465,19 @@ async def send_and_confirm(
         "transaction_delivery_started",
         extra={
             "signature": signature,
-            "last_valid_block_height": last_valid_block_height,
+            "last_valid_block_height": (
+                last_valid_block_height
+            ),
         },
     )
 
     last_send_time = 0.0
     send_count = 0
-    started_at = time.monotonic()
 
     while True:
+
         # ---------------------------------------------------------------
-        # 1. Check whether transaction has already landed.
+        # 1. Check transaction status FIRST
         # ---------------------------------------------------------------
 
         status = await _get_signature_status(
@@ -502,20 +489,24 @@ async def send_and_confirm(
 
             transaction_error = status.get("err")
 
+            # Transaction landed but program execution failed.
             if transaction_error is not None:
-                transaction = await _get_transaction_details(
-                    rpc_url,
-                    signature,
+
+                transaction = (
+                    await _get_transaction_details(
+                        rpc_url,
+                        signature,
+                    )
                 )
 
-                error_details = _format_transaction_error(
+                details = _format_transaction_error(
                     status,
                     transaction,
                 )
 
                 raise SolanaTxError(
                     "transaction landed but failed on-chain:\n"
-                    f"{error_details}\n"
+                    f"{details}\n"
                     f"{solscan_link}"
                 )
 
@@ -523,10 +514,12 @@ async def send_and_confirm(
                 "confirmationStatus"
             )
 
+            # Only now do we declare the buy successful.
             if confirmation_status in (
                 "confirmed",
                 "finalized",
             ):
+
                 logger.info(
                     "transaction_confirmed",
                     extra={
@@ -541,7 +534,7 @@ async def send_and_confirm(
                 return signature
 
         # ---------------------------------------------------------------
-        # 2. Check blockhash expiration.
+        # 2. Check whether the transaction is still valid
         # ---------------------------------------------------------------
 
         current_height = await _get_block_height(
@@ -553,17 +546,21 @@ async def send_and_confirm(
             and current_height is not None
             and current_height > last_valid_block_height
         ):
-            # One final status lookup after expiry. It is possible for the
-            # transaction to have landed at the boundary.
+
+            # One final status check at the expiry boundary.
             final_status = await _get_signature_status(
                 rpc_url,
                 signature,
             )
 
             if final_status is not None:
-                final_error = final_status.get("err")
+
+                final_error = final_status.get(
+                    "err"
+                )
 
                 if final_error is not None:
+
                     transaction = (
                         await _get_transaction_details(
                             rpc_url,
@@ -571,14 +568,14 @@ async def send_and_confirm(
                         )
                     )
 
-                    error_details = _format_transaction_error(
+                    details = _format_transaction_error(
                         final_status,
                         transaction,
                     )
 
                     raise SolanaTxError(
                         "transaction landed but failed on-chain:\n"
-                        f"{error_details}\n"
+                        f"{details}\n"
                         f"{solscan_link}"
                     )
 
@@ -596,23 +593,30 @@ async def send_and_confirm(
 
             raise SolanaTxError(
                 "transaction blockhash expired before "
-                f"confirmation. Last valid block height: "
-                f"{last_valid_block_height}; current: "
+                "confirmation. "
+                f"last_valid_block_height="
+                f"{last_valid_block_height}, "
+                f"current_block_height="
                 f"{current_height}. "
                 f"{solscan_link}"
             )
 
         # ---------------------------------------------------------------
-        # 3. Broadcast/rebroadcast.
+        # 3. Rebroadcast while transaction remains valid
         # ---------------------------------------------------------------
 
         now = time.monotonic()
 
-        if (
+        should_send = (
             send_count == 0
-            or now - last_send_time
-            >= RESEND_INTERVAL_SECONDS
-        ):
+            or (
+                now - last_send_time
+                >= RESEND_INTERVAL_SECONDS
+            )
+        )
+
+        if should_send:
+
             try:
                 returned_signature = (
                     await _send_transaction(
@@ -625,11 +629,14 @@ async def send_and_confirm(
                 last_send_time = now
 
                 if returned_signature != signature:
+
                     logger.warning(
                         "rpc_signature_mismatch",
                         extra={
                             "local_signature": signature,
-                            "rpc_signature": returned_signature,
+                            "rpc_signature": (
+                                returned_signature
+                            ),
                         },
                     )
 
@@ -648,6 +655,7 @@ async def send_and_confirm(
                 )
 
             except SolanaTxError as exc:
+
                 error_text = str(exc)
 
                 logger.warning(
@@ -661,45 +669,40 @@ async def send_and_confirm(
                     },
                 )
 
-                # If the RPC explicitly rejected the transaction during
-                # preflight, don't blindly resend it forever. The error is
-                # generally deterministic and is exactly what we need for
-                # diagnosing the transaction.
-                lower_error = error_text.lower()
+                lower_error = (
+                    error_text.lower()
+                )
+
+                # These errors are generally deterministic and should be
+                # surfaced immediately rather than repeatedly resubmitted.
+                deterministic_errors = (
+                    "simulation failed",
+                    "instruction error",
+                    "account not found",
+                    "insufficient funds",
+                    "insufficient lamports",
+                    "invalid account",
+                    "invalid transaction",
+                    "signature verification",
+                    "blockhash not found",
+                )
 
                 if any(
                     marker in lower_error
-                    for marker in (
-                        "simulation",
-                        "instruction error",
-                        "account not found",
-                        "insufficient funds",
-                        "blockhash not found",
-                        "transaction simulation failed",
-                    )
+                    for marker in deterministic_errors
                 ):
                     raise
 
-                # Otherwise, this may be a transient RPC/network error.
-                await asyncio.sleep(
-                    RESEND_INTERVAL_SECONDS
-                )
-
         # ---------------------------------------------------------------
-        # 4. Safety timeout only when the builder didn't give us an expiry.
+        # 4. Keep waiting.
+        #
+        # There is intentionally NO fixed 3-attempt limit.
+        #
+        # We continue until:
+        #   confirmed
+        #   on-chain failure
+        #   blockhash expiration
         # ---------------------------------------------------------------
-
-        if (
-            last_valid_block_height is None
-            and (
-                time.monotonic() - started_at
-            ) >= 60.0
-        ):
-            raise SolanaTxError(
-                "transaction could not be confirmed within "
-                f"60 seconds and no last_valid_block_height "
-                f"was supplied: {solscan_link}"
-            )
 
         await asyncio.sleep(
             STATUS_POLL_INTERVAL_SECONDS
@@ -714,7 +717,7 @@ async def get_sol_balance(
     rpc_url: str,
     pubkey_str: str,
 ) -> float:
-    """Return the wallet SOL balance."""
+    """Return wallet SOL balance."""
 
     async with AsyncClient(
         rpc_url,
@@ -723,7 +726,9 @@ async def get_sol_balance(
 
         try:
             response = await client.get_balance(
-                Pubkey.from_string(pubkey_str),
+                Pubkey.from_string(
+                    pubkey_str
+                ),
                 commitment=Confirmed,
             )
 
