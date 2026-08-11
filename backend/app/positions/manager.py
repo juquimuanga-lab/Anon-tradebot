@@ -12,13 +12,16 @@ Take-profit examples:
         At +60% PnL, sell 60% of the original position.
         At +100% PnL, sell the remaining 40%.
 
-Important safety rules:
+Safety rules:
 
 - Live positions must use a real market price for TP/SL/trailing decisions.
-- A simulated/stale price must NEVER trigger a real-money price exit.
-- A simulated volume value must NEVER trigger a real-money volume exit.
-- A TP level is only marked as hit AFTER the sell succeeds.
-- A failed sell leaves the TP level pending for retry.
+- Simulated/stale prices must never trigger real-money price exits.
+- Simulated volume must never trigger real-money volume exits.
+- A TP level is only marked as hit after the sell succeeds.
+- Failed sells leave the TP level pending.
+- Live positions are reconciled against the actual wallet token balance.
+- Manual/external wallet sales close or reduce the tracked position.
+- Only one exit can execute for a position at a time.
 """
 
 import asyncio
@@ -28,6 +31,10 @@ from datetime import datetime, timezone
 from app.config.settings import settings
 from app.connectors.anoncoin import AnoncoinClient
 from app.execution.base import OrderResult
+from app.execution.onchain.solana_rpc import (
+    SolanaTxError,
+    get_token_balance,
+)
 from app.execution.price_source import (
     get_current_price_usd,
     get_current_volume_usd,
@@ -42,6 +49,11 @@ logger = logging.getLogger(
 )
 
 
+# If the wallet balance is within this percentage of the expected balance,
+# do not treat tiny RPC/token-account differences as an external sale.
+WALLET_RECONCILIATION_TOLERANCE_PCT = 0.5
+
+
 class PositionManager:
     def __init__(
         self,
@@ -53,6 +65,21 @@ class PositionManager:
         self._anoncoin = anoncoin
         self._execution_router = execution_router
         self._tick = 0
+
+        # Prevent two exits for the same position from running concurrently.
+        #
+        # Example:
+        #
+        #   TP triggers
+        #       +
+        #   stop loss/manual close fires at nearly the same time
+        #
+        # Only the first exit is allowed to execute.
+        self._exit_in_progress: set[int] = set()
+
+        # Cache wallet public keys so we don't have to resolve the wallet
+        # through the execution router on every 5-second monitoring cycle.
+        self._wallet_pubkeys: dict[int, str] = {}
 
     # ------------------------------------------------------------------
     # Rule loading
@@ -67,15 +94,17 @@ class PositionManager:
         We intentionally use position.rule_id rather than the admin's
         currently active rule.
 
-        This means changing an admin's rule does not retroactively change
-        the TP/SL settings of positions that are already open.
+        Changing an admin's rule therefore does not retroactively change
+        positions that are already open.
         """
 
         if position.rule_id:
             rules = await repo.get_all_rules()
 
             for rule in rules:
+
                 if rule.id == position.rule_id:
+
                     from app.storage.repository import (
                         rule_row_to_params,
                     )
@@ -121,21 +150,7 @@ class PositionManager:
         position,
         requested_sell_pct: float,
     ) -> float:
-        """Return the percentage of the original position that can safely
-        be sold.
-
-        TP percentages are interpreted as percentages of the ORIGINAL
-        position.
-
-        Example:
-
-            Original = 100%
-            TP1 sells 60%
-            Remaining = 40%
-
-        If a later rule asks to sell 60%, only the remaining 40% can
-        actually be sold.
-        """
+        """Return the percentage of the original position that can be sold."""
 
         remaining_pct = max(
             0.0,
@@ -154,6 +169,335 @@ class PositionManager:
         return min(
             requested_pct,
             remaining_pct,
+        )
+
+    # ------------------------------------------------------------------
+    # Wallet reconciliation
+    # ------------------------------------------------------------------
+
+    async def _get_wallet_pubkey(
+        self,
+        position,
+    ) -> str | None:
+        """Resolve and cache the live wallet public key for a position."""
+
+        if position.mode != "live":
+            return None
+
+        owner_user_id = (
+            position.owner_user_id
+        )
+
+        if owner_user_id is None:
+            logger.warning(
+                "live_position_missing_wallet_owner",
+                extra={
+                    "position_id": position.id,
+                    "mint": position.mint,
+                },
+            )
+            return None
+
+        cached = self._wallet_pubkeys.get(
+            owner_user_id
+        )
+
+        if cached:
+            return cached
+
+        try:
+
+            adapter = await (
+                self._execution_router.get_adapter(
+                    position.mode,
+                    owner_user_id,
+                )
+            )
+
+        except Exception as exc:
+
+            logger.warning(
+                "wallet_adapter_lookup_failed",
+                extra={
+                    "position_id": position.id,
+                    "owner_user_id": owner_user_id,
+                    "error": str(exc),
+                },
+            )
+
+            return None
+
+        # WalletExecutionAdapter intentionally keeps the public key in
+        # memory as _pubkey. No private key is exposed here.
+        pubkey = getattr(
+            adapter,
+            "_pubkey",
+            None,
+        )
+
+        if not pubkey:
+            logger.warning(
+                "live_wallet_public_key_unavailable",
+                extra={
+                    "position_id": position.id,
+                    "owner_user_id": owner_user_id,
+                },
+            )
+            return None
+
+        self._wallet_pubkeys[
+            owner_user_id
+        ] = str(pubkey)
+
+        return str(pubkey)
+
+    async def _reconcile_live_position(
+        self,
+        position,
+    ) -> bool:
+        """Reconcile a live position against the actual wallet balance.
+
+        Returns:
+
+            True:
+                The position was changed/closed because the wallet balance
+                differs materially from the tracked position.
+
+            False:
+                No reconciliation was necessary.
+
+        IMPORTANT:
+
+        We only reduce the tracked position.
+
+        We never increase it based on wallet balance because the wallet may
+        contain tokens acquired outside this bot.
+        """
+
+        if position.mode != "live":
+            return False
+
+        if position.amount_tokens <= 0:
+            return False
+
+        wallet_pubkey = await self._get_wallet_pubkey(
+            position
+        )
+
+        if not wallet_pubkey:
+            return False
+
+        try:
+
+            actual_balance = (
+                await get_token_balance(
+                    settings.solana_rpc_url,
+                    wallet_pubkey,
+                    position.mint,
+                )
+            )
+
+        except SolanaTxError as exc:
+
+            logger.warning(
+                "wallet_token_reconciliation_failed",
+                extra={
+                    "position_id": position.id,
+                    "mint": position.mint,
+                    "error": str(exc),
+                },
+            )
+
+            # Never close a position merely because the RPC lookup failed.
+            return False
+
+        except Exception as exc:
+
+            logger.warning(
+                "wallet_token_reconciliation_unexpected_error",
+                extra={
+                    "position_id": position.id,
+                    "mint": position.mint,
+                    "error": str(exc),
+                },
+            )
+
+            return False
+
+        original_amount = max(
+            0.0,
+            float(
+                position.amount_tokens
+            ),
+        )
+
+        tracked_remaining_pct = max(
+            0.0,
+            float(
+                position.remaining_pct or 0.0
+            ),
+        )
+
+        expected_balance = (
+            original_amount
+            * (
+                tracked_remaining_pct
+                / 100.0
+            )
+        )
+
+        # Never increase a position based on an external wallet balance.
+        if actual_balance >= expected_balance:
+            return False
+
+        # Ignore tiny differences caused by token/RPC rounding.
+        if expected_balance > 0:
+
+            difference_pct = (
+                (
+                    expected_balance
+                    - actual_balance
+                )
+                / expected_balance
+                * 100.0
+            )
+
+            if (
+                difference_pct
+                < WALLET_RECONCILIATION_TOLERANCE_PCT
+            ):
+                return False
+
+        actual_remaining_pct = (
+            actual_balance
+            / original_amount
+            * 100.0
+        )
+
+        actual_remaining_pct = max(
+            0.0,
+            min(
+                actual_remaining_pct,
+                tracked_remaining_pct,
+            ),
+        )
+
+        # --------------------------------------------------------------
+        # Wallet has no tokens left.
+        #
+        # This is the Phantom/manual-sale case from the user's screenshot.
+        # --------------------------------------------------------------
+
+        if actual_balance <= 0:
+
+            await repo.update_position(
+                position.id,
+                status="closed",
+                remaining_pct=0.0,
+                closed_at=datetime.now(
+                    timezone.utc
+                ),
+                close_reason=(
+                    "position closed externally "
+                    "from wallet"
+                ),
+            )
+
+            position.remaining_pct = 0.0
+            position.status = "closed"
+
+            logger.info(
+                "position_reconciled_external_close",
+                extra={
+                    "position_id": position.id,
+                    "mint": position.mint,
+                    "previous_remaining_pct": (
+                        tracked_remaining_pct
+                    ),
+                    "actual_wallet_balance": 0.0,
+                    "wallet": wallet_pubkey,
+                },
+            )
+
+            return True
+
+        # --------------------------------------------------------------
+        # Wallet contains fewer tokens than the database expects.
+        #
+        # Example:
+        #
+        # Database: 100%
+        # Wallet:    40%
+        #
+        # This means approximately 60% was sold externally.
+        # --------------------------------------------------------------
+
+        await repo.update_position(
+            position.id,
+            remaining_pct=(
+                actual_remaining_pct
+            ),
+        )
+
+        position.remaining_pct = (
+            actual_remaining_pct
+        )
+
+        logger.info(
+            "position_reconciled_external_partial_sell",
+            extra={
+                "position_id": position.id,
+                "mint": position.mint,
+                "previous_remaining_pct": (
+                    tracked_remaining_pct
+                ),
+                "actual_remaining_pct": (
+                    actual_remaining_pct
+                ),
+                "actual_wallet_balance": (
+                    actual_balance
+                ),
+                "wallet": wallet_pubkey,
+            },
+        )
+
+        return True
+
+    # ------------------------------------------------------------------
+    # Exit lock
+    # ------------------------------------------------------------------
+
+    def _try_begin_exit(
+        self,
+        position_id: int,
+    ) -> bool:
+        """Atomically claim an exit slot for a position."""
+
+        if position_id in self._exit_in_progress:
+
+            logger.debug(
+                "position_exit_already_in_progress",
+                extra={
+                    "position_id": position_id,
+                },
+            )
+
+            return False
+
+        self._exit_in_progress.add(
+            position_id
+        )
+
+        return True
+
+    def _finish_exit(
+        self,
+        position_id: int,
+    ) -> None:
+        """Release the position exit lock."""
+
+        self._exit_in_progress.discard(
+            position_id
         )
 
     # ------------------------------------------------------------------
@@ -176,173 +520,356 @@ class PositionManager:
                 Sell successfully executed.
 
             False:
-                Sell failed. Position remains unchanged.
+                Sell failed or another exit is already in progress.
 
         A failed sell MUST NOT:
+
             - reduce remaining_pct
             - close the position
             - mark a TP as hit
         """
 
-        sell_pct = self._sellable_pct(
-            position,
-            sell_pct,
-        )
-
-        if sell_pct <= 0:
-            logger.warning(
-                "sell_skipped_no_remaining_position",
-                extra={
-                    "mint": token.mint,
-                    "position_id": position.id,
-                    "reason": reason,
-                    "remaining_pct": (
-                        position.remaining_pct
-                    ),
-                },
-            )
-
+        if not self._try_begin_exit(
+            position.id
+        ):
             return False
 
-        adapter = await (
-            self._execution_router.get_adapter(
-                position.mode,
-                position.owner_user_id,
-            )
-        )
-
-        amount_to_sell = (
-            position.amount_tokens
-            * (sell_pct / 100)
-        )
-
-        logger.info(
-            "sell_attempt",
-            extra={
-                "mint": token.mint,
-                "position_id": position.id,
-                "sell_pct": sell_pct,
-                "remaining_pct_before": (
-                    position.remaining_pct
-                ),
-                "reason": reason,
-                "mode": position.mode,
-            },
-        )
-
         try:
-            result = await asyncio.wait_for(
-                adapter.sell(
-                    token,
-                    amount_to_sell,
-                    sell_pct,
-                ),
-                timeout=(
-                    settings.execution_timeout_seconds
-                ),
+
+            # ----------------------------------------------------------
+            # Never attempt to sell something the wallet no longer owns.
+            #
+            # This catches manual Phantom sales even if reconciliation
+            # happened between monitoring cycles.
+            # ----------------------------------------------------------
+
+            if position.mode == "live":
+
+                reconciled = (
+                    await self._reconcile_live_position(
+                        position
+                    )
+                )
+
+                if reconciled:
+
+                    if (
+                        position.status == "closed"
+                        or float(
+                            position.remaining_pct
+                            or 0.0
+                        ) <= 0.01
+                    ):
+                        logger.info(
+                            "sell_cancelled_position_already_closed_externally",
+                            extra={
+                                "position_id": (
+                                    position.id
+                                ),
+                                "mint": token.mint,
+                                "reason": reason,
+                            },
+                        )
+
+                        return False
+
+                    # Position was partially sold externally.
+                    # Recalculate the requested amount against the new
+                    # remaining percentage.
+                    sell_pct = self._sellable_pct(
+                        position,
+                        sell_pct,
+                    )
+
+            sell_pct = self._sellable_pct(
+                position,
+                sell_pct,
             )
 
-        except asyncio.TimeoutError:
+            if sell_pct <= 0:
 
-            logger.error(
-                "sell_execution_timeout",
+                logger.info(
+                    "sell_skipped_no_remaining_position",
+                    extra={
+                        "mint": token.mint,
+                        "position_id": position.id,
+                        "reason": reason,
+                        "remaining_pct": (
+                            position.remaining_pct
+                        ),
+                    },
+                )
+
+                return False
+
+            adapter = await (
+                self._execution_router.get_adapter(
+                    position.mode,
+                    position.owner_user_id,
+                )
+            )
+
+            amount_to_sell = (
+                position.amount_tokens
+                * (
+                    sell_pct
+                    / 100.0
+                )
+            )
+
+            logger.info(
+                "sell_attempt",
                 extra={
                     "mint": token.mint,
                     "position_id": position.id,
                     "sell_pct": sell_pct,
+                    "remaining_pct_before": (
+                        position.remaining_pct
+                    ),
                     "reason": reason,
+                    "mode": position.mode,
                 },
             )
 
-            result = OrderResult(
-                success=False,
-                status="failed",
-                error_message=(
-                    "execution did not resolve within "
-                    f"{settings.execution_timeout_seconds}s - "
-                    "outcome unknown; verify wallet balance "
-                    "and transaction status manually"
-                ),
-            )
+            try:
 
-        # --------------------------------------------------------------
-        # Determine exit price.
-        # --------------------------------------------------------------
+                result = await asyncio.wait_for(
+                    adapter.sell(
+                        token,
+                        amount_to_sell,
+                        sell_pct,
+                    ),
+                    timeout=(
+                        settings.execution_timeout_seconds
+                    ),
+                )
 
-        exit_price = (
-            result.price_usd
-            if result.success
-            and result.price_usd
-            else current_price
-        )
+            except asyncio.TimeoutError:
 
-        # --------------------------------------------------------------
-        # Calculate the portion of the original investment being sold.
-        # --------------------------------------------------------------
+                logger.error(
+                    "sell_execution_timeout",
+                    extra={
+                        "mint": token.mint,
+                        "position_id": position.id,
+                        "sell_pct": sell_pct,
+                        "reason": reason,
+                    },
+                )
 
-        invested_portion = (
-            position.amount_sol_invested
-            * (sell_pct / 100)
-        )
+                result = OrderResult(
+                    success=False,
+                    status="failed",
+                    error_message=(
+                        "execution did not resolve within "
+                        f"{settings.execution_timeout_seconds}s - "
+                        "outcome unknown; verify wallet balance "
+                        "and transaction status manually"
+                    ),
+                )
 
-        pnl_amount = (
-            invested_portion
-            * (
-                exit_price
-                - position.entry_price_usd
-            )
-            / max(
-                position.entry_price_usd,
-                1e-12,
-            )
-        )
+            # ----------------------------------------------------------
+            # Determine exit price.
+            # ----------------------------------------------------------
 
-        proceeds = (
-            invested_portion
-            + pnl_amount
-        )
-
-        # --------------------------------------------------------------
-        # Record the order attempt.
-        # --------------------------------------------------------------
-
-        await repo.create_order(
-            position.mint,
-            "sell",
-            position.mode,
-            (
-                "filled"
+            exit_price = (
+                result.price_usd
                 if result.success
-                else "failed"
-            ),
-            invested_portion,
-            exit_price,
-            result.tx_signature,
-            result.error_message,
-            rule_id=position.rule_id,
-            owner_user_id=position.owner_user_id,
-        )
-
-        # --------------------------------------------------------------
-        # CRITICAL:
-        #
-        # If the sell failed, DO NOT modify the position.
-        #
-        # This is especially important for TP.
-        # --------------------------------------------------------------
-
-        if not result.success:
-
-            logger.warning(
-                "sell_failed_position_unchanged",
-                extra={
-                    "mint": token.mint,
-                    "position_id": position.id,
-                    "sell_pct": sell_pct,
-                    "reason": reason,
-                    "error": result.error_message,
-                },
+                and result.price_usd
+                else current_price
             )
+
+            # ----------------------------------------------------------
+            # Calculate portion of original investment being sold.
+            # ----------------------------------------------------------
+
+            invested_portion = (
+                position.amount_sol_invested
+                * (
+                    sell_pct
+                    / 100.0
+                )
+            )
+
+            pnl_amount = (
+                invested_portion
+                * (
+                    exit_price
+                    - position.entry_price_usd
+                )
+                / max(
+                    position.entry_price_usd,
+                    1e-12,
+                )
+            )
+
+            proceeds = (
+                invested_portion
+                + pnl_amount
+            )
+
+            # ----------------------------------------------------------
+            # Record order attempt.
+            # ----------------------------------------------------------
+
+            await repo.create_order(
+                position.mint,
+                "sell",
+                position.mode,
+                (
+                    "filled"
+                    if result.success
+                    else "failed"
+                ),
+                invested_portion,
+                exit_price,
+                result.tx_signature,
+                result.error_message,
+                rule_id=position.rule_id,
+                owner_user_id=position.owner_user_id,
+            )
+
+            # ----------------------------------------------------------
+            # SELL FAILED
+            #
+            # Do NOT modify position state.
+            # Do NOT mark TP as hit.
+            #
+            # Also do NOT send "Sell triggered" here. The old behavior
+            # produced the repeated Triggered -> Failed -> Triggered ->
+            # Failed spam visible in Telegram.
+            # ----------------------------------------------------------
+
+            if not result.success:
+
+                logger.warning(
+                    "sell_failed_position_unchanged",
+                    extra={
+                        "mint": token.mint,
+                        "position_id": position.id,
+                        "sell_pct": sell_pct,
+                        "reason": reason,
+                        "error": result.error_message,
+                    },
+                )
+
+                await self._notifier.sell_failed(
+                    position.owner_user_id,
+                    token.ticker_symbol
+                    or token.mint[:8],
+                    (
+                        result.error_message
+                        or "unknown error"
+                    ),
+                )
+
+                return False
+
+            # ----------------------------------------------------------
+            # SELL SUCCESS
+            #
+            # Only now modify position state.
+            # ----------------------------------------------------------
+
+            remaining_pct = max(
+                0.0,
+                float(
+                    position.remaining_pct
+                    or 0.0
+                )
+                - sell_pct,
+            )
+
+            # Paper trading balance handling.
+            if position.mode == "paper":
+
+                from app.execution.paper import (
+                    PaperExecutionAdapter,
+                )
+
+                if isinstance(
+                    adapter,
+                    PaperExecutionAdapter,
+                ):
+                    await adapter.credit_balance(
+                        proceeds
+                    )
+
+            realized_pnl = (
+                float(
+                    position.realized_pnl_usd
+                    or 0.0
+                )
+                + pnl_amount
+            )
+
+            if remaining_pct <= 0.01:
+
+                await repo.update_position(
+                    position.id,
+                    status="closed",
+                    remaining_pct=0.0,
+                    closed_at=datetime.now(
+                        timezone.utc
+                    ),
+                    close_reason=reason,
+                    realized_pnl_usd=(
+                        realized_pnl
+                    ),
+                )
+
+                position.remaining_pct = 0.0
+                position.status = "closed"
+
+                logger.info(
+                    "position_closed",
+                    extra={
+                        "mint": token.mint,
+                        "position_id": position.id,
+                        "sell_pct": sell_pct,
+                        "reason": reason,
+                        "realized_pnl": pnl_amount,
+                        "tx_signature": (
+                            result.tx_signature
+                        ),
+                    },
+                )
+
+            else:
+
+                await repo.update_position(
+                    position.id,
+                    remaining_pct=(
+                        remaining_pct
+                    ),
+                    realized_pnl_usd=(
+                        realized_pnl
+                    ),
+                )
+
+                position.remaining_pct = (
+                    remaining_pct
+                )
+
+                logger.info(
+                    "partial_sell_filled",
+                    extra={
+                        "mint": token.mint,
+                        "position_id": position.id,
+                        "sell_pct": sell_pct,
+                        "remaining_pct": (
+                            remaining_pct
+                        ),
+                        "reason": reason,
+                        "realized_pnl": pnl_amount,
+                        "tx_signature": (
+                            result.tx_signature
+                        ),
+                    },
+                )
+
+            # ----------------------------------------------------------
+            # Only notify "triggered" after the sell actually succeeded.
+            # ----------------------------------------------------------
 
             await self._notifier.sell_triggered(
                 position.owner_user_id,
@@ -352,126 +879,22 @@ class PositionManager:
                 sell_pct,
             )
 
-            await self._notifier.sell_failed(
+            await self._notifier.sell_filled(
                 position.owner_user_id,
                 token.ticker_symbol
                 or token.mint[:8],
-                (
-                    result.error_message
-                    or "unknown error"
-                ),
+                exit_price,
+                pnl_amount,
+                result.tx_signature,
             )
 
-            return False
+            return True
 
-        # --------------------------------------------------------------
-        # SELL SUCCESS.
-        #
-        # Only now modify the position.
-        # --------------------------------------------------------------
+        finally:
 
-        remaining_pct = max(
-            0.0,
-            float(
-                position.remaining_pct or 0.0
+            self._finish_exit(
+                position.id
             )
-            - sell_pct,
-        )
-
-        # Paper trading balance handling.
-        if position.mode == "paper":
-
-            from app.execution.paper import (
-                PaperExecutionAdapter,
-            )
-
-            if isinstance(
-                adapter,
-                PaperExecutionAdapter,
-            ):
-                await adapter.credit_balance(
-                    proceeds
-                )
-
-        realized_pnl = (
-            position.realized_pnl_usd
-            + pnl_amount
-        )
-
-        if remaining_pct <= 0.01:
-
-            await repo.update_position(
-                position.id,
-                status="closed",
-                remaining_pct=0.0,
-                closed_at=datetime.now(
-                    timezone.utc
-                ),
-                close_reason=reason,
-                realized_pnl_usd=(
-                    realized_pnl
-                ),
-            )
-
-            logger.info(
-                "position_closed",
-                extra={
-                    "mint": token.mint,
-                    "position_id": position.id,
-                    "sell_pct": sell_pct,
-                    "reason": reason,
-                    "realized_pnl": pnl_amount,
-                    "tx_signature": (
-                        result.tx_signature
-                    ),
-                },
-            )
-
-        else:
-
-            await repo.update_position(
-                position.id,
-                remaining_pct=remaining_pct,
-                realized_pnl_usd=(
-                    realized_pnl
-                ),
-            )
-
-            logger.info(
-                "partial_sell_filled",
-                extra={
-                    "mint": token.mint,
-                    "position_id": position.id,
-                    "sell_pct": sell_pct,
-                    "remaining_pct": (
-                        remaining_pct
-                    ),
-                    "reason": reason,
-                    "realized_pnl": pnl_amount,
-                    "tx_signature": (
-                        result.tx_signature
-                    ),
-                },
-            )
-
-        await self._notifier.sell_triggered(
-            position.owner_user_id,
-            token.ticker_symbol
-            or token.mint[:8],
-            reason,
-            sell_pct,
-        )
-
-        await self._notifier.sell_filled(
-            position.owner_user_id,
-            token.ticker_symbol
-            or token.mint[:8],
-            exit_price,
-            pnl_amount,
-            result.tx_signature,
-        )
-
-        return True
 
     # ------------------------------------------------------------------
     # Position evaluation
@@ -482,6 +905,39 @@ class PositionManager:
         position,
     ):
         """Evaluate automated exits for one open position."""
+
+        # --------------------------------------------------------------
+        # First thing we do for a live position:
+        #
+        # Check what the wallet ACTUALLY owns.
+        #
+        # This is intentionally before the price lookup. A manual Phantom
+        # sale should be detected even if the price feed is temporarily
+        # unavailable.
+        # --------------------------------------------------------------
+
+        if position.mode == "live":
+
+            reconciled = (
+                await self._reconcile_live_position(
+                    position
+                )
+            )
+
+            if reconciled:
+
+                if (
+                    position.status == "closed"
+                    or float(
+                        position.remaining_pct
+                        or 0.0
+                    ) <= 0.01
+                ):
+                    return
+
+        # --------------------------------------------------------------
+        # Token
+        # --------------------------------------------------------------
 
         token_row = await repo.get_token(
             position.mint
@@ -561,9 +1017,6 @@ class PositionManager:
 
         # --------------------------------------------------------------
         # PnL
-        #
-        # If price is simulated/stale, this number is NOT safe for
-        # real-money TP/SL decisions.
         # --------------------------------------------------------------
 
         pnl_pct = self._pnl_pct(
@@ -598,19 +1051,16 @@ class PositionManager:
         )
 
         # --------------------------------------------------------------
-        # Peak price / volume
-        #
-        # IMPORTANT:
-        #
-        # Never update a live position's peak from a simulated price.
-        # Otherwise a temporary API outage could create a fake peak and
-        # subsequently trigger a trailing stop.
+        # Peak price
         # --------------------------------------------------------------
 
         if not is_simulated_price:
 
             peak_price = max(
-                position.peak_price_usd,
+                float(
+                    position.peak_price_usd
+                    or 0.0
+                ),
                 current_price,
             )
 
@@ -630,17 +1080,22 @@ class PositionManager:
 
         else:
 
-            peak_price = (
+            peak_price = float(
                 position.peak_price_usd
+                or 0.0
             )
 
-        # Volume peak is only safe when the current
-        # volume is real.
+        # --------------------------------------------------------------
+        # Peak volume
+        # --------------------------------------------------------------
 
         if not is_simulated_volume:
 
             peak_volume = max(
-                position.peak_volume_24h_usd,
+                float(
+                    position.peak_volume_24h_usd
+                    or 0.0
+                ),
                 current_volume,
             )
 
@@ -662,15 +1117,13 @@ class PositionManager:
 
         else:
 
-            peak_volume = (
+            peak_volume = float(
                 position.peak_volume_24h_usd
+                or 0.0
             )
 
         # --------------------------------------------------------------
         # TIME-BASED EXIT
-        #
-        # This does not depend on market price, so it remains usable even
-        # when the price feed is temporarily unavailable.
         # --------------------------------------------------------------
 
         if rule.time_based_exit_seconds:
@@ -719,16 +1172,7 @@ class PositionManager:
                 return
 
         # --------------------------------------------------------------
-        # PRICE-BASED EXITS REQUIRE A REAL PRICE.
-        #
-        # If the live price source failed, DO NOT use the stale/simulated
-        # value for:
-        #
-        #   - stop loss
-        #   - trailing stop
-        #   - take profit
-        #
-        # We simply wait for the next live price.
+        # PRICE EXITS REQUIRE REAL PRICE
         # --------------------------------------------------------------
 
         if is_simulated_price:
@@ -839,8 +1283,6 @@ class PositionManager:
 
         # --------------------------------------------------------------
         # VOLUME DROP EXIT
-        #
-        # This requires a REAL volume source.
         # --------------------------------------------------------------
 
         if (
@@ -892,12 +1334,9 @@ class PositionManager:
         # --------------------------------------------------------------
         # TAKE PROFIT
         #
-        # TP levels are evaluated against the EXACT rule attached to the
-        # position.
-        #
         # Example:
         #
-        #     60:60,100:40
+        # 60:60,100:40
         #
         # +60%:
         #     sell 60%
@@ -905,7 +1344,7 @@ class PositionManager:
         # +100%:
         #     sell remaining 40%
         #
-        # A level is ONLY marked hit after the sell succeeds.
+        # A TP level is only consumed after the sell succeeds.
         # --------------------------------------------------------------
 
         tp_hit_indexes = set(
@@ -916,7 +1355,6 @@ class PositionManager:
             rule.take_profit_levels
         ):
 
-            # Already successfully executed.
             if idx in tp_hit_indexes:
                 continue
 
@@ -935,6 +1373,7 @@ class PositionManager:
             )
 
             if requested_sell_pct <= 0:
+
                 logger.warning(
                     "invalid_take_profit_sell_percentage",
                     extra={
@@ -951,7 +1390,7 @@ class PositionManager:
 
                 continue
 
-            # Threshold has not been reached.
+            # Threshold not reached.
             if pnl_pct < gain_pct:
                 continue
 
@@ -983,9 +1422,6 @@ class PositionManager:
                     },
                 )
 
-                # Nothing remains to sell, so this level cannot execute.
-                # Marking it as hit is safe because the position has already
-                # been exhausted by previous successful exits.
                 new_tp_indexes = list(
                     position.tp_hit_indexes
                     or []
@@ -1042,12 +1478,7 @@ class PositionManager:
                 )
             )
 
-            # ----------------------------------------------------------
-            # CRITICAL:
-            #
             # Only consume TP after confirmed successful execution.
-            # ----------------------------------------------------------
-
             if sell_success:
 
                 new_tp_indexes = list(
@@ -1072,12 +1503,13 @@ class PositionManager:
                         new_tp_indexes
                     )
 
+                # _close_position already updated the live position.
                 position.remaining_pct = max(
                     0.0,
                     float(
                         position.remaining_pct
-                    )
-                    - actual_sell_pct,
+                        or 0.0
+                    ),
                 )
 
                 logger.info(
@@ -1100,7 +1532,9 @@ class PositionManager:
             else:
 
                 # Do NOT mark the TP as hit.
-                # It will be retried on the next cycle.
+                #
+                # It remains pending and can be retried on the next
+                # monitoring cycle.
                 logger.warning(
                     "take_profit_sell_failed_will_retry",
                     extra={
@@ -1145,6 +1579,37 @@ class PositionManager:
         if not target:
             return False
 
+        # Reconcile first.
+
+        if target.mode == "live":
+
+            reconciled = (
+                await self._reconcile_live_position(
+                    target
+                )
+            )
+
+            if reconciled:
+
+                if (
+                    target.status == "closed"
+                    or float(
+                        target.remaining_pct
+                        or 0.0
+                    ) <= 0.01
+                ):
+                    logger.info(
+                        "manual_close_skipped_position_already_closed",
+                        extra={
+                            "position_id": (
+                                target.id
+                            ),
+                            "mint": target.mint,
+                        },
+                    )
+
+                    return False
+
         token_row = await repo.get_token(
             target.mint
         )
@@ -1188,10 +1653,6 @@ class PositionManager:
             self._tick,
         )
 
-        # A manual close also needs a real price for live execution.
-        # We do not block the actual sell itself here because the execution
-        # adapter determines the actual execution price, but we make the
-        # status visible in logs.
         if is_simulated_price:
 
             logger.warning(
