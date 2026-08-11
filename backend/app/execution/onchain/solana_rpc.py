@@ -7,6 +7,7 @@ Responsibilities:
 - Detect transactions that landed but failed on-chain.
 - Provide useful transaction diagnostics.
 - Provide SOL balance lookups.
+- Provide SPL-token balance lookups for position reconciliation.
 
 The wallet Keypair only exists in this Python process.
 It is never passed to the Node.js DBC builder.
@@ -24,7 +25,6 @@ from solana.rpc.commitment import Confirmed
 from solders.hash import Hash as SoldersHash
 from solders.keypair import Keypair
 from solders.pubkey import Pubkey
-from solders.signature import Signature
 from solders.transaction import Transaction as LegacyTransaction
 from solders.transaction import VersionedTransaction
 
@@ -42,7 +42,11 @@ logger = logging.getLogger(
 
 RPC_COMMITMENT = "confirmed"
 
-# How frequently we check the transaction status.
+# Token-balance reconciliation can use processed data because we want to
+# detect an external/manual sale as quickly as practical.
+TOKEN_BALANCE_COMMITMENT = "processed"
+
+# How frequently we check transaction status.
 STATUS_POLL_INTERVAL_SECONDS = 0.25
 
 # Minimum time between rebroadcasts.
@@ -56,6 +60,8 @@ RPC_MAX_RETRIES = 0
 
 # Keep preflight enabled while we establish reliable execution.
 SKIP_PREFLIGHT = False
+
+LAMPORTS_PER_SOL = 1_000_000_000
 
 
 class SolanaTxError(Exception):
@@ -378,6 +384,277 @@ def _format_transaction_error(
 
 
 # ---------------------------------------------------------------------------
+# SPL TOKEN BALANCE
+# ---------------------------------------------------------------------------
+
+async def get_token_balance(
+    rpc_url: str,
+    owner_pubkey: str,
+    token_mint: str,
+) -> float:
+    """Return the owner's current SPL-token balance.
+
+    This is intentionally read directly from Solana RPC rather than relying
+    on the bot's database.
+
+    It is used to reconcile positions after:
+        - manual Phantom sales
+        - partial manual sales
+        - failed/unknown sell attempts
+        - other external wallet activity
+
+    A balance of 0 means the wallet currently has no token accounts holding
+    that mint.
+
+    The lookup uses processed commitment because this is a monitoring/
+    reconciliation read where low latency matters more than waiting for
+    confirmation.
+    """
+
+    try:
+        owner = str(
+            Pubkey.from_string(owner_pubkey)
+        )
+
+        mint = str(
+            Pubkey.from_string(token_mint)
+        )
+
+    except Exception as exc:
+        raise SolanaTxError(
+            redact_text(
+                f"invalid owner or token mint: {exc}"
+            )
+        ) from exc
+
+    try:
+        result = await _rpc_request(
+            rpc_url,
+            "getTokenAccountsByOwner",
+            [
+                owner,
+                {
+                    "mint": mint,
+                },
+                {
+                    "encoding": "jsonParsed",
+                    "commitment": TOKEN_BALANCE_COMMITMENT,
+                },
+            ],
+        )
+
+    except SolanaTxError:
+        raise
+
+    except Exception as exc:
+        raise SolanaTxError(
+            redact_text(
+                f"SPL token balance lookup failed: {exc}"
+            )
+        ) from exc
+
+    if not result:
+        return 0.0
+
+    accounts = result.get(
+        "value",
+        [],
+    )
+
+    if not accounts:
+        return 0.0
+
+    total_balance = 0.0
+
+    for account in accounts:
+
+        try:
+            parsed = (
+                account
+                .get("account", {})
+                .get("data", {})
+                .get("parsed", {})
+            )
+
+            info = parsed.get(
+                "info",
+                {},
+            )
+
+            token_amount = info.get(
+                "tokenAmount",
+                {},
+            )
+
+            ui_amount = token_amount.get(
+                "uiAmount"
+            )
+
+            if ui_amount is not None:
+                total_balance += float(
+                    ui_amount
+                )
+                continue
+
+            # Fallback for RPC responses that omit uiAmount.
+            raw_amount = token_amount.get(
+                "amount"
+            )
+
+            decimals = token_amount.get(
+                "decimals"
+            )
+
+            if (
+                raw_amount is not None
+                and decimals is not None
+            ):
+                total_balance += (
+                    int(raw_amount)
+                    / (
+                        10
+                        ** int(decimals)
+                    )
+                )
+
+        except Exception as exc:
+
+            logger.warning(
+                "token_account_parse_failed",
+                extra={
+                    "owner": owner_pubkey,
+                    "mint": token_mint,
+                    "error": redact_text(
+                        str(exc)
+                    ),
+                },
+            )
+
+    return max(
+        0.0,
+        total_balance,
+    )
+
+
+async def get_token_balance_raw(
+    rpc_url: str,
+    owner_pubkey: str,
+    token_mint: str,
+) -> tuple[int, int]:
+    """Return (raw token amount, decimals) for an SPL mint.
+
+    This is useful when the execution layer needs exact integer token
+    quantities rather than floating-point UI amounts.
+
+    Multiple token accounts for the same mint are summed.
+    """
+
+    try:
+        owner = str(
+            Pubkey.from_string(owner_pubkey)
+        )
+
+        mint = str(
+            Pubkey.from_string(token_mint)
+        )
+
+    except Exception as exc:
+        raise SolanaTxError(
+            redact_text(
+                f"invalid owner or token mint: {exc}"
+            )
+        ) from exc
+
+    result = await _rpc_request(
+        rpc_url,
+        "getTokenAccountsByOwner",
+        [
+            owner,
+            {
+                "mint": mint,
+            },
+            {
+                "encoding": "jsonParsed",
+                "commitment": TOKEN_BALANCE_COMMITMENT,
+            },
+        ],
+    )
+
+    if not result:
+        return 0, 0
+
+    accounts = result.get(
+        "value",
+        [],
+    )
+
+    if not accounts:
+        return 0, 0
+
+    total_raw = 0
+    decimals = 0
+
+    for account in accounts:
+
+        try:
+
+            parsed = (
+                account
+                .get("account", {})
+                .get("data", {})
+                .get("parsed", {})
+            )
+
+            info = parsed.get(
+                "info",
+                {},
+            )
+
+            token_amount = info.get(
+                "tokenAmount",
+                {},
+            )
+
+            raw_amount = token_amount.get(
+                "amount"
+            )
+
+            account_decimals = token_amount.get(
+                "decimals"
+            )
+
+            if raw_amount is None:
+                continue
+
+            total_raw += int(
+                raw_amount
+            )
+
+            if account_decimals is not None:
+                decimals = int(
+                    account_decimals
+                )
+
+        except Exception as exc:
+
+            logger.warning(
+                "token_account_raw_parse_failed",
+                extra={
+                    "owner": owner_pubkey,
+                    "mint": token_mint,
+                    "error": redact_text(
+                        str(exc)
+                    ),
+                },
+            )
+
+    return (
+        max(0, total_raw),
+        decimals,
+    )
+
+
+# ---------------------------------------------------------------------------
 # Send transaction
 # ---------------------------------------------------------------------------
 
@@ -487,7 +764,9 @@ async def send_and_confirm(
 
         if status is not None:
 
-            transaction_error = status.get("err")
+            transaction_error = status.get(
+                "err"
+            )
 
             # Transaction landed but program execution failed.
             if transaction_error is not None:
@@ -514,7 +793,6 @@ async def send_and_confirm(
                 "confirmationStatus"
             )
 
-            # Only now do we declare the buy successful.
             if confirmation_status in (
                 "confirmed",
                 "finalized",
@@ -618,6 +896,7 @@ async def send_and_confirm(
         if should_send:
 
             try:
+
                 returned_signature = (
                     await _send_transaction(
                         rpc_url,
@@ -673,8 +952,6 @@ async def send_and_confirm(
                     error_text.lower()
                 )
 
-                # These errors are generally deterministic and should be
-                # surfaced immediately rather than repeatedly resubmitted.
                 deterministic_errors = (
                     "simulation failed",
                     "instruction error",
@@ -695,13 +972,6 @@ async def send_and_confirm(
 
         # ---------------------------------------------------------------
         # 4. Keep waiting.
-        #
-        # There is intentionally NO fixed 3-attempt limit.
-        #
-        # We continue until:
-        #   confirmed
-        #   on-chain failure
-        #   blockhash expiration
         # ---------------------------------------------------------------
 
         await asyncio.sleep(
@@ -725,6 +995,7 @@ async def get_sol_balance(
     ) as client:
 
         try:
+
             response = await client.get_balance(
                 Pubkey.from_string(
                     pubkey_str
@@ -732,9 +1003,13 @@ async def get_sol_balance(
                 commitment=Confirmed,
             )
 
-            return response.value / 1_000_000_000
+            return (
+                response.value
+                / LAMPORTS_PER_SOL
+            )
 
         except Exception as exc:
+
             raise SolanaTxError(
                 redact_text(
                     f"SOL balance lookup failed: {exc}"
