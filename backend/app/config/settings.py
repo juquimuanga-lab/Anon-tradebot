@@ -2,7 +2,7 @@
 from functools import lru_cache
 from typing import List, Optional
 
-from pydantic import Field
+from pydantic import Field, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -56,7 +56,8 @@ class Settings(BaseSettings):
     enable_mock_feed: bool = False
 
     # On-chain wallet execution
-    solana_rpc_url: str = "https://api.mainnet-beta.solana.com"
+    # If SOLANA_RPC_URL is not explicitly provided, automatically use Helius.
+    solana_rpc_url: Optional[str] = None
     jupiter_base_url: str = "https://lite-api.jup.ag/swap/v1"
     jupiter_price_url: str = "https://lite-api.jup.ag/price/v3"
     default_slippage_bps: int = 300
@@ -69,9 +70,30 @@ class Settings(BaseSettings):
 
     log_level: str = "INFO"
 
+    @model_validator(mode="after")
+    def configure_solana_rpc(self):
+        """
+        Use Helius as the primary Solana RPC when HELIUS_API_KEY is
+        configured. An explicitly supplied SOLANA_RPC_URL always takes
+        precedence.
+        """
+        if not self.solana_rpc_url:
+            if self.helius_api_key:
+                self.solana_rpc_url = (
+                    f"https://mainnet.helius-rpc.com/?api-key={self.helius_api_key}"
+                )
+            else:
+                self.solana_rpc_url = "https://api.mainnet-beta.solana.com"
+
+        return self
+
     @property
     def telegram_admin_ids(self) -> List[int]:
-        return [int(x) for x in _split_csv(self.telegram_admin_ids_raw) if x.lstrip("-").isdigit()]
+        return [
+            int(x)
+            for x in _split_csv(self.telegram_admin_ids_raw)
+            if x.lstrip("-").isdigit()
+        ]
 
     @property
     def creator_watchlist(self) -> List[str]:
