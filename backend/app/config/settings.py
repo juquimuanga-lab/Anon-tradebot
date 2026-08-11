@@ -64,7 +64,7 @@ class Settings(BaseSettings):
 
     # Timers
     scan_interval_seconds: int = 30
-    position_check_interval_seconds: int = 20
+    position_check_interval_seconds: int = 5
     execution_timeout_seconds: int = 180
     daily_summary_hour_utc: int = 23
 
