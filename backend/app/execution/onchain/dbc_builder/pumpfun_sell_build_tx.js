@@ -43,6 +43,15 @@ const {
   getSellSolAmountFromTokenAmount,
 } = require("@pump-fun/pump-sdk");
 
+const {
+  getAssociatedTokenAddressSync,
+  createAssociatedTokenAccountIdempotentInstruction,
+  createTransferInstruction,
+  TOKEN_PROGRAM_ID,
+  TOKEN_2022_PROGRAM_ID,
+  ASSOCIATED_TOKEN_PROGRAM_ID,
+} = require("@solana/spl-token");
+
 const BN = require("bn.js");
 const bs58 = require("bs58");
 
@@ -343,6 +352,194 @@ async function getWalletTokenBalance(
   }
 
   return totalBalance;
+}
+
+async function prepareCanonicalSellAccount(
+  connection,
+  user,
+  mint,
+  tokenProgram,
+  amount
+) {
+  const associatedTokenAddress =
+    getAssociatedTokenAddressSync(
+      mint,
+      user,
+      false,
+      tokenProgram,
+      ASSOCIATED_TOKEN_PROGRAM_ID
+    );
+
+  const associatedAccountInfo =
+    await connection.getAccountInfo(
+      associatedTokenAddress,
+      "processed"
+    );
+
+  if (associatedAccountInfo) {
+    return {
+      associatedTokenAddress,
+      setupInstructions: [],
+      ataCreated: false,
+      tokensMovedToAta: new BN(0),
+    };
+  }
+
+  const accounts =
+    await connection.getParsedTokenAccountsByOwner(
+      user,
+      { mint },
+      "processed"
+    );
+
+  let remaining =
+    new BN(amount.toString());
+
+  const sourceAccounts = [];
+
+  for (const account of accounts.value) {
+    const info =
+      account?.account?.data?.parsed?.info;
+
+    const sourceOwner = info?.owner;
+    const rawAmount =
+      info?.tokenAmount?.amount;
+
+    if (!rawAmount) {
+      continue;
+    }
+
+    if (
+      sourceOwner &&
+      sourceOwner !== user.toBase58()
+    ) {
+      continue;
+    }
+
+    const source =
+      account.pubkey;
+
+    if (
+      source.equals(
+        associatedTokenAddress
+      )
+    ) {
+      continue;
+    }
+
+    const balance =
+      new BN(String(rawAmount));
+
+    if (
+      balance.lte(
+        new BN(0)
+      )
+    ) {
+      continue;
+    }
+
+    sourceAccounts.push({
+      source,
+      balance,
+    });
+
+    if (
+      balance.gte(
+        remaining
+      )
+    ) {
+      break;
+    }
+
+    remaining =
+      remaining.sub(
+        balance
+      );
+  }
+
+  if (
+    remaining.gt(
+      new BN(0)
+    )
+  ) {
+    throw new Error(
+      "pumpfun_canonical_ata_missing_and_source_token_account_insufficient"
+    );
+  }
+
+  const setupInstructions = [];
+
+  setupInstructions.push(
+    createAssociatedTokenAccountIdempotentInstruction(
+      user,
+      associatedTokenAddress,
+      user,
+      mint,
+      tokenProgram,
+      ASSOCIATED_TOKEN_PROGRAM_ID
+    )
+  );
+
+  let transferRemaining =
+    new BN(amount.toString());
+
+  for (
+    const sourceAccount of
+      sourceAccounts
+  ) {
+    if (
+      transferRemaining.lte(
+        new BN(0)
+      )
+    ) {
+      break;
+    }
+
+    const transferAmount =
+      sourceAccount.balance.gte(
+        transferRemaining
+      )
+        ? transferRemaining
+        : sourceAccount.balance;
+
+    setupInstructions.push(
+      createTransferInstruction(
+        sourceAccount.source,
+        associatedTokenAddress,
+        user,
+        BigInt(
+          transferAmount.toString()
+        ),
+        [],
+        tokenProgram
+      )
+    );
+
+    transferRemaining =
+      transferRemaining.sub(
+        transferAmount
+      );
+  }
+
+  if (
+    transferRemaining.gt(
+      new BN(0)
+    )
+  ) {
+    throw new Error(
+      "pumpfun_failed_to_prepare_tokens_for_canonical_ata"
+    );
+  }
+
+  return {
+    associatedTokenAddress,
+    setupInstructions,
+    ataCreated: true,
+    tokensMovedToAta:
+      new BN(
+        amount.toString()
+      ),
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -868,14 +1065,47 @@ async function main() {
   };
 
 
-  let instructions;
+  const offlineSdk =
+  new PumpSdk();
 
-  try {
+const sellAccountPreparation =
+  await prepareCanonicalSellAccount(
+    connection,
+    user,
+    mint,
+    tokenProgram,
+    amount
+  );
 
-    instructions =
-      await onlineSdk.sellInstructions(
-        sellInstructionParams
-      );
+let instructions;
+
+try {
+  instructions =
+    await offlineSdk.sellInstructions(
+      sellInstructionParams
+    );
+
+} catch (error) {
+  throw new Error(
+    "pumpfun_sell_instructions_failed: " +
+    `${
+      error?.message ||
+      error
+    }`
+  );
+}
+
+if (
+  sellAccountPreparation
+    .setupInstructions.length >
+  0
+) {
+  instructions = [
+    ...sellAccountPreparation
+      .setupInstructions,
+    ...instructions,
+  ];
+}
 
   } catch (error) {
 
