@@ -1,0 +1,217 @@
+diff --git a/backend/app/config/settings.py b/backend/app/config/settings.py
+--- a/backend/app/config/settings.py
++++ b/backend/app/config/settings.py
+@@ -35,6 +35,37 @@ class Settings(BaseSettings):
+     helius_api_key: Optional[str] = None
+
++    # ------------------------------------------------------------------
++    # Solana Tracker smart-money analytics
++    # ------------------------------------------------------------------
++
++    solana_tracker_base_url: str = (
++        "https://data.solanatracker.io"
++    )
++
++    solana_tracker_api_key: Optional[str] = None
++
++    smart_money_wallets_raw: str = Field(
++        default="",
++        validation_alias="SMART_MONEY_WALLETS",
++    )
++
++    smart_money_enabled: bool = Field(
++        default=False,
++        validation_alias="SMART_MONEY_ENABLED",
++    )
++
++    smart_money_min_buy_usd: float = Field(
++        default=50.0,
++        validation_alias="SMART_MONEY_MIN_BUY_USD",
++    )
++
++    smart_money_max_trades_per_token: int = Field(
++        default=100,
++        validation_alias="SMART_MONEY_MAX_TRADES_PER_TOKEN",
++    )
++
++    smart_money_trade_lookback_seconds: int = Field(
++        default=180,
++        validation_alias="SMART_MONEY_TRADE_LOOKBACK_SECONDS",
++    )
++
+@@ -111,6 +142,12 @@ class Settings(BaseSettings):
+     def creator_watchlist(self) -> List[str]:
+         return _split_csv(
+             self.creator_watchlist_raw
+         )
++
++    @property
++    def smart_money_wallets(self) -> List[str]:
++        return _split_csv(
++            self.smart_money_wallets_raw
++        )
+
+
+ @lru_cache
+
+diff --git a/backend/app/bot/notifications.py b/backend/app/bot/notifications.py
+--- a/backend/app/bot/notifications.py
++++ b/backend/app/bot/notifications.py
+@@ -35,10 +35,53 @@ class Notifier:
+-    async def new_qualified_token(self, recipient_id: int, ticker: str, mint: str, score: float, source: str) -> None:
++    async def new_qualified_token(
++        self,
++        recipient_id: int,
++        ticker: str,
++        mint: str,
++        score: float,
++        source: str,
++        smart_money=None,
++    ) -> None:
+         tag = "[SIMULATED] " if source == "mock_simulated" else ""
++
++        lines = [
++            f"{tag}*New qualified token* `{ticker}`",
++            f"Mint: `{mint[:6]}...{mint[-4:]}`",
++            f"Rule score: {score:.1f}/100",
++        ]
++
++        if smart_money is not None:
++            signal = smart_money.get("signal")
++            profiles = smart_money.get("profiles") or {}
++
++            lines.extend([
++                "",
++                f"*Smart money score*: "
++                f"{signal.score:.1f}/100" if signal else
++                "*Smart money*: lookup unavailable",
++            ])
++
++            if signal and signal.has_signal:
++                lines.append(
++                    f"*Tracked wallets buying*: "
++                    f"{len(signal.matched_wallets)}"
++                )
++
++                for trade in signal.matched_trades[:5]:
++                    profile = profiles.get(trade.wallet) or {}
++                    quality = profile.get("quality_score")
++                    quality_text = (
++                        f" | quality {quality:.0f}/100"
++                        if quality is not None
++                        else ""
++                    )
++                    age = max(0.0, trade.age_seconds)
++                    lines.append(
++                        f"- `{trade.wallet[:6]}...{trade.wallet[-4:]}` "
++                        f"bought ${trade.volume_usd:,.2f} "
++                        f"{age:.0f}s ago{quality_text}"
++                    )
++            elif signal:
++                lines.append(
++                    "*Smart money*: No tracked Pump.fun buy detected"
++                )
++
+         await self._send_to(
+             recipient_id,
+-            f"{tag}*New qualified token* `{ticker}`\nMint: `{mint[:6]}...{mint[-4:]}`\nScore: {score:.1f}/100",
++            "\n".join(lines),
+         )
+
+     async def rule_violation(self, recipient_id: int, ticker: str, reasons: list[str]) -> None:
+
+diff --git a/backend/app/scanners/scanner.py b/backend/app/scanners/scanner.py
+--- a/backend/app/scanners/scanner.py
++++ b/backend/app/scanners/scanner.py
+@@ -16,6 +16,11 @@ from app.connectors.helius import (
+     HeliusClient,
+ )
+
++from app.connectors.solana_tracker import (
++    SolanaTrackerAPIError,
++    solana_tracker,
++)
++
+ from app.execution.base import OrderResult
+@@ -121,6 +126,8 @@ class ScannerService:
+         self._holders_backoff_until: (
+             datetime | None
+         ) = None
++
++        self._solana_tracker = solana_tracker
+
+     # ------------------------------------------------------------------
+     # Anoncoin API discovery
+@@ -953,6 +960,34 @@ class ScannerService:
+
+         return False
+
++    # ------------------------------------------------------------------
++    # Phase 1 smart-money observation
++    # ------------------------------------------------------------------
++
++    async def _get_smart_money_context(
++        self,
++        token,
++    ):
++        """Read smart-money activity without changing qualification/trading."""
++        if (
++            token.source != SOURCE_PUMPFUN
++            or not settings.smart_money_enabled
++        ):
++            return None
++
++        try:
++            signal = await self._solana_tracker.get_token_smart_money(
++                token.mint,
++            )
++            profiles = await self._solana_tracker.get_wallet_profiles()
++            return {
++                "signal": signal,
++                "profiles": profiles,
++            }
++        except SolanaTrackerAPIError as exc:
++            logger.warning(
++                "smart_money_lookup_failed",
++                extra={
++                    "mint": token.mint,
++                    "error": str(exc),
++                },
++            )
++            return None
++        except Exception:
++            logger.exception(
++                "smart_money_lookup_unexpected_error",
++                extra={"mint": token.mint},
++            )
++            return None
++
+     # ------------------------------------------------------------------
+     # Screening
+     # ------------------------------------------------------------------
+@@ -1014,6 +1049,14 @@ class ScannerService:
+
+         metrics.tokens_qualified += 1
+
++        smart_money = await self._get_smart_money_context(
++            token
++        )
++
+         logger.info(
+             "token_qualified",
+             extra={
+@@ -1062,13 +1097,14 @@ class ScannerService:
+-        await self._notifier.new_qualified_token(
++        await self._notifier.new_qualified_token(
+             rule.created_by,
+             (
+                 token.ticker_symbol
+                 or token.mint[:8]
+             ),
+             token.mint,
+             score_result.score,
+             token.source,
++            smart_money=smart_money,
+         )
+
+         return await self._maybe_trade(
