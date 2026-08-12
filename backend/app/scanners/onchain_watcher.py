@@ -18,10 +18,14 @@ Anoncoin/Meteora launch path.
 import asyncio
 import base64
 import logging
+import json
+import struct
+from collections import deque
 from typing import Optional
 from urllib.parse import urlsplit, urlunsplit
 
 import httpx
+import websockets
 
 from solana.rpc.async_api import AsyncClient
 from solders.pubkey import Pubkey
@@ -96,6 +100,22 @@ PUMPFUN_CREATE_DISCRIMINATORS = (
     PUMPFUN_CREATE_DISCRIMINATOR,
     PUMPFUN_CREATE_V2_DISCRIMINATOR,
 )
+
+# Pump.fun emits the same CreateEvent for both legacy create and create_v2.
+# The event contains the mint directly, so discovery does not need a
+# getTransaction RPC call for every launch.
+PUMPFUN_CREATE_EVENT_DISCRIMINATOR = bytes(
+    [27, 114, 169, 77, 222, 235, 99, 118]
+)
+
+PUMPFUN_STREAM_RECONNECT_SECONDS = 2.0
+PUMPFUN_STREAM_MAX_BACKOFF_SECONDS = 30.0
+PUMPFUN_FALLBACK_POLL_SECONDS = 120.0
+PUMPFUN_FALLBACK_SIGNATURE_LIMIT = 10
+PUMPFUN_EVENT_QUEUE_MAXSIZE = 500
+
+# One stream task per watched mint-authority address.
+_pumpfun_streams: dict[str, dict] = {}
 
 
 # ---------------------------------------------------------------------------
@@ -1358,8 +1378,302 @@ def extract_pumpfun_create(
 
 
 # ---------------------------------------------------------------------------
-# Pump.fun detector
+# Pump.fun streaming discovery
 # ---------------------------------------------------------------------------
+
+def _rpc_http_to_ws_url(rpc_url: str) -> str:
+    """Convert a Solana/Helius HTTP RPC URL to its WebSocket equivalent."""
+
+    if rpc_url.startswith("https://"):
+        return "wss://" + rpc_url[len("https://"):]
+
+    if rpc_url.startswith("http://"):
+        return "ws://" + rpc_url[len("http://"):]
+
+    return rpc_url
+
+
+def _read_borsh_string(
+    data: bytes,
+    offset: int,
+) -> tuple[Optional[str], int]:
+    """Read a Borsh length-prefixed UTF-8 string."""
+
+    if offset + 4 > len(data):
+        return None, offset
+
+    length = struct.unpack_from("<I", data, offset)[0]
+    offset += 4
+
+    if length > 1_000_000 or offset + length > len(data):
+        return None, offset
+
+    raw = data[offset:offset + length]
+    offset += length
+
+    try:
+        return raw.decode("utf-8", errors="replace"), offset
+    except Exception:
+        return None, offset
+
+
+def _parse_pumpfun_create_event(
+    encoded_data: str,
+) -> Optional[dict]:
+    """Parse Pump.fun's CreateEvent from a `Program data:` log line.
+
+    CreateEvent is emitted by both `create` and `create_v2` and contains the
+    mint and creator directly. This lets the watcher discover launches without
+    calling getTransaction for every signature.
+    """
+
+    try:
+        data = base64.b64decode(encoded_data)
+    except Exception:
+        return None
+
+    if not data.startswith(PUMPFUN_CREATE_EVENT_DISCRIMINATOR):
+        return None
+
+    offset = len(PUMPFUN_CREATE_EVENT_DISCRIMINATOR)
+
+    name, offset = _read_borsh_string(data, offset)
+    if name is None:
+        return None
+
+    symbol, offset = _read_borsh_string(data, offset)
+    if symbol is None:
+        return None
+
+    uri, offset = _read_borsh_string(data, offset)
+    if uri is None:
+        return None
+
+    # CreateEvent layout:
+    # name, symbol, uri, mint, bonding_curve, user, creator, ...
+    pubkey_size = 32
+    required = pubkey_size * 4
+    if offset + required > len(data):
+        return None
+
+    mint_bytes = data[offset:offset + 32]
+    offset += 32
+
+    bonding_curve_bytes = data[offset:offset + 32]
+    offset += 32
+
+    user_bytes = data[offset:offset + 32]
+    offset += 32
+
+    creator_bytes = data[offset:offset + 32]
+
+    try:
+        mint = str(Pubkey.from_bytes(mint_bytes))
+        bonding_curve = str(Pubkey.from_bytes(bonding_curve_bytes))
+        user = str(Pubkey.from_bytes(user_bytes))
+        creator = str(Pubkey.from_bytes(creator_bytes))
+    except Exception:
+        return None
+
+    if not mint or mint == SOL_MINT:
+        return None
+
+    return {
+        "mint": mint,
+        "creator": creator,
+        "user": user,
+        "bonding_curve": bonding_curve,
+        "name": name,
+        "symbol": symbol,
+        "uri": uri,
+        "source": "pumpfun",
+    }
+
+
+def _extract_pumpfun_event_from_logs(
+    logs: list[str],
+) -> Optional[dict]:
+    """Find a Pump.fun CreateEvent in transaction logs."""
+
+    for line in logs:
+        if not isinstance(line, str):
+            continue
+
+        prefix = "Program data:"
+        if not line.startswith(prefix):
+            continue
+
+        encoded = line[len(prefix):].strip()
+        event = _parse_pumpfun_create_event(encoded)
+        if event:
+            return event
+
+    return None
+
+
+async def _pumpfun_stream_worker(
+    rpc_url: str,
+    mint_authority: str,
+    queue: asyncio.Queue,
+    stop_event: asyncio.Event,
+) -> None:
+    """Continuously stream Pump.fun CreateEvents over standard Solana WSS."""
+
+    ws_url = _rpc_http_to_ws_url(rpc_url)
+    backoff = PUMPFUN_STREAM_RECONNECT_SECONDS
+
+    while not stop_event.is_set():
+        try:
+            async with websockets.connect(
+                ws_url,
+                ping_interval=20,
+                ping_timeout=20,
+                close_timeout=5,
+                max_size=4 * 1024 * 1024,
+            ) as ws:
+                request = {
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "method": "logsSubscribe",
+                    "params": [
+                        {"mentions": [mint_authority]},
+                        {"commitment": "processed"},
+                    ],
+                }
+
+                await ws.send(json.dumps(request))
+                subscription_response = json.loads(await ws.recv())
+
+                if "error" in subscription_response:
+                    raise RuntimeError(
+                        f"Pump.fun logsSubscribe failed: {subscription_response['error']}"
+                    )
+
+                logger.info(
+                    "pumpfun_stream_connected",
+                    extra={
+                        "mint_authority": mint_authority,
+                    },
+                )
+
+                backoff = PUMPFUN_STREAM_RECONNECT_SECONDS
+
+                while not stop_event.is_set():
+                    raw = await ws.recv()
+                    message = json.loads(raw)
+
+                    params = message.get("params") or {}
+                    result = params.get("result") or {}
+                    value = result.get("value") or {}
+
+                    if value.get("err") is not None:
+                        continue
+
+                    logs = value.get("logs") or []
+                    signature = value.get("signature")
+
+                    if not signature:
+                        continue
+
+                    launch = _extract_pumpfun_event_from_logs(logs)
+                    if not launch:
+                        continue
+
+                    launch["tx_signature"] = signature
+                    launch["block_time"] = None
+                    launch["watched_wallet"] = mint_authority
+                    launch["discovery"] = "websocket_create_event"
+
+                    try:
+                        queue.put_nowait(launch)
+                    except asyncio.QueueFull:
+                        # Never let a launch burst block the stream forever.
+                        # Keep the newest signal because the scanner is more
+                        # interested in current launches than stale backlog.
+                        try:
+                            queue.get_nowait()
+                        except asyncio.QueueEmpty:
+                            pass
+                        try:
+                            queue.put_nowait(launch)
+                        except asyncio.QueueFull:
+                            pass
+
+        except asyncio.CancelledError:
+            raise
+
+        except Exception as exc:
+            logger.warning(
+                "pumpfun_stream_disconnected",
+                extra={
+                    "mint_authority": mint_authority,
+                    "error": f"{type(exc).__name__}: {exc}",
+                    "retry_seconds": backoff,
+                },
+            )
+
+            try:
+                await asyncio.wait_for(
+                    stop_event.wait(),
+                    timeout=backoff,
+                )
+            except asyncio.TimeoutError:
+                pass
+
+            backoff = min(
+                backoff * 2,
+                PUMPFUN_STREAM_MAX_BACKOFF_SECONDS,
+            )
+
+
+def _get_or_create_pumpfun_stream(
+    rpc_url: str,
+    mint_authority: str,
+) -> dict:
+    """Create the background Pump.fun stream once per mint authority."""
+
+    state = _pumpfun_streams.get(mint_authority)
+    if state:
+        task = state.get("task")
+        if task and not task.done():
+            return state
+
+    queue: asyncio.Queue = asyncio.Queue(
+        maxsize=PUMPFUN_EVENT_QUEUE_MAXSIZE
+    )
+    stop_event = asyncio.Event()
+    task = asyncio.create_task(
+        _pumpfun_stream_worker(
+            rpc_url,
+            mint_authority,
+            queue,
+            stop_event,
+        ),
+        name=f"pumpfun-stream-{mint_authority[:8]}",
+    )
+
+    state = {
+        "queue": queue,
+        "stop_event": stop_event,
+        "task": task,
+        "last_fallback": 0.0,
+    }
+    _pumpfun_streams[mint_authority] = state
+    return state
+
+
+def _drain_pumpfun_queue(
+    queue: asyncio.Queue,
+) -> list[dict]:
+    """Drain all currently buffered launch events."""
+
+    items = []
+    while True:
+        try:
+            items.append(queue.get_nowait())
+        except asyncio.QueueEmpty:
+            return items
+
 
 async def poll_new_pumpfun_mints(
     rpc_url: str,
@@ -1367,347 +1681,235 @@ async def poll_new_pumpfun_mints(
     watermarks: WatermarkStore,
     limit: int = 20,
 ) -> list[dict]:
-    """Poll Pump.fun's mint-authority address for new token launches.
+    """Return newly-created Pump.fun tokens with minimal RPC credit usage.
 
-    The watcher specifically looks for:
+    Primary path:
+        Standard Solana logsSubscribe -> Pump.fun CreateEvent -> mint
 
-        Pump.fun program
-              +
-        create instruction discriminator
+    This avoids the old N+1 pattern of:
+        getSignaturesForAddress + getTransaction for every signature.
+
+    Recovery path:
+        A low-frequency signature poll is used only when the stream has
+        disconnected or every PUMPFUN_FALLBACK_POLL_SECONDS. The fallback
+        preserves the old parser and is therefore able to recover missed
+        events without making transaction calls during normal streaming.
     """
 
-    async with AsyncClient(
-        rpc_url
-    ) as client:
+    state = _get_or_create_pumpfun_stream(
+        rpc_url,
+        mint_authority,
+    )
 
-        authority_pubkey = (
-            Pubkey.from_string(
-                mint_authority
-            )
+    discovered = []
+    seen_signatures = set()
+
+    # ------------------------------------------------------------------
+    # Fast path: drain CreateEvents already received by the WSS listener.
+    # ------------------------------------------------------------------
+
+    for launch in _drain_pumpfun_queue(state["queue"]):
+        signature = launch.get("tx_signature")
+        mint = launch.get("mint")
+
+        if not signature or not mint:
+            continue
+
+        if signature in seen_signatures:
+            continue
+
+        seen_signatures.add(signature)
+        watermarks.set(
+            f"pumpfun:{mint_authority}",
+            signature,
         )
 
-        watermark_key = (
+        if not watermarks.is_initialized(
             f"pumpfun:{mint_authority}"
-        )
-
-        until = watermarks.get(
-            watermark_key
-        )
-
-        sig_infos = None
-
-        # ------------------------------------------------------------------
-        # Primary Solana client
-        # ------------------------------------------------------------------
-
-        try:
-
-            resp = (
-                await client.get_signatures_for_address(
-                    authority_pubkey,
-                    limit=limit,
-                    until=(
-                        Signature.from_string(
-                            until
-                        )
-                        if until
-                        else None
-                    ),
-                )
+        ):
+            watermarks.mark_initialized(
+                f"pumpfun:{mint_authority}"
             )
 
-            sig_infos = [
+        discovered.append(launch)
+
+        logger.info(
+            "pumpfun_launch_detected",
+            extra={
+                "mint": launch.get("mint"),
+                "creator": launch.get("creator"),
+                "tx_signature": signature,
+                "discovery": launch.get("discovery"),
+            },
+        )
+
+    # ------------------------------------------------------------------
+    # Low-frequency recovery path.
+    # ------------------------------------------------------------------
+    # Only run it when enough time has elapsed. Normal operation therefore
+    # uses WSS and does not call getTransaction for every launch.
+    # ------------------------------------------------------------------
+
+    loop_time = asyncio.get_running_loop().time()
+    stream_task = state.get("task")
+    stream_down = bool(
+        stream_task is not None
+        and stream_task.done()
+    )
+
+    fallback_due = (
+        loop_time - float(state.get("last_fallback", 0.0))
+        >= PUMPFUN_FALLBACK_POLL_SECONDS
+    )
+
+    if not stream_down and not fallback_due:
+        return discovered
+
+    state["last_fallback"] = loop_time
+
+    watermark_key = f"pumpfun:{mint_authority}"
+    until = watermarks.get(watermark_key)
+
+    try:
+        authority_pubkey = Pubkey.from_string(mint_authority)
+
+        async with AsyncClient(rpc_url) as client:
+            resp = await client.get_signatures_for_address(
+                authority_pubkey,
+                limit=min(
+                    int(limit),
+                    PUMPFUN_FALLBACK_SIGNATURE_LIMIT,
+                ),
+                until=(
+                    Signature.from_string(until)
+                    if until
+                    else None
+                ),
+            )
+
+            normalized = [
                 {
-                    "signature": str(
-                        item.signature
-                    ),
+                    "signature": str(item.signature),
                     "err": item.err,
-                    "block_time": (
-                        item.block_time
-                    ),
+                    "block_time": item.block_time,
                 }
                 for item in resp.value
             ]
 
-        except Exception as exc:
-
-            logger.warning(
-                "pumpfun_get_signatures_failed: "
-                "solana client: "
-                f"{type(exc).__name__}: "
-                f"{exc} | "
-                f"rpc={_safe_rpc_url(rpc_url)} | "
-                f"mint_authority={mint_authority}"
-            )
-
-            # --------------------------------------------------------------
-            # Direct JSON-RPC fallback
-            # --------------------------------------------------------------
-
-            try:
-
-                sig_infos = (
-                    await _get_signatures_direct(
-                        rpc_url,
-                        mint_authority,
-                        limit,
-                        until,
+            # On a fresh stream start, initialize from the newest signature
+            # only if the stream has not already supplied events. This keeps
+            # startup from replaying historical launches.
+            if not watermarks.is_initialized(watermark_key):
+                if normalized:
+                    watermarks.set(
+                        watermark_key,
+                        normalized[0]["signature"],
                     )
+                watermarks.mark_initialized(
+                    watermark_key
                 )
-
                 logger.info(
-                    "pumpfun_get_signatures_direct_rpc_success",
+                    "pumpfun_watermark_initialized",
                     extra={
-                        "mint_authority": (
-                            mint_authority
+                        "mint_authority": mint_authority,
+                        "signature": (
+                            normalized[0]["signature"]
+                            if normalized
+                            else None
                         ),
-                        "count": len(
-                            sig_infos
-                        ),
+                        "mode": "streaming",
                     },
                 )
+                return discovered
 
-            except Exception as direct_exc:
+            # Process only signatures newer than the watermark. The stream
+            # should normally make this list empty; this is strictly recovery.
+            for sig_info in reversed(normalized):
+                signature = sig_info.get("signature")
+                if not signature:
+                    continue
+                if signature in seen_signatures:
+                    continue
+                if sig_info.get("err") is not None:
+                    continue
 
-                logger.error(
-                    "pumpfun_get_signatures_failed: "
-                    "direct rpc fallback: "
-                    f"{type(direct_exc).__name__}: "
-                    f"{direct_exc} | "
-                    f"rpc={_safe_rpc_url(rpc_url)} | "
-                    f"mint_authority={mint_authority}"
-                )
-
-                return []
-
-        if not sig_infos:
-
-            return []
-
-        # ------------------------------------------------------------------
-        # Normalize direct/client responses
-        # ------------------------------------------------------------------
-
-        normalized = []
-
-        for item in sig_infos:
-
-            if isinstance(
-                item,
-                dict,
-            ):
-
-                normalized.append(
-                    item
-                )
-
-            else:
-
-                normalized.append(
-                    _signature_dict(
-                        item
-                    )
-                )
-
-        if not normalized:
-
-            return []
-
-        newest_signature = (
-            normalized[0].get(
-                "signature"
-            )
-        )
-
-        if not newest_signature:
-
-            logger.warning(
-                "pumpfun_signature_response_missing_signature"
-            )
-
-            return []
-
-        watermarks.set(
-            watermark_key,
-            newest_signature,
-        )
-
-        if not watermarks.is_initialized(
-            watermark_key
-        ):
-
-            # Do not snipe historical launches on startup.
-            watermarks.mark_initialized(
-                watermark_key
-            )
-
-            logger.info(
-                "pumpfun_watermark_initialized",
-                extra={
-                    "mint_authority": (
-                        mint_authority
-                    ),
-                    "signature": (
-                        newest_signature
-                    ),
-                },
-            )
-
-            return []
-
-        discovered = []
-
-        # ------------------------------------------------------------------
-        # Oldest -> newest
-        # ------------------------------------------------------------------
-
-        for sig_info in reversed(
-            normalized
-        ):
-
-            if sig_info.get(
-                "err"
-            ) is not None:
-
-                continue
-
-            signature = sig_info.get(
-                "signature"
-            )
-
-            if not signature:
-
-                continue
-
-            # --------------------------------------------------------------
-            # Get transaction
-            # --------------------------------------------------------------
-
-            tx_value = None
-
-            try:
-
-                # If this signature came from the solana-py client,
-                # convert it back to a Signature object.
-                signature_obj = (
-                    Signature.from_string(
-                        signature
-                    )
-                )
-
-                tx_resp = (
-                    await client.get_transaction(
-                        signature_obj,
+                tx_value = None
+                try:
+                    tx_resp = await client.get_transaction(
+                        Signature.from_string(signature),
                         encoding="jsonParsed",
                         max_supported_transaction_version=0,
                     )
-                )
-
-                tx_value = (
-                    tx_resp.value
-                )
-
-            except Exception as exc:
-
-                logger.warning(
-                    "pumpfun_get_transaction_failed: "
-                    "solana client: "
-                    f"{type(exc).__name__}: "
-                    f"{exc} | "
-                    f"signature={signature}"
-                )
-
-                # ----------------------------------------------------------
-                # Direct getTransaction fallback
-                # ----------------------------------------------------------
-
-                try:
-
-                    tx_value = (
-                        await _get_transaction_direct(
+                    tx_value = tx_resp.value
+                except Exception as exc:
+                    logger.warning(
+                        "pumpfun_recovery_get_transaction_failed",
+                        extra={
+                            "signature": signature,
+                            "error": str(exc),
+                        },
+                    )
+                    try:
+                        tx_value = await _get_transaction_direct(
                             rpc_url,
                             signature,
                         )
-                    )
+                    except Exception:
+                        continue
 
-                except Exception as direct_exc:
-
-                    logger.warning(
-                        "pumpfun_get_transaction_failed: "
-                        "direct rpc fallback: "
-                        f"{type(direct_exc).__name__}: "
-                        f"{direct_exc} | "
-                        f"signature={signature}"
-                    )
-
+                if not tx_value:
                     continue
 
-            if not tx_value:
-
-                continue
-
-            # --------------------------------------------------------------
-            # The primary parser expects a solders response wrapper.
-            # Direct RPC fallback returns raw JSON, so only use the
-            # instruction parser for the native solana-py path.
-            # --------------------------------------------------------------
-
-            launch = None
-
-            try:
-
-                launch = (
-                    extract_pumpfun_create(
-                        tx_value
+                try:
+                    launch = extract_pumpfun_create(tx_value)
+                except Exception:
+                    logger.debug(
+                        "pumpfun_recovery_parse_failed",
+                        exc_info=True,
                     )
+                    continue
+
+                if not launch:
+                    continue
+
+                launch["tx_signature"] = signature
+                launch["block_time"] = sig_info.get("block_time")
+                launch["watched_wallet"] = mint_authority
+                launch["discovery"] = "rpc_recovery"
+
+                discovered.append(launch)
+                seen_signatures.add(signature)
+                watermarks.set(
+                    watermark_key,
+                    signature,
                 )
 
-            except Exception:
-
-                logger.debug(
-                    "pumpfun_create_parse_failed",
-                    exc_info=True,
+                logger.info(
+                    "pumpfun_launch_detected",
+                    extra={
+                        "mint": launch.get("mint"),
+                        "creator": launch.get("creator"),
+                        "tx_signature": signature,
+                        "discovery": "rpc_recovery",
+                    },
                 )
 
-            if not launch:
+    except Exception as exc:
+        logger.warning(
+            "pumpfun_recovery_poll_failed",
+            extra={
+                "mint_authority": mint_authority,
+                "error": f"{type(exc).__name__}: {exc}",
+            },
+        )
 
-                continue
+    if discovered:
+        logger.info(
+            "pumpfun_discovery_batch_complete",
+            extra={
+                "count": len(discovered),
+                "mode": "streaming",
+            },
+        )
 
-            launch[
-                "tx_signature"
-            ] = signature
-
-            launch[
-                "block_time"
-            ] = sig_info.get(
-                "block_time"
-            )
-
-            launch[
-                "watched_wallet"
-            ] = mint_authority
-
-            discovered.append(
-                launch
-            )
-
-            logger.info(
-                "pumpfun_launch_detected",
-                extra={
-                    "mint": launch.get(
-                        "mint"
-                    ),
-                    "creator": launch.get(
-                        "creator"
-                    ),
-                    "tx_signature": launch.get(
-                        "tx_signature"
-                    ),
-                },
-            )
-
-            await asyncio.sleep(
-                0.05
-            )
-
-        return discovered
+    return discovered
