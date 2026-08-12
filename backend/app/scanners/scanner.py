@@ -92,17 +92,9 @@ logger = logging.getLogger(
 # Launch sources
 # ---------------------------------------------------------------------------
 
-SOURCE_ANONCOIN = (
-    "anoncoin_onchain"
-)
-
-SOURCE_PUMPFUN = (
-    "pumpfun"
-)
-
-SOURCE_MOCK = (
-    "mock_simulated"
-)
+SOURCE_ANONCOIN = "anoncoin_onchain"
+SOURCE_PUMPFUN = "pumpfun"
+SOURCE_MOCK = "mock_simulated"
 
 
 # ---------------------------------------------------------------------------
@@ -120,35 +112,14 @@ class ScannerService:
         execution_router: ExecutionRouter,
     ):
         self._notifier = notifier
-
-        self._position_manager = (
-            position_manager
-        )
-
+        self._position_manager = position_manager
         self._anoncoin = anoncoin
-
-        self._holders_client = (
-            holders_client
-        )
-
-        self._execution_router = (
-            execution_router
-        )
+        self._holders_client = holders_client
+        self._execution_router = execution_router
 
         self._watermarks = (
             onchain_watcher.WatermarkStore()
         )
-
-        # Each pending launch retains:
-        #
-        # {
-        #     "first_seen": datetime,
-        #     "source": str,
-        #     "metadata": dict
-        # }
-        #
-        # This is important because Anoncoin and Pump.fun use completely
-        # different launch mechanisms.
 
         self._pending_watch: dict[
             str,
@@ -173,7 +144,6 @@ class ScannerService:
         self,
     ):
         try:
-
             raw_coins = (
                 await self._anoncoin.get_coins(
                     sort_by="new",
@@ -182,9 +152,7 @@ class ScannerService:
             )
 
             return [
-                from_anoncoin_coin(
-                    coin
-                )
+                from_anoncoin_coin(coin)
                 for coin in raw_coins
             ]
 
@@ -198,13 +166,12 @@ class ScannerService:
             )
 
             if settings.enable_mock_feed:
-
                 return mock_feed.generate()
 
             return []
 
     # ------------------------------------------------------------------
-    # Watch Anoncoin creator
+    # Anoncoin on-chain watcher
     # ------------------------------------------------------------------
 
     async def _watch_anoncoin_for_new_mints(
@@ -212,12 +179,9 @@ class ScannerService:
     ):
         """Watch the existing Anoncoin creator addresses."""
 
-        for wallet in (
-            settings.creator_watchlist
-        ):
+        for wallet in settings.creator_watchlist:
 
             try:
-
                 discovered = (
                     await onchain_watcher.poll_new_mints(
                         settings.solana_rpc_url,
@@ -241,10 +205,7 @@ class ScannerService:
 
                 mint = item["mint"]
 
-                if (
-                    mint
-                    in self._pending_watch
-                ):
+                if mint in self._pending_watch:
                     continue
 
                 if await repo.token_already_seen(
@@ -252,17 +213,13 @@ class ScannerService:
                 ):
                     continue
 
-                self._pending_watch[
-                    mint
-                ] = {
+                self._pending_watch[mint] = {
                     "first_seen": (
                         datetime.now(
                             timezone.utc
                         )
                     ),
-                    "source": (
-                        SOURCE_ANONCOIN
-                    ),
+                    "source": SOURCE_ANONCOIN,
                     "metadata": item,
                 }
 
@@ -273,19 +230,15 @@ class ScannerService:
                     extra={
                         "mint": mint,
                         "watched_wallet": wallet,
-                        "source": (
-                            SOURCE_ANONCOIN
-                        ),
-                        "tx_signature": (
-                            item.get(
-                                "tx_signature"
-                            )
+                        "source": SOURCE_ANONCOIN,
+                        "tx_signature": item.get(
+                            "tx_signature"
                         ),
                     },
                 )
 
     # ------------------------------------------------------------------
-    # Watch Pump.fun
+    # Pump.fun watcher
     # ------------------------------------------------------------------
 
     async def _watch_pumpfun_for_new_mints(
@@ -296,7 +249,8 @@ class ScannerService:
         try:
 
             discovered = (
-                await onchain_watcher.poll_new_pumpfun_mints(
+                await onchain_watcher
+                .poll_new_pumpfun_mints(
                     settings.solana_rpc_url,
                     settings.pumpfun_mint_authority,
                     self._watermarks,
@@ -320,10 +274,7 @@ class ScannerService:
 
             mint = item["mint"]
 
-            if (
-                mint
-                in self._pending_watch
-            ):
+            if mint in self._pending_watch:
                 continue
 
             if await repo.token_already_seen(
@@ -331,17 +282,13 @@ class ScannerService:
             ):
                 continue
 
-            self._pending_watch[
-                mint
-            ] = {
+            self._pending_watch[mint] = {
                 "first_seen": (
                     datetime.now(
                         timezone.utc
                     )
                 ),
-                "source": (
-                    SOURCE_PUMPFUN
-                ),
+                "source": SOURCE_PUMPFUN,
                 "metadata": item,
             }
 
@@ -351,18 +298,12 @@ class ScannerService:
                 "pumpfun_new_mint_detected",
                 extra={
                     "mint": mint,
-                    "creator": (
-                        item.get(
-                            "creator"
-                        )
+                    "creator": item.get(
+                        "creator"
                     ),
-                    "source": (
-                        SOURCE_PUMPFUN
-                    ),
-                    "tx_signature": (
-                        item.get(
-                            "tx_signature"
-                        )
+                    "source": SOURCE_PUMPFUN,
+                    "tx_signature": item.get(
+                        "tx_signature"
                     ),
                 },
             )
@@ -375,11 +316,6 @@ class ScannerService:
         self,
     ):
         """Poll both supported launch sources."""
-
-        # Keep the sources independent.
-        #
-        # If Pump.fun fails, Anoncoin continues.
-        # If Anoncoin fails, Pump.fun continues.
 
         await self._watch_anoncoin_for_new_mints()
 
@@ -395,7 +331,6 @@ class ScannerService:
         metadata: dict,
         first_seen: datetime,
     ) -> TokenSnapshot | None:
-        """Build a TokenSnapshot from the Meteora DBC state."""
 
         try:
 
@@ -440,63 +375,45 @@ class ScannerService:
 
         return TokenSnapshot(
             mint=mint,
-
-            ticker_name=(
-                f"anon-{mint[:6]}"
+            ticker_name=f"anon-{mint[:6]}",
+            ticker_symbol=mint[:6],
+            creator_wallet=info.get(
+                "creator",
+                "",
             ),
-
-            ticker_symbol=(
-                mint[:6]
-            ),
-
-            creator_wallet=(
-                info.get(
-                    "creator",
-                    "",
-                )
-            ),
-
             created_on=first_seen,
-
             price_usd=(
                 info[
                     "price_sol_per_token"
                 ]
                 * sol_price
             ),
-
             market_cap_usd=(
                 info[
                     "market_cap_sol"
                 ]
                 * sol_price
             ),
-
             liquidity_usd=(
                 info[
                     "quote_reserve_sol"
                 ]
                 * sol_price
             ),
-
             holders=0,
-
             volume_24h_usd=0.0,
-
             is_migrated=bool(
                 info.get(
                     "is_migrated",
                     False,
                 )
             ),
-
             decimals=int(
                 info.get(
                     "token_decimals",
                     6,
                 )
             ),
-
             source=SOURCE_ANONCOIN,
         )
 
@@ -551,12 +468,8 @@ class ScannerService:
             return None
 
         creator = (
-            info.get(
-                "creator"
-            )
-            or metadata.get(
-                "creator"
-            )
+            info.get("creator")
+            or metadata.get("creator")
             or ""
         )
 
@@ -595,43 +508,27 @@ class ScannerService:
 
         return TokenSnapshot(
             mint=mint,
-
-            ticker_name=(
-                f"pump-{mint[:6]}"
-            ),
-
-            ticker_symbol=(
-                mint[:6]
-            ),
-
+            ticker_name=f"pump-{mint[:6]}",
+            ticker_symbol=mint[:6],
             creator_wallet=creator,
-
             created_on=first_seen,
-
             price_usd=price_usd,
-
             market_cap_usd=market_cap_usd,
-
             liquidity_usd=liquidity_usd,
-
             holders=0,
-
             volume_24h_usd=0.0,
-
             is_migrated=bool(
                 info.get(
                     "is_migrated",
                     False,
                 )
             ),
-
             decimals=int(
                 info.get(
                     "token_decimals",
                     6,
                 )
             ),
-
             source=SOURCE_PUMPFUN,
         )
 
@@ -646,7 +543,6 @@ class ScannerService:
         metadata: dict,
         first_seen: datetime,
     ) -> TokenSnapshot | None:
-        """Dispatch the token to its correct source-specific reader."""
 
         if source == SOURCE_ANONCOIN:
 
@@ -686,6 +582,7 @@ class ScannerService:
         self,
         token,
     ):
+
         now = datetime.now(
             timezone.utc
         )
@@ -695,7 +592,6 @@ class ScannerService:
             and now
             < self._holders_backoff_until
         ):
-
             return token
 
         try:
@@ -745,13 +641,10 @@ class ScannerService:
             )
 
         elif (
-            self._holders_failure_count
-            == 0
+            self._holders_failure_count == 0
         ):
 
-            self._holders_backoff_until = (
-                None
-            )
+            self._holders_backoff_until = None
 
         return apply_holder_enrichment(
             token,
@@ -799,7 +692,6 @@ class ScannerService:
             token.mint,
             rule_row.created_by,
         ):
-
             return True
 
         recent_buys = (
@@ -859,11 +751,24 @@ class ScannerService:
             ),
         )
 
+        # --------------------------------------------------------------
+        # IMPORTANT:
+        #
+        # Pass the launch source into the execution router.
+        #
+        # Anoncoin -> existing WalletExecutionAdapter
+        # Pump.fun  -> PumpFunExecutionUnavailableAdapter for now
+        #
+        # This prevents a Pump.fun token from falling through into the
+        # Anoncoin/Meteora execution path.
+        # --------------------------------------------------------------
+
         adapter = (
             await self._execution_router
             .get_adapter(
                 state.mode,
                 rule_row.created_by,
+                source=token.source,
             )
         )
 
@@ -1130,7 +1035,6 @@ class ScannerService:
             score_result.score
             < settings.qualify_score_threshold
         ):
-
             return False
 
         metrics.tokens_qualified += 1
@@ -1163,14 +1067,13 @@ class ScannerService:
         )
 
     # ------------------------------------------------------------------
-    # Pending on-chain launches
+    # Pending launches
     # ------------------------------------------------------------------
 
     async def _process_watched_wallet_pending(
         self,
         active_rules: list,
     ):
-        """Process pending launches for every active admin rule."""
 
         now = datetime.now(
             timezone.utc
@@ -1243,13 +1146,6 @@ class ScannerService:
 
                 continue
 
-            # ----------------------------------------------------------
-            # Source-specific market data.
-            #
-            # Anoncoin -> Meteora
-            # Pump.fun -> Pump.fun bonding curve
-            # ----------------------------------------------------------
-
             token = (
                 await self._build_onchain_snapshot(
                     mint,
@@ -1261,11 +1157,12 @@ class ScannerService:
 
             if token is None:
 
-                # Keep the launch pending.
+                # Keep it pending.
                 #
-                # This is important because a brand-new Pump.fun bonding
-                # curve may not be immediately available on the first RPC
-                # read.
+                # This is particularly important for Pump.fun because
+                # the bonding curve may not be immediately readable on
+                # the first RPC request after launch.
+
                 continue
 
             await repo.save_token(
@@ -1345,16 +1242,12 @@ class ScannerService:
             active_rules
         )
 
-        # --------------------------------------------------------------
         # Existing Anoncoin API discovery / mock feed.
-        # --------------------------------------------------------------
-
         for token in await self._fetch_new_tokens():
 
             if await repo.token_already_seen(
                 token.mint
             ):
-
                 continue
 
             await repo.save_token(
@@ -1464,7 +1357,6 @@ class ScannerService:
             != settings.daily_summary_hour_utc
             or already_sent_today
         ):
-
             return
 
         closed = (
