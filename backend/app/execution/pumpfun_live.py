@@ -1,45 +1,22 @@
 """Live Pump.fun execution adapter.
 
-This adapter is intentionally separate from the existing Meteora/Jupiter
-WalletExecutionAdapter.
+Separate from the existing Meteora/Jupiter WalletExecutionAdapter.
 
-Flow:
+BUY:
+    Pump.fun SDK -> unsigned transaction -> Python signs -> Helius RPC
 
-    Scanner
-       |
-       v
-    ExecutionRouter
-       |
-       v
-    PumpFunExecutionAdapter
-       |
-       v
-    pumpfun.build_unsigned_buy_transaction()
-       |
-       v
-    pumpfun_build_tx.js
-       |
-       v
-    unsigned legacy transaction
-       |
-       v
-    Python signs with wallet Keypair
-       |
-       v
-    solana_rpc.send_and_confirm()
-       |
-       v
-    confirmed Solana transaction
+SELL:
+    Pump.fun SDK -> unsigned transaction -> Python signs -> Helius RPC
 
 Security:
-
-- The private key never leaves Python.
-- The private key is never passed to Node.js.
-- Node.js only constructs the unsigned transaction.
-- The adapter never routes Pump.fun trades through Meteora/Jupiter.
+- Private key never leaves Python.
+- Private key is never passed to Node.js.
+- Node.js only constructs unsigned transactions.
+- Pump.fun positions never fall through to Meteora/Jupiter.
 """
 
 import logging
+from decimal import Decimal, ROUND_DOWN
 
 from solders.keypair import Keypair
 
@@ -52,6 +29,7 @@ from app.execution.onchain.pumpfun import (
     PumpFunError,
     PumpFunTransactionBuildError,
     build_unsigned_buy_transaction,
+    build_unsigned_sell_transaction,
 )
 
 from app.execution.onchain.solana_rpc import (
@@ -79,36 +57,18 @@ LAMPORTS_PER_SOL = 1_000_000_000
 def _is_stale_blockhash_error(
     exc: Exception,
 ) -> bool:
-    """Return True when the transaction failed because its blockhash expired.
-
-    A stale blockhash is safe to recover from by rebuilding the transaction
-    with a fresh blockhash.
-
-    We deliberately do NOT retry arbitrary transaction failures because a
-    Pump.fun transaction may have actually reached the network and failed
-    for a meaningful reason such as:
-
-        - insufficient SOL
-        - slippage exceeded
-        - bonding curve completed
-        - invalid account
-        - insufficient token inventory
-        - program constraint failure
-    """
+    """Return True when a transaction failed because its blockhash expired."""
 
     text = str(
         exc
     ).lower()
 
-    normalized = (
-        text.replace(
-            " ",
-            "",
-        )
+    normalized = text.replace(
+        " ",
+        "",
     )
 
     stale_markers = (
-        "blockhashnotfound",
         "blockhashnotfound",
         "transactionexpiredblockheight",
         "lastvalidblockheight",
@@ -124,15 +84,60 @@ def _is_stale_blockhash_error(
         return True
 
     return (
-        "blockhash not found"
-        in text
+        "blockhash not found" in text
         or
-        "block height exceeded"
-        in text
+        "block height exceeded" in text
         or
-        "transaction expired"
-        in text
+        "transaction expired" in text
     )
+
+
+def _token_amount_to_raw(
+    amount_tokens: float,
+    decimals: int,
+) -> int:
+    """Convert human-readable SPL token amount to exact raw units.
+
+    Decimal is used instead of floating-point multiplication so we don't
+    accidentally create an invalid raw token amount.
+    """
+
+    if amount_tokens <= 0:
+        raise ValueError(
+            "token amount must be greater than zero"
+        )
+
+    if decimals < 0 or decimals > 18:
+        raise ValueError(
+            f"invalid token decimals: {decimals}"
+        )
+
+    multiplier = Decimal(
+        10
+    ) ** Decimal(
+        decimals
+    )
+
+    raw = (
+        Decimal(
+            str(amount_tokens)
+        )
+        * multiplier
+    ).quantize(
+        Decimal("1"),
+        rounding=ROUND_DOWN,
+    )
+
+    raw_int = int(
+        raw
+    )
+
+    if raw_int <= 0:
+        raise ValueError(
+            "token amount is too small for token decimals"
+        )
+
+    return raw_int
 
 
 # ---------------------------------------------------------------------------
@@ -171,7 +176,7 @@ class PumpFunExecutionAdapter(
     async def wallet_balance_sol(
         self,
     ) -> float:
-        """Return the wallet's current SOL balance."""
+        """Return current wallet SOL balance."""
 
         return await get_sol_balance(
             self._rpc_url,
@@ -239,13 +244,6 @@ class PumpFunExecutionAdapter(
             self._default_slippage_bps
         )
 
-        # --------------------------------------------------------------
-        # Rebuild + resend only when the blockhash becomes stale.
-        #
-        # We intentionally keep this small because a sniper transaction
-        # should not spend a long time retrying a failed trade.
-        # --------------------------------------------------------------
-
         max_attempts = 3
 
         for attempt in range(
@@ -253,13 +251,6 @@ class PumpFunExecutionAdapter(
         ):
 
             try:
-
-                # ------------------------------------------------------
-                # Build a completely fresh transaction.
-                #
-                # This fetches a fresh blockhash and returns its
-                # last_valid_block_height.
-                # ------------------------------------------------------
 
                 built = (
                     await build_unsigned_buy_transaction(
@@ -293,10 +284,6 @@ class PumpFunExecutionAdapter(
                     ]
                 )
 
-                # ------------------------------------------------------
-                # Sign ONLY in Python.
-                # ------------------------------------------------------
-
                 signed = (
                     sign_legacy_transaction(
                         transaction_b64,
@@ -304,14 +291,6 @@ class PumpFunExecutionAdapter(
                         self._keypair,
                     )
                 )
-
-                # ------------------------------------------------------
-                # Broadcast + confirmation.
-                #
-                # last_valid_block_height is deliberately passed through.
-                # This prevents the confirmation worker from waiting
-                # indefinitely for an expired transaction.
-                # ------------------------------------------------------
 
                 signature = (
                     await send_and_confirm(
@@ -365,10 +344,6 @@ class PumpFunExecutionAdapter(
                 PumpFunError,
                 SolanaTxError,
             ) as exc:
-
-                # ------------------------------------------------------
-                # Only rebuild/retry when the transaction is stale.
-                # ------------------------------------------------------
 
                 if (
                     attempt
@@ -447,32 +422,330 @@ class PumpFunExecutionAdapter(
         amount_tokens: float,
         sell_pct: float,
     ) -> OrderResult:
-        """Pump.fun selling is not enabled by this adapter yet.
+        """Sell a Pump.fun bonding-curve position."""
 
-        We intentionally fail closed instead of routing the sell through
-        Jupiter or Meteora.
+        try:
 
-        The Pump.fun sell builder will be added separately once the buy
-        path has been verified on-chain.
-        """
+            amount_tokens_float = float(
+                amount_tokens
+            )
 
-        logger.warning(
-            "pumpfun_sell_not_enabled",
-            extra={
-                "mint": token.mint,
-                "amount_tokens": (
-                    amount_tokens
+        except (
+            TypeError,
+            ValueError,
+        ) as exc:
+
+            return OrderResult(
+                success=False,
+                status="failed",
+                error_message=(
+                    "invalid token sell amount: "
+                    f"{exc}"
                 ),
-                "sell_pct": sell_pct,
-            },
+            )
+
+        if amount_tokens_float <= 0:
+
+            return OrderResult(
+                success=False,
+                status="failed",
+                error_message=(
+                    "token sell amount must be "
+                    "greater than zero"
+                ),
+            )
+
+        try:
+
+            sell_pct_float = float(
+                sell_pct
+            )
+
+        except (
+            TypeError,
+            ValueError,
+        ) as exc:
+
+            return OrderResult(
+                success=False,
+                status="failed",
+                error_message=(
+                    "invalid sell percentage: "
+                    f"{exc}"
+                ),
+            )
+
+        if (
+            sell_pct_float <= 0
+            or sell_pct_float > 100
+        ):
+
+            return OrderResult(
+                success=False,
+                status="failed",
+                error_message=(
+                    "sell percentage must be "
+                    "greater than 0 and no more than 100"
+                ),
+            )
+
+        # --------------------------------------------------------------
+        # amount_tokens is the current amount being considered by the
+        # position manager. sell_pct determines how much of that amount
+        # should actually be sold.
+        # --------------------------------------------------------------
+
+        tokens_to_sell = (
+            amount_tokens_float
+            * (
+                sell_pct_float
+                / 100.0
+            )
         )
+
+        if tokens_to_sell <= 0:
+
+            return OrderResult(
+                success=False,
+                status="failed",
+                error_message=(
+                    "calculated Pump.fun sell amount "
+                    "is zero"
+                ),
+            )
+
+        try:
+
+            decimals = int(
+                token.decimals
+            )
+
+            amount_tokens_raw = (
+                _token_amount_to_raw(
+                    tokens_to_sell,
+                    decimals,
+                )
+            )
+
+        except (
+            TypeError,
+            ValueError,
+        ) as exc:
+
+            return OrderResult(
+                success=False,
+                status="failed",
+                error_message=(
+                    f"invalid Pump.fun token amount: {exc}"
+                ),
+            )
+
+        slippage_bps = (
+            self._default_slippage_bps
+        )
+
+        max_attempts = 3
+
+        for attempt in range(
+            max_attempts
+        ):
+
+            try:
+
+                # ------------------------------------------------------
+                # Build a completely fresh SELL transaction.
+                # ------------------------------------------------------
+
+                built = (
+                    await build_unsigned_sell_transaction(
+                        mint=token.mint,
+                        owner_pubkey=self._pubkey,
+                        amount_tokens_raw=(
+                            amount_tokens_raw
+                        ),
+                        slippage_bps=(
+                            slippage_bps
+                        ),
+                        rpc_url=self._rpc_url,
+                    )
+                )
+
+                transaction_b64 = (
+                    built[
+                        "transaction_b64"
+                    ]
+                )
+
+                blockhash = (
+                    built[
+                        "blockhash"
+                    ]
+                )
+
+                last_valid_block_height = (
+                    built[
+                        "last_valid_block_height"
+                    ]
+                )
+
+                # ------------------------------------------------------
+                # Sign ONLY in Python.
+                # ------------------------------------------------------
+
+                signed = (
+                    sign_legacy_transaction(
+                        transaction_b64,
+                        blockhash,
+                        self._keypair,
+                    )
+                )
+
+                # ------------------------------------------------------
+                # Broadcast + confirmation.
+                # ------------------------------------------------------
+
+                signature = (
+                    await send_and_confirm(
+                        self._rpc_url,
+                        signed,
+                        last_valid_block_height,
+                    )
+                )
+
+                logger.info(
+                    "pumpfun_sell_confirmed",
+                    extra={
+                        "mint": token.mint,
+                        "owner": self._pubkey,
+                        "amount_tokens_requested": (
+                            amount_tokens_float
+                        ),
+                        "sell_pct": (
+                            sell_pct_float
+                        ),
+                        "amount_tokens_sold": (
+                            tokens_to_sell
+                        ),
+                        "amount_tokens_raw": (
+                            amount_tokens_raw
+                        ),
+                        "token_decimals": (
+                            decimals
+                        ),
+                        "attempt": attempt + 1,
+                        "tx_signature": signature,
+                        "blockhash": blockhash,
+                        "last_valid_block_height": (
+                            last_valid_block_height
+                        ),
+                        "priority_fee_micro_lamports": (
+                            built.get(
+                                "priority_fee_micro_lamports"
+                            )
+                        ),
+                        "priority_fee_source": (
+                            built.get(
+                                "priority_fee_source"
+                            )
+                        ),
+                        "expected_sol_lamports": (
+                            built.get(
+                                "expected_sol_lamports"
+                            )
+                        ),
+                    },
+                )
+
+                return OrderResult(
+                    success=True,
+                    status="filled",
+                    price_usd=(
+                        token.price_usd
+                    ),
+                    tx_signature=signature,
+                )
+
+            except (
+                PumpFunTransactionBuildError,
+                PumpFunError,
+                SolanaTxError,
+            ) as exc:
+
+                if (
+                    attempt
+                    < max_attempts - 1
+                    and _is_stale_blockhash_error(
+                        exc
+                    )
+                ):
+
+                    logger.warning(
+                        "pumpfun_sell_retrying_fresh_blockhash",
+                        extra={
+                            "mint": token.mint,
+                            "attempt": (
+                                attempt + 1
+                            ),
+                            "error": str(exc),
+                        },
+                    )
+
+                    continue
+
+                logger.warning(
+                    "pumpfun_sell_failed",
+                    extra={
+                        "mint": token.mint,
+                        "amount_tokens_sold": (
+                            tokens_to_sell
+                        ),
+                        "amount_tokens_raw": (
+                            amount_tokens_raw
+                        ),
+                        "sell_pct": (
+                            sell_pct_float
+                        ),
+                        "attempt": (
+                            attempt + 1
+                        ),
+                        "error": str(exc),
+                    },
+                )
+
+                return OrderResult(
+                    success=False,
+                    status="failed",
+                    error_message=str(
+                        exc
+                    ),
+                )
+
+            except Exception as exc:
+
+                logger.exception(
+                    "pumpfun_sell_unexpected_error",
+                    extra={
+                        "mint": token.mint,
+                        "amount_tokens_sold": (
+                            tokens_to_sell
+                        ),
+                    },
+                )
+
+                return OrderResult(
+                    success=False,
+                    status="failed",
+                    error_message=(
+                        "unexpected Pump.fun "
+                        f"sell execution error: {exc}"
+                    ),
+                )
 
         return OrderResult(
             success=False,
             status="failed",
             error_message=(
-                "Pump.fun selling is not enabled "
-                "yet. The token will not be routed "
-                "through Meteora/Jupiter."
+                "Pump.fun sell failed after "
+                f"{max_attempts} attempts"
             ),
-  )
+        )
