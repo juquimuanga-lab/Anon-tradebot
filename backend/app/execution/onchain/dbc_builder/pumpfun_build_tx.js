@@ -47,8 +47,8 @@ const bs58 = require("bs58");
 
 const {
   TOKEN_PROGRAM_ID,
+  TOKEN_2022_PROGRAM_ID,
 } = require("@solana/spl-token");
-
 
 // ---------------------------------------------------------------------------
 // Configuration
@@ -252,6 +252,55 @@ function createPumpSdk(
   };
 }
 
+// ---------------------------------------------------------------------------
+// Resolve the token program from the actual mint account
+// ---------------------------------------------------------------------------
+//
+// The BUY previously reached CreateIdempotent and failed with
+// IncorrectProgramId. The mint account owner is authoritative, so resolve
+// the token program directly from the mint before building ATA/buy
+// instructions.
+//
+
+async function resolveActualTokenProgram(
+  connection,
+  mint
+) {
+  const mintAccount =
+    await connection.getAccountInfo(
+      mint,
+      "processed"
+    );
+
+  if (!mintAccount) {
+    throw new Error(
+      "pumpfun_mint_account_not_found"
+    );
+  }
+
+  const owner =
+    mintAccount.owner;
+
+  if (
+    owner.equals(
+      TOKEN_PROGRAM_ID
+    )
+  ) {
+    return TOKEN_PROGRAM_ID;
+  }
+
+  if (
+    owner.equals(
+      TOKEN_2022_PROGRAM_ID
+    )
+  ) {
+    return TOKEN_2022_PROGRAM_ID;
+  }
+
+  throw new Error(
+    `pumpfun_unsupported_mint_program: ${owner.toBase58()}`
+  );
+}
 
 // ---------------------------------------------------------------------------
 // stdin
@@ -660,11 +709,22 @@ async function main() {
     );
   }
 
-  const buyState =
-    await online.fetchBuyState(
-      mint,
-      user
-    );
+  const actualTokenProgram =
+  await resolveActualTokenProgram(
+    connection,
+    mint
+  );
+
+console.error(
+  `Pump.fun mint token program: ${actualTokenProgram.toBase58()}`
+);
+
+const buyState =
+  await online.fetchBuyState(
+    mint,
+    user,
+    actualTokenProgram
+  );
 
 
   if (!buyState) {
@@ -675,11 +735,28 @@ async function main() {
 
 
   const {
-    bondingCurveAccountInfo,
-    bondingCurve,
-    associatedUserAccountInfo,
-    tokenProgram,
-  } = buyState;
+  bondingCurveAccountInfo,
+  bondingCurve,
+  associatedUserAccountInfo,
+  tokenProgram: sdkTokenProgram,
+} = buyState;
+
+const tokenProgram =
+  actualTokenProgram;
+
+if (
+  sdkTokenProgram &&
+  !sdkTokenProgram.equals(
+    actualTokenProgram
+  )
+) {
+  console.error(
+    "Pump.fun token program mismatch; " +
+    `SDK=${sdkTokenProgram.toBase58()} ` +
+    `mintOwner=${actualTokenProgram.toBase58()}. ` +
+    "Using mint owner."
+  );
+}
 
 
   if (
@@ -910,17 +987,10 @@ async function main() {
   };
 
 
-  if (
-    tokenProgram
-  ) {
-    instructionParams.tokenProgram =
-      tokenProgram;
-
-  } else {
-    instructionParams.tokenProgram =
-      TOKEN_PROGRAM_ID;
-  }
-
+  // Never fall back to TOKEN_PROGRAM_ID here.
+// The program was verified directly from the mint account.
+instructionParams.tokenProgram =
+  actualTokenProgram;
 
   let instructions;
 
