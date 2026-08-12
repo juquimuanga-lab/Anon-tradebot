@@ -1189,8 +1189,13 @@ class ScannerService:
                     await self._screen_and_maybe_trade(
                         token,
                         rule,
+                        # Pump.fun is intentionally silent for rejected
+                        # tokens. Only qualified Pump.fun launches should
+                        # reach Telegram. Keep the existing Anoncoin
+                        # rejection notifications unchanged.
                         notify_on_fail=(
-                            key
+                            source != SOURCE_PUMPFUN
+                            and key
                             not in self._notified_fail
                         ),
                     )
