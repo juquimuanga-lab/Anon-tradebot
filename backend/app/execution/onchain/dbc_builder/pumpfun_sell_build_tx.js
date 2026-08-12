@@ -1107,17 +1107,6 @@ if (
   ];
 }
 
-  } catch (error) {
-
-    throw new Error(
-      "pumpfun_sell_instructions_failed: " +
-      `${
-        error?.message ||
-        error
-      }`
-    );
-  }
-
 
   if (
     !instructions ||
