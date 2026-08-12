@@ -38,6 +38,7 @@ const pumpSdkModule = require("@pump-fun/pump-sdk");
 const {
   PumpSdk,
   OnlinePumpSdk,
+  PUMP_SDK,
   getBuyTokenAmountFromSolAmount,
 } = pumpSdkModule;
 
@@ -113,72 +114,142 @@ function slippageBpsToPercent(
 function createPumpSdk(
   connection
 ) {
-  const candidates = [];
+  // The official SDK has two layers:
+  //
+  //   OnlinePumpSdk -> RPC/state fetching
+  //   PUMP_SDK      -> offline instruction building
+  //
+  // Do NOT require one object to expose both sets of methods.
+
+  let online;
+  let onlineName;
 
   if (
     typeof OnlinePumpSdk ===
     "function"
   ) {
-    candidates.push({
-      name: "OnlinePumpSdk",
-      Constructor: OnlinePumpSdk,
-    });
-  }
-
-  if (
-    typeof PumpSdk ===
-    "function"
-  ) {
-    candidates.push({
-      name: "PumpSdk",
-      Constructor: PumpSdk,
-    });
-  }
-
-  for (
-    const candidate of candidates
-  ) {
     try {
-      const sdk = new candidate.Constructor(
+      online = new OnlinePumpSdk(
         connection
       );
 
-      const requiredMethods = [
-        "fetchGlobal",
-        "fetchBuyState",
-        "buyInstructions",
-      ];
-
-      const missingMethods =
-        requiredMethods.filter(
-          (method) =>
-            typeof sdk[method] !==
-            "function"
-        );
-
-      if (
-        missingMethods.length === 0
-      ) {
-        return {
-          sdk,
-          name: candidate.name,
-        };
-      }
+      onlineName =
+        "OnlinePumpSdk";
 
     } catch (error) {
       console.error(
-        `Pump.fun SDK candidate ${candidate.name} initialization failed: ${
+        `Pump.fun OnlinePumpSdk initialization failed: ${
           error?.message || error
         }`
       );
     }
   }
 
-  throw new Error(
-    "pumpfun_sdk_incompatible: " +
-    "no installed Pump.fun SDK class exposes " +
-    "fetchGlobal, fetchBuyState and buyInstructions"
-  );
+  // Compatibility fallback for SDK builds that expose the online methods
+  // directly through PumpSdk.
+  if (
+    !online &&
+    typeof PumpSdk ===
+    "function"
+  ) {
+    try {
+      const candidate =
+        new PumpSdk(
+          connection
+        );
+
+      if (
+        typeof candidate.fetchGlobal ===
+          "function" &&
+        typeof candidate.fetchBuyState ===
+          "function"
+      ) {
+        online =
+          candidate;
+
+        onlineName =
+          "PumpSdk-online-compatible";
+      }
+
+    } catch (error) {
+      console.error(
+        `Pump.fun PumpSdk online fallback initialization failed: ${
+          error?.message || error
+        }`
+      );
+    }
+  }
+
+  if (!online) {
+    throw new Error(
+      "pumpfun_sdk_incompatible: OnlinePumpSdk/fetchBuyState unavailable"
+    );
+  }
+
+  // PUMP_SDK is the official offline instruction-builder singleton.
+  // Some package builds may not export the singleton, so fall back to a
+  // connection-less PumpSdk instance when available.
+  let instructionSdk =
+    PUMP_SDK;
+
+  let instructionName =
+    "PUMP_SDK";
+
+  if (
+    !instructionSdk &&
+    typeof PumpSdk ===
+      "function"
+  ) {
+    try {
+      instructionSdk =
+        new PumpSdk();
+
+      instructionName =
+        "PumpSdk-offline";
+
+    } catch (error) {
+      console.error(
+        `Pump.fun offline PumpSdk initialization failed: ${
+          error?.message || error
+        }`
+      );
+    }
+  }
+
+  if (
+    !instructionSdk ||
+    typeof instructionSdk.buyInstructions !==
+      "function"
+  ) {
+    throw new Error(
+      "pumpfun_sdk_incompatible: offline PUMP_SDK/PumpSdk buyInstructions unavailable"
+    );
+  }
+
+  if (
+    typeof online.fetchGlobal !==
+      "function"
+  ) {
+    throw new Error(
+      "pumpfun_sdk_fetch_global_unavailable"
+    );
+  }
+
+  if (
+    typeof online.fetchBuyState !==
+      "function"
+  ) {
+    throw new Error(
+      "pumpfun_sdk_fetch_buy_state_unavailable"
+    );
+  }
+
+  return {
+    online,
+    instructionSdk,
+    onlineName,
+    instructionName,
+  };
 }
 
 
@@ -390,6 +461,7 @@ async function main() {
   try {
     input =
       JSON.parse(raw);
+
   } catch (error) {
     throw new Error(
       `invalid_json_input: ${
@@ -511,12 +583,15 @@ async function main() {
       connection
     );
 
-  const sdk =
-    sdkInfo.sdk;
+  const online =
+    sdkInfo.online;
+
+  const instructionSdk =
+    sdkInfo.instructionSdk;
 
 
   console.error(
-    `Pump.fun SDK selected: ${sdkInfo.name}`
+    `Pump.fun SDK selected: ${sdkInfo.onlineName}`
   );
 
 
@@ -525,7 +600,7 @@ async function main() {
   // -------------------------------------------------------------------------
 
   if (
-    typeof sdk.fetchGlobal !==
+    typeof online.fetchGlobal !==
     "function"
   ) {
     throw new Error(
@@ -534,7 +609,7 @@ async function main() {
   }
 
   const global =
-    await sdk.fetchGlobal();
+    await online.fetchGlobal();
 
 
   if (!global) {
@@ -552,13 +627,13 @@ async function main() {
     null;
 
   if (
-    typeof sdk.fetchFeeConfig ===
+    typeof online.fetchFeeConfig ===
     "function"
   ) {
     try {
 
       feeConfig =
-        await sdk.fetchFeeConfig();
+        await online.fetchFeeConfig();
 
     } catch (error) {
 
@@ -577,7 +652,7 @@ async function main() {
   // -------------------------------------------------------------------------
 
   if (
-    typeof sdk.fetchBuyState !==
+    typeof online.fetchBuyState !==
     "function"
   ) {
     throw new Error(
@@ -586,7 +661,7 @@ async function main() {
   }
 
   const buyState =
-    await sdk.fetchBuyState(
+    await online.fetchBuyState(
       mint,
       user
     );
@@ -803,7 +878,7 @@ async function main() {
   //
 
   if (
-    typeof sdk.buyInstructions !==
+    typeof instructionSdk.buyInstructions !==
     "function"
   ) {
     throw new Error(
@@ -840,6 +915,7 @@ async function main() {
   ) {
     instructionParams.tokenProgram =
       tokenProgram;
+
   } else {
     instructionParams.tokenProgram =
       TOKEN_PROGRAM_ID;
@@ -851,7 +927,7 @@ async function main() {
   try {
 
     instructions =
-      await sdk.buyInstructions(
+      await instructionSdk.buyInstructions(
         instructionParams
       );
 
@@ -1070,7 +1146,10 @@ async function main() {
           : TOKEN_PROGRAM_ID.toBase58(),
 
       pump_sdk_class:
-        sdkInfo.name,
+        sdkInfo.onlineName,
+
+      pump_sdk_instruction_class:
+        sdkInfo.instructionName,
 
       action:
         "buy",
