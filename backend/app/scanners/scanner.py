@@ -8,14 +8,17 @@ Launch sources:
 2. Pump.fun
    Detected independently through the Pump.fun mint-authority watcher.
 
-The two sources are deliberately kept separate.
+3. Mock/simulated
+   Existing development/testing source.
+
+The launch sources remain separate until they reach the common
+TokenSnapshot/rule engine.
 
 IMPORTANT:
-    Pump.fun tokens must NOT be passed through the Meteora DBC price/pool
-    reader. Their price/execution path will be implemented by the Pump.fun
-    adapter.
+    Pump.fun tokens are priced through pumpfun.py and must not be routed
+    through the Meteora DBC price reader.
 
-The same Telegram/admin rules are then applied to both sources.
+The same Telegram/admin screening rules are applied to both sources.
 """
 
 import asyncio
@@ -23,33 +26,60 @@ import logging
 from datetime import datetime, timedelta, timezone
 
 from app.config.settings import settings
+
 from app.connectors.anoncoin import (
     AnoncoinAPIError,
     AnoncoinClient,
 )
+
 from app.connectors.helius import (
     HeliusAPIError,
     HeliusClient,
 )
+
 from app.execution.base import OrderResult
-from app.execution.onchain import meteora_dbc
-from app.execution.onchain.meteora_dbc import DbcBuildError
-from app.execution.router import ExecutionRouter
+
+from app.execution.onchain import (
+    meteora_dbc,
+    pumpfun,
+)
+
+from app.execution.onchain.meteora_dbc import (
+    DbcBuildError,
+)
+
+from app.execution.onchain.pumpfun import (
+    PumpFunError,
+    PumpFunInvalidAccount,
+    PumpFunPoolNotFound,
+)
+
+from app.execution.router import (
+    ExecutionRouter,
+)
+
 from app.metrics import metrics
+
 from app.scanners import (
     mock_feed,
     onchain_watcher,
     price_feed,
 )
+
 from app.scanners.normalize import (
     apply_holder_enrichment,
     from_anoncoin_coin,
 )
+
 from app.scoring.rules import (
     TokenSnapshot,
     evaluate_hard_filters,
 )
-from app.scoring.scorer import compute_score
+
+from app.scoring.scorer import (
+    compute_score,
+)
+
 from app.storage import repository as repo
 
 
@@ -75,6 +105,10 @@ SOURCE_MOCK = (
 )
 
 
+# ---------------------------------------------------------------------------
+# Scanner service
+# ---------------------------------------------------------------------------
+
 class ScannerService:
 
     def __init__(
@@ -86,13 +120,17 @@ class ScannerService:
         execution_router: ExecutionRouter,
     ):
         self._notifier = notifier
+
         self._position_manager = (
             position_manager
         )
+
         self._anoncoin = anoncoin
+
         self._holders_client = (
             holders_client
         )
+
         self._execution_router = (
             execution_router
         )
@@ -101,24 +139,16 @@ class ScannerService:
             onchain_watcher.WatermarkStore()
         )
 
-        # ------------------------------------------------------------------
-        # IMPORTANT:
+        # Each pending launch retains:
         #
-        # Previously:
+        # {
+        #     "first_seen": datetime,
+        #     "source": str,
+        #     "metadata": dict
+        # }
         #
-        #     mint -> datetime
-        #
-        # Now:
-        #
-        #     mint -> {
-        #         first_seen: datetime,
-        #         source: str,
-        #         metadata: dict
-        #     }
-        #
-        # This allows Anoncoin and Pump.fun tokens to travel through the
-        # same rule engine without losing their launch source.
-        # ------------------------------------------------------------------
+        # This is important because Anoncoin and Pump.fun use completely
+        # different launch mechanisms.
 
         self._pending_watch: dict[
             str,
@@ -163,11 +193,12 @@ class ScannerService:
             logger.info(
                 "anoncoin_discovery_unavailable",
                 extra={
-                    "detail": str(exc)
+                    "detail": str(exc),
                 },
             )
 
             if settings.enable_mock_feed:
+
                 return mock_feed.generate()
 
             return []
@@ -260,7 +291,7 @@ class ScannerService:
     async def _watch_pumpfun_for_new_mints(
         self,
     ):
-        """Watch Pump.fun independently from the Anoncoin detector."""
+        """Watch Pump.fun independently from Anoncoin."""
 
         try:
 
@@ -345,17 +376,17 @@ class ScannerService:
     ):
         """Poll both supported launch sources."""
 
-        # Keep the two detectors independent.
+        # Keep the sources independent.
         #
-        # If Pump.fun has an RPC/API problem, Anoncoin should continue
-        # operating normally, and vice versa.
+        # If Pump.fun fails, Anoncoin continues.
+        # If Anoncoin fails, Pump.fun continues.
 
         await self._watch_anoncoin_for_new_mints()
 
         await self._watch_pumpfun_for_new_mints()
 
     # ------------------------------------------------------------------
-    # Anoncoin/Meteora snapshot
+    # Anoncoin / Meteora snapshot
     # ------------------------------------------------------------------
 
     async def _build_anoncoin_snapshot(
@@ -364,11 +395,7 @@ class ScannerService:
         metadata: dict,
         first_seen: datetime,
     ) -> TokenSnapshot | None:
-        """Build the existing Meteora snapshot.
-
-        This path is unchanged conceptually and remains exclusively for
-        Anoncoin/Meteora launches.
-        """
+        """Build a TokenSnapshot from the Meteora DBC state."""
 
         try:
 
@@ -413,52 +440,199 @@ class ScannerService:
 
         return TokenSnapshot(
             mint=mint,
+
             ticker_name=(
                 f"anon-{mint[:6]}"
             ),
+
             ticker_symbol=(
                 mint[:6]
             ),
+
             creator_wallet=(
                 info.get(
                     "creator",
                     "",
                 )
             ),
+
             created_on=first_seen,
+
             price_usd=(
                 info[
                     "price_sol_per_token"
                 ]
                 * sol_price
             ),
+
             market_cap_usd=(
                 info[
                     "market_cap_sol"
                 ]
                 * sol_price
             ),
+
             liquidity_usd=(
                 info[
                     "quote_reserve_sol"
                 ]
                 * sol_price
             ),
+
             holders=0,
+
             volume_24h_usd=0.0,
+
             is_migrated=bool(
                 info.get(
                     "is_migrated",
                     False,
                 )
             ),
+
             decimals=int(
                 info.get(
                     "token_decimals",
                     6,
                 )
             ),
+
             source=SOURCE_ANONCOIN,
+        )
+
+    # ------------------------------------------------------------------
+    # Pump.fun snapshot
+    # ------------------------------------------------------------------
+
+    async def _build_pumpfun_snapshot(
+        self,
+        mint: str,
+        metadata: dict,
+        first_seen: datetime,
+    ) -> TokenSnapshot | None:
+        """Build a TokenSnapshot from Pump.fun's bonding curve."""
+
+        try:
+
+            info = (
+                await pumpfun.get_pool_info(
+                    mint,
+                    settings.solana_rpc_url,
+                    commitment="processed",
+                )
+            )
+
+        except (
+            PumpFunPoolNotFound,
+            PumpFunInvalidAccount,
+            PumpFunError,
+        ) as exc:
+
+            logger.warning(
+                "pumpfun_pool_info_failed",
+                extra={
+                    "mint": mint,
+                    "error": str(exc),
+                },
+            )
+
+            return None
+
+        except Exception as exc:
+
+            logger.exception(
+                "pumpfun_snapshot_unexpected_error",
+                extra={
+                    "mint": mint,
+                    "error": str(exc),
+                },
+            )
+
+            return None
+
+        creator = (
+            info.get(
+                "creator"
+            )
+            or metadata.get(
+                "creator"
+            )
+            or ""
+        )
+
+        price_usd = float(
+            info.get(
+                "price_usd",
+                0.0,
+            )
+        )
+
+        market_cap_usd = float(
+            info.get(
+                "market_cap_usd",
+                0.0,
+            )
+        )
+
+        liquidity_usd = float(
+            info.get(
+                "liquidity_usd",
+                0.0,
+            )
+        )
+
+        if price_usd <= 0:
+
+            logger.warning(
+                "pumpfun_invalid_price",
+                extra={
+                    "mint": mint,
+                    "price_usd": price_usd,
+                },
+            )
+
+            return None
+
+        return TokenSnapshot(
+            mint=mint,
+
+            ticker_name=(
+                f"pump-{mint[:6]}"
+            ),
+
+            ticker_symbol=(
+                mint[:6]
+            ),
+
+            creator_wallet=creator,
+
+            created_on=first_seen,
+
+            price_usd=price_usd,
+
+            market_cap_usd=market_cap_usd,
+
+            liquidity_usd=liquidity_usd,
+
+            holders=0,
+
+            volume_24h_usd=0.0,
+
+            is_migrated=bool(
+                info.get(
+                    "is_migrated",
+                    False,
+                )
+            ),
+
+            decimals=int(
+                info.get(
+                    "token_decimals",
+                    6,
+                )
+            ),
+
+            source=SOURCE_PUMPFUN,
         )
 
     # ------------------------------------------------------------------
@@ -472,14 +646,7 @@ class ScannerService:
         metadata: dict,
         first_seen: datetime,
     ) -> TokenSnapshot | None:
-        """Build the correct snapshot for a launch source.
-
-        Pump.fun deliberately stops here for now.
-
-        Its dedicated bonding-curve reader is the next component we are
-        adding. This prevents a Pump.fun mint from accidentally entering
-        the Meteora path.
-        """
+        """Dispatch the token to its correct source-specific reader."""
 
         if source == SOURCE_ANONCOIN:
 
@@ -493,20 +660,13 @@ class ScannerService:
 
         if source == SOURCE_PUMPFUN:
 
-            # Do NOT call meteora_dbc.get_pool_info() here.
-            #
-            # Pump.fun tokens are on Pump.fun's bonding curve at launch.
-            #
-            # The next file will provide the Pump.fun snapshot builder.
-
-            logger.debug(
-                "pumpfun_snapshot_waiting_for_adapter",
-                extra={
-                    "mint": mint,
-                },
+            return await (
+                self._build_pumpfun_snapshot(
+                    mint,
+                    metadata,
+                    first_seen,
+                )
             )
-
-            return None
 
         logger.warning(
             "unknown_onchain_source",
@@ -535,6 +695,7 @@ class ScannerService:
             and now
             < self._holders_backoff_until
         ):
+
             return token
 
         try:
@@ -638,6 +799,7 @@ class ScannerService:
             token.mint,
             rule_row.created_by,
         ):
+
             return True
 
         recent_buys = (
@@ -760,6 +922,7 @@ class ScannerService:
                 extra={
                     "mint": token.mint,
                     "rule_id": rule_row.id,
+                    "source": token.source,
                 },
             )
 
@@ -967,6 +1130,7 @@ class ScannerService:
             score_result.score
             < settings.qualify_score_threshold
         ):
+
             return False
 
         metrics.tokens_qualified += 1
@@ -1006,7 +1170,7 @@ class ScannerService:
         self,
         active_rules: list,
     ):
-        """Process pending launches independently for every admin rule."""
+        """Process pending launches for every active admin rule."""
 
         now = datetime.now(
             timezone.utc
@@ -1080,11 +1244,10 @@ class ScannerService:
                 continue
 
             # ----------------------------------------------------------
-            # Build the correct source-specific snapshot.
+            # Source-specific market data.
             #
-            # Pump.fun currently waits for the Pump.fun adapter, so it
-            # will remain pending rather than being incorrectly sent
-            # through Meteora.
+            # Anoncoin -> Meteora
+            # Pump.fun -> Pump.fun bonding curve
             # ----------------------------------------------------------
 
             token = (
@@ -1098,6 +1261,11 @@ class ScannerService:
 
             if token is None:
 
+                # Keep the launch pending.
+                #
+                # This is important because a brand-new Pump.fun bonding
+                # curve may not be immediately available on the first RPC
+                # read.
                 continue
 
             await repo.save_token(
@@ -1178,10 +1346,7 @@ class ScannerService:
         )
 
         # --------------------------------------------------------------
-        # Anoncoin API discovery / mock feed.
-        #
-        # This remains separate from the two direct on-chain launch
-        # detectors.
+        # Existing Anoncoin API discovery / mock feed.
         # --------------------------------------------------------------
 
         for token in await self._fetch_new_tokens():
@@ -1189,6 +1354,7 @@ class ScannerService:
             if await repo.token_already_seen(
                 token.mint
             ):
+
                 continue
 
             await repo.save_token(
@@ -1298,6 +1464,7 @@ class ScannerService:
             != settings.daily_summary_hour_utc
             or already_sent_today
         ):
+
             return
 
         closed = (
