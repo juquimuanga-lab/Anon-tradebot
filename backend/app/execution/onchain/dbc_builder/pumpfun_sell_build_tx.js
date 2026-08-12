@@ -6,15 +6,15 @@
  *   - supplies the mint
  *   - supplies the exact raw token amount
  *   - signs the returned transaction
- *   - broadcasts/confirm it
+ *   - broadcasts/confirms it
  *
  * This file:
  *   - never receives a private key
  *   - never signs
  *   - never broadcasts
  *
- * The official Pump.fun SDK constructs the current bonding-curve sell
- * instruction set, including current fee-recipient accounts.
+ * Pump SDK 1.36.x is used for the current Pump.fun bonding-curve
+ * sell instruction set.
  */
 
 const {
@@ -32,11 +32,6 @@ const {
 const BN = require("bn.js");
 const bs58 = require("bs58");
 
-const {
-  TOKEN_PROGRAM_ID,
-  getMint,
-} = require("@solana/spl-token");
-
 
 // ---------------------------------------------------------------------------
 // Configuration
@@ -52,22 +47,18 @@ const FALLBACK_PRIORITY_FEE_MICROLAMPORTS = 10_000;
 // ---------------------------------------------------------------------------
 
 function readStdin() {
-  return new Promise((resolve) => {
+  return new Promise((resolve, reject) => {
     let data = "";
 
-    process.stdin.on(
-      "data",
-      (chunk) => {
-        data += chunk;
-      }
-    );
+    process.stdin.on("data", (chunk) => {
+      data += chunk;
+    });
 
-    process.stdin.on(
-      "end",
-      () => {
-        resolve(data);
-      }
-    );
+    process.stdin.on("end", () => {
+      resolve(data);
+    });
+
+    process.stdin.on("error", reject);
   });
 }
 
@@ -76,36 +67,10 @@ function readStdin() {
 // Helpers
 // ---------------------------------------------------------------------------
 
-function requirePositiveInteger(
-  value,
-  field
-) {
-  const parsed = Number(value);
+function slippageBpsToPercent(slippageBps) {
+  const bps = Number(slippageBps);
 
-  if (
-    !Number.isSafeInteger(parsed) ||
-    parsed <= 0
-  ) {
-    throw new Error(
-      `${field}_must_be_positive_integer`
-    );
-  }
-
-  return parsed;
-}
-
-
-function slippageBpsToPercent(
-  slippageBps
-) {
-  const bps = Number(
-    slippageBps
-  );
-
-  if (
-    !Number.isFinite(bps) ||
-    bps < 0
-  ) {
+  if (!Number.isFinite(bps) || bps < 0) {
     return 3;
   }
 
@@ -113,30 +78,22 @@ function slippageBpsToPercent(
 }
 
 
-function hasComputeUnitPriceInstruction(
-  transaction
-) {
-  return transaction.instructions.some(
-    (instruction) => {
-
-      if (
-        !instruction.programId.equals(
-          ComputeBudgetProgram.programId
-        )
-      ) {
-        return false;
-      }
-
-      if (
-        !instruction.data ||
-        instruction.data.length === 0
-      ) {
-        return false;
-      }
-
-      return instruction.data[0] === 3;
+function hasComputeUnitPriceInstruction(transaction) {
+  return transaction.instructions.some((instruction) => {
+    if (
+      !instruction.programId.equals(
+        ComputeBudgetProgram.programId
+      )
+    ) {
+      return false;
     }
-  );
+
+    if (!instruction.data || instruction.data.length === 0) {
+      return false;
+    }
+
+    return instruction.data[0] === 3;
+  });
 }
 
 
@@ -148,71 +105,61 @@ async function getPriorityFeeEstimate(
   connection,
   transaction
 ) {
-  const serialized =
-    transaction.serialize({
-      requireAllSignatures: false,
-      verifySignatures: false,
-    });
+  const serialized = transaction.serialize({
+    requireAllSignatures: false,
+    verifySignatures: false,
+  });
 
-  const serializedBase58 =
-    bs58.encode(
-      serialized
-    );
+  const serializedBase58 = bs58.encode(
+    serialized
+  );
 
-  const response =
-    await fetch(
-      connection.rpcEndpoint,
-      {
-        method: "POST",
+  const response = await fetch(
+    connection.rpcEndpoint,
+    {
+      method: "POST",
 
-        headers: {
-          "Content-Type":
-            "application/json",
-        },
+      headers: {
+        "Content-Type": "application/json",
+      },
 
-        body: JSON.stringify({
-          jsonrpc: "2.0",
+      body: JSON.stringify({
+        jsonrpc: "2.0",
 
-          id:
-            "anon-tradebot-pumpfun-sell-priority-fee",
+        id:
+          "anon-tradebot-pumpfun-sell-priority-fee",
 
-          method:
-            "getPriorityFeeEstimate",
+        method:
+          "getPriorityFeeEstimate",
 
-          params: [
-            {
-              transaction:
-                serializedBase58,
+        params: [
+          {
+            transaction: serializedBase58,
 
-              options: {
-                priorityLevel:
-                  PRIORITY_LEVEL,
+            options: {
+              priorityLevel:
+                PRIORITY_LEVEL,
 
-                recommended:
-                  true,
-              },
+              recommended: true,
             },
-          ],
-        }),
-      }
-    );
+          },
+        ],
+      }),
+    }
+  );
 
   if (!response.ok) {
     throw new Error(
-      "Helius priority fee request failed " +
-      `with HTTP ${response.status}`
+      `Helius priority fee request failed with HTTP ${response.status}`
     );
   }
 
-  const body =
-    await response.json();
+  const body = await response.json();
 
   if (body.error) {
     throw new Error(
       "Helius priority fee RPC error: " +
-      JSON.stringify(
-        body.error
-      )
+      JSON.stringify(body.error)
     );
   }
 
@@ -244,11 +191,15 @@ async function getPriorityFeeEstimate(
 // ---------------------------------------------------------------------------
 
 async function main() {
-  const raw =
-    await readStdin();
+  const raw = await readStdin();
 
-  const input =
-    JSON.parse(raw);
+  if (!raw.trim()) {
+    throw new Error(
+      "empty_stdin_payload"
+    );
+  }
+
+  const input = JSON.parse(raw);
 
   const {
     action,
@@ -261,7 +212,7 @@ async function main() {
 
 
   // -------------------------------------------------------------------------
-  // Validate
+  // Validate input
   // -------------------------------------------------------------------------
 
   if (!rpcUrl) {
@@ -299,34 +250,16 @@ async function main() {
 
 
   // -------------------------------------------------------------------------
-  // Public keys
-  // -------------------------------------------------------------------------
-
-  const mint =
-    new PublicKey(
-      baseMint
-    );
-
-  const user =
-    new PublicKey(
-      ownerPubkey
-    );
-
-
-  // -------------------------------------------------------------------------
-  // Exact raw token amount
+  // Raw SPL token amount
   //
-  // This is intentionally passed as a decimal string to BN.
-  //
-  // Never use JS floating point for the raw SPL token amount.
+  // NEVER use JavaScript floating-point arithmetic for token base units.
   // -------------------------------------------------------------------------
 
-  const amount =
-    new BN(
-      String(
-        amountTokensRaw
-      )
-    );
+  const amount = new BN(
+    String(
+      amountTokensRaw
+    )
+  );
 
   if (
     amount.lte(
@@ -340,35 +273,57 @@ async function main() {
 
 
   // -------------------------------------------------------------------------
-  // Connection
+  // Public keys
   // -------------------------------------------------------------------------
 
-  const connection =
-    new Connection(
-      rpcUrl,
-      {
-        commitment:
-          "processed",
-      }
-    );
+  const mint = new PublicKey(
+    baseMint
+  );
 
-
-  // -------------------------------------------------------------------------
-  // Pump SDK
-  // -------------------------------------------------------------------------
-
-  const sdk =
-    new PumpSdk(
-      connection
-    );
+  const user = new PublicKey(
+    ownerPubkey
+  );
 
 
   // -------------------------------------------------------------------------
-  // Global state
+  // Connection / SDK
   // -------------------------------------------------------------------------
 
-  const global =
-    await sdk.fetchGlobal();
+  const connection = new Connection(
+    rpcUrl,
+    {
+      commitment: "processed",
+    }
+  );
+
+  const sdk = new PumpSdk(
+    connection
+  );
+
+
+  // -------------------------------------------------------------------------
+  // Fetch current Pump.fun state
+  //
+  // fetchSellState() determines the correct token program for the mint.
+  // We use that returned tokenProgram rather than hard-coding the legacy
+  // SPL Token program.
+  // -------------------------------------------------------------------------
+
+  const [
+    global,
+    feeConfig,
+    sellState,
+  ] = await Promise.all([
+    sdk.fetchGlobal(),
+
+    sdk.fetchFeeConfig(),
+
+    sdk.fetchSellState(
+      mint,
+      user
+    ),
+  ]);
+
 
   if (!global) {
     throw new Error(
@@ -376,46 +331,11 @@ async function main() {
     );
   }
 
-
-  // -------------------------------------------------------------------------
-  // Fee configuration
-  // -------------------------------------------------------------------------
-
-  let feeConfig =
-    null;
-
-  try {
-
-    feeConfig =
-      await sdk.fetchFeeConfig();
-
-  } catch (error) {
-
-    // Keep this non-fatal because the instruction builder itself can
-    // obtain what it needs from the SDK state.
-    console.error(
-      "Pump.fun fee config unavailable: " +
-      `${
-        error?.message ||
-        error
-      }`
+  if (!feeConfig) {
+    throw new Error(
+      "pumpfun_fee_config_not_found"
     );
   }
-
-
-  // -------------------------------------------------------------------------
-  // Fetch live SELL state
-  //
-  // This is intentionally fetchSellState(), not fetchBuyState().
-  // The SDK can therefore resolve the exact account state required for
-  // selling this wallet's token position.
-  // -------------------------------------------------------------------------
-
-  const sellState =
-    await sdk.fetchSellState(
-      mint,
-      user
-    );
 
   if (!sellState) {
     throw new Error(
@@ -427,6 +347,7 @@ async function main() {
   const {
     bondingCurveAccountInfo,
     bondingCurve,
+    tokenProgram,
   } = sellState;
 
 
@@ -442,12 +363,15 @@ async function main() {
     );
   }
 
+  if (!tokenProgram) {
+    throw new Error(
+      "pumpfun_token_program_missing_from_sell_state"
+    );
+  }
+
 
   // -------------------------------------------------------------------------
-  // Selling is only valid while the token is on the Pump.fun bonding curve.
-  //
-  // Once complete/migrated, the position must be handled by the graduated
-  // market executor rather than this bonding-curve sell path.
+  // Bonding-curve sell only
   // -------------------------------------------------------------------------
 
   if (
@@ -460,56 +384,25 @@ async function main() {
 
 
   // -------------------------------------------------------------------------
-  // Verify token decimals.
+  // Verify current wallet token balance.
   //
-  // This is mainly defensive validation. The actual sell amount is already
-  // supplied as raw units.
-  // -------------------------------------------------------------------------
-
-  const mintInfo =
-    await getMint(
-      connection,
-      mint,
-      "processed",
-      TOKEN_PROGRAM_ID
-    );
-
-  const decimals =
-    Number(
-      mintInfo.decimals
-    );
-
-
-  // -------------------------------------------------------------------------
-  // Make sure the requested sell amount doesn't exceed the wallet's
-  // current token balance.
-  //
-  // The SDK exposes getTokenBalance(), which reads the associated token
-  // balance using the current wallet.
+  // Both values are raw token units.
   // -------------------------------------------------------------------------
 
   const walletBalance =
     await sdk.getTokenBalance(
       mint,
       user,
-      TOKEN_PROGRAM_ID
+      tokenProgram
     );
 
-  if (!walletBalance) {
-    throw new Error(
-      "pumpfun_token_balance_unavailable"
-    );
-  }
 
   if (
-    amount.gt(
-      new BN(
-        walletBalance.toString()
-      )
-    )
+    walletBalance === undefined ||
+    walletBalance === null
   ) {
     throw new Error(
-      "pumpfun_sell_amount_exceeds_wallet_balance"
+      "pumpfun_token_balance_unavailable"
     );
   }
 
@@ -525,60 +418,34 @@ async function main() {
   }
 
 
+  if (
+    amount.gt(
+      walletBalance
+    )
+  ) {
+    throw new Error(
+      "pumpfun_sell_amount_exceeds_wallet_balance"
+    );
+  }
+
+
   // -------------------------------------------------------------------------
   // Calculate expected SOL output.
-  //
-  // This gives the SDK the minimum SOL amount after applying slippage.
   // -------------------------------------------------------------------------
 
-  let expectedSolAmount;
+  const expectedSolAmount =
+    getSellSolAmountFromTokenAmount({
+      global,
 
-  try {
+      feeConfig,
 
-    if (feeConfig) {
+      mintSupply:
+        bondingCurve.tokenTotalSupply,
 
-      expectedSolAmount =
-        getSellSolAmountFromTokenAmount({
-          global,
-          feeConfig,
-          mintSupply:
-            bondingCurve.tokenTotalSupply,
-          bondingCurve,
-          amount,
-        });
+      bondingCurve,
 
-    } else {
-
-      expectedSolAmount =
-        getSellSolAmountFromTokenAmount(
-          global,
-          bondingCurve,
-          amount
-        );
-    }
-
-  } catch (firstError) {
-
-    try {
-
-      expectedSolAmount =
-        getSellSolAmountFromTokenAmount({
-          global,
-          bondingCurve,
-          amount,
-        });
-
-    } catch (secondError) {
-
-      throw new Error(
-        "pumpfun_sell_quote_failed: " +
-        `${
-          secondError?.message ||
-          firstError
-        }`
-      );
-    }
-  }
+      amount,
+    });
 
 
   if (!expectedSolAmount) {
@@ -617,52 +484,43 @@ async function main() {
 
   // -------------------------------------------------------------------------
   // Mayhem mode
+  // -------------------------------------------------------------------------
+
+  const mayhemMode = Boolean(
+    bondingCurve.isMayhemMode ??
+    bondingCurve.is_mayhem_mode ??
+    false
+  );
+
+
+  // -------------------------------------------------------------------------
+  // Build Pump.fun SELL instructions.
   //
-  // Newer Pump.fun curves can expose this state on the bonding curve.
-  // Default false when the field is unavailable.
-  // -------------------------------------------------------------------------
-
-  const mayhemMode =
-    Boolean(
-      bondingCurve.isMayhemMode ??
-      bondingCurve.is_mayhem_mode ??
-      false
-    );
-
-
-  // -------------------------------------------------------------------------
-  // Build SELL instructions
+  // Spreading sellState passes the SDK-detected tokenProgram and the
+  // other current sell-state accounts into the instruction builder.
   // -------------------------------------------------------------------------
 
   const instructions =
     await sdk.sellInstructions({
+      ...sellState,
+
       global,
-
-      bondingCurveAccountInfo,
-
-      bondingCurve,
 
       mint,
 
       user,
 
-      // Exact raw token amount.
       amount,
 
-      // Minimum SOL expected after slippage.
       solAmount:
         expectedSolBN,
 
       slippage:
         slippagePercent,
 
-      tokenProgram:
-        TOKEN_PROGRAM_ID,
-
       mayhemMode,
 
-      cashback:
-        false,
+      cashback: false,
     });
 
 
@@ -680,14 +538,12 @@ async function main() {
 
 
   // -------------------------------------------------------------------------
-  // Transaction
+  // Build transaction
   // -------------------------------------------------------------------------
 
-  const tx =
-    new Transaction();
+  const tx = new Transaction();
 
-  tx.feePayer =
-    user;
+  tx.feePayer = user;
 
   tx.add(
     ...instructions
@@ -695,7 +551,7 @@ async function main() {
 
 
   // -------------------------------------------------------------------------
-  // Blockhash
+  // Initial blockhash
   // -------------------------------------------------------------------------
 
   const initialBlockhash =
@@ -708,7 +564,7 @@ async function main() {
 
 
   // -------------------------------------------------------------------------
-  // Priority fee
+  // Helius priority fee
   // -------------------------------------------------------------------------
 
   let priorityFeeMicroLamports =
@@ -742,7 +598,7 @@ async function main() {
 
 
   // -------------------------------------------------------------------------
-  // Add priority fee
+  // Add priority fee if the SDK hasn't already done so.
   // -------------------------------------------------------------------------
 
   let priorityFeeInstructionAdded =
@@ -768,7 +624,7 @@ async function main() {
 
 
   // -------------------------------------------------------------------------
-  // Final blockhash AFTER all instructions
+  // Final fresh blockhash
   // -------------------------------------------------------------------------
 
   const finalBlockhash =
@@ -781,21 +637,18 @@ async function main() {
 
 
   // -------------------------------------------------------------------------
-  // Serialize
+  // Serialize unsigned transaction
   // -------------------------------------------------------------------------
 
   const serialized =
     tx.serialize({
-      requireAllSignatures:
-        false,
-
-      verifySignatures:
-        false,
+      requireAllSignatures: false,
+      verifySignatures: false,
     });
 
 
   // -------------------------------------------------------------------------
-  // Return unsigned transaction
+  // Return unsigned transaction to Python
   // -------------------------------------------------------------------------
 
   process.stdout.write(
@@ -825,8 +678,8 @@ async function main() {
       wallet_token_balance_raw:
         walletBalance.toString(),
 
-      token_decimals:
-        decimals,
+      token_program:
+        tokenProgram.toBase58(),
 
       expected_sol_lamports:
         expectedSolBN.toString(),
@@ -838,7 +691,7 @@ async function main() {
 
       slippage_bps:
         Number(
-          slippageBps || 300
+          slippageBps ?? 300
         ),
 
       slippage_percent:
@@ -891,9 +744,4 @@ main().catch(
               err.message) ||
             err
           ),
-      }) + "\n"
-    );
-
-    process.exit(0);
-  }
-);
+      })
