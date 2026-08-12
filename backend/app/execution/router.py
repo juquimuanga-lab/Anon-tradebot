@@ -7,34 +7,47 @@ Execution sources:
         -> existing WalletExecutionAdapter
 
     Pump.fun
-        -> Pump.fun adapter
-           (will be enabled once pumpfun execution is installed)
+        -> PumpFunExecutionAdapter
 
 Paper mode:
     -> PaperExecutionAdapter
 
-The router deliberately fails closed for Pump.fun until the dedicated
-Pump.fun execution adapter is available. This prevents Pump.fun tokens
-from accidentally being sent through the Anoncoin/Meteora execution path.
+The router keeps the two live execution paths completely separate.
+A Pump.fun token must never accidentally fall through into the
+Anoncoin/Meteora executor.
 """
 
 import logging
 from typing import Optional
 
 from app.config.settings import settings
-from app.execution.base import ExecutionAdapter
-from app.execution.onchain.jupiter import JupiterClient
+
+from app.execution.base import (
+    ExecutionAdapter,
+)
+
+from app.execution.onchain.jupiter import (
+    JupiterClient,
+)
+
 from app.execution.onchain.wallet_keys import (
     InvalidWalletKeyError,
     load_keypair,
 )
+
 from app.execution.paper import (
     PaperExecutionAdapter,
 )
+
+from app.execution.pumpfun_live import (
+    PumpFunExecutionAdapter,
+)
+
 from app.execution.wallet_live import (
     NoWalletConnectedAdapter,
     WalletExecutionAdapter,
 )
+
 from app.security.secrets_manager import (
     secrets_manager,
 )
@@ -62,104 +75,30 @@ SOURCE_MOCK = (
 )
 
 
-class PumpFunExecutionUnavailableAdapter:
-    """
-    Safe placeholder adapter for Pump.fun.
-
-    Pump.fun execution is intentionally not enabled until the dedicated
-    Pump.fun transaction builder/executor has been installed.
-
-    This prevents the router from accidentally sending a Pump.fun token
-    through the existing Meteora/Jupiter execution path.
-    """
-
-    def __init__(
-        self,
-        reason: Optional[str] = None,
-    ):
-        self._reason = (
-            reason
-            or
-            "Pump.fun live execution is not installed yet."
-        )
-
-    async def buy(
-        self,
-        token,
-        amount_sol: float,
-    ):
-        from app.execution.base import (
-            OrderResult,
-        )
-
-        logger.warning(
-            "pumpfun_execution_blocked",
-            extra={
-                "mint": getattr(
-                    token,
-                    "mint",
-                    None,
-                ),
-                "reason": self._reason,
-            },
-        )
-
-        return OrderResult(
-            success=False,
-            status="failed",
-            error_message=(
-                self._reason
-                + " Pump.fun trades are blocked "
-                  "until the dedicated execution adapter "
-                  "is enabled."
-            ),
-        )
-
-    async def sell(
-        self,
-        token,
-        amount_tokens: float,
-    ):
-        from app.execution.base import (
-            OrderResult,
-        )
-
-        logger.warning(
-            "pumpfun_sell_execution_blocked",
-            extra={
-                "mint": getattr(
-                    token,
-                    "mint",
-                    None,
-                ),
-                "reason": self._reason,
-            },
-        )
-
-        return OrderResult(
-            success=False,
-            status="failed",
-            error_message=(
-                self._reason
-                + " Pump.fun selling is blocked "
-                  "until the dedicated execution adapter "
-                  "is enabled."
-            ),
-        )
-
+# ---------------------------------------------------------------------------
+# Router
+# ---------------------------------------------------------------------------
 
 class ExecutionRouter:
     """
-    Select the appropriate execution adapter.
+    Select the correct execution adapter.
 
-    The existing constructor remains compatible with the rest of the
-    application.
+    Anoncoin:
+        Meteora DBC for pre-migration tokens.
+        Jupiter for migrated tokens.
+
+    Pump.fun:
+        Dedicated Pump.fun bonding-curve executor.
+
+    Paper:
+        Paper execution regardless of launch source.
     """
 
     def __init__(
         self,
         jupiter_client: JupiterClient,
     ):
+
         self._paper_adapter = (
             PaperExecutionAdapter()
         )
@@ -168,11 +107,60 @@ class ExecutionRouter:
             jupiter_client
         )
 
-        # Dedicated Pump.fun execution will be attached here after the
-        # Pump.fun transaction builder is implemented.
-        self._pumpfun_adapter = (
-            PumpFunExecutionUnavailableAdapter()
+    # ------------------------------------------------------------------
+    # Wallet loading
+    # ------------------------------------------------------------------
+
+    async def _load_wallet_adapter(
+        self,
+        owner_user_id: Optional[int],
+        source: str,
+    ) -> Optional[object]:
+        """
+        Load the wallet belonging to the Telegram/admin rule owner.
+
+        Returns None when a usable wallet is unavailable.
+
+        The private key remains inside Python and is never passed to
+        the Node transaction builder.
+        """
+
+        if owner_user_id is None:
+
+            return None
+
+        raw_key = (
+            await secrets_manager
+            .get_wallet_private_key(
+                owner_user_id
+            )
         )
+
+        if not raw_key:
+
+            return None
+
+        try:
+
+            keypair = load_keypair(
+                raw_key
+            )
+
+        except InvalidWalletKeyError as exc:
+
+            logger.error(
+                "stored_wallet_key_invalid",
+                extra={
+                    "owner_user_id": (
+                        owner_user_id
+                    ),
+                    "source": source,
+                },
+            )
+
+            return None
+
+        return keypair
 
     # ------------------------------------------------------------------
     # Adapter selection
@@ -202,19 +190,14 @@ class ExecutionRouter:
                 Existing Meteora/Jupiter wallet execution.
 
             SOURCE_PUMPFUN
-                Dedicated Pump.fun execution.
+                Dedicated Pump.fun bonding-curve execution.
 
             SOURCE_MOCK
-                Only allowed through paper execution.
-
-        IMPORTANT:
-            source defaults to SOURCE_ANONCOIN to preserve compatibility
-            with existing callers while the rest of the codebase is being
-            migrated to explicit source-aware routing.
+                Never allowed to execute live.
         """
 
         # --------------------------------------------------------------
-        # Paper mode
+        # PAPER MODE
         # --------------------------------------------------------------
 
         if mode == "paper":
@@ -223,7 +206,7 @@ class ExecutionRouter:
 
 
         # --------------------------------------------------------------
-        # Unknown source
+        # Validate source
         # --------------------------------------------------------------
 
         if source not in {
@@ -236,7 +219,9 @@ class ExecutionRouter:
                 "unknown_execution_source",
                 extra={
                     "source": source,
-                    "owner_user_id": owner_user_id,
+                    "owner_user_id": (
+                        owner_user_id
+                    ),
                 },
             )
 
@@ -249,7 +234,9 @@ class ExecutionRouter:
 
 
         # --------------------------------------------------------------
-        # Mock tokens must never execute live.
+        # Mock tokens
+        #
+        # Never allow simulated tokens to reach a live wallet.
         # --------------------------------------------------------------
 
         if source == SOURCE_MOCK:
@@ -257,47 +244,22 @@ class ExecutionRouter:
             logger.warning(
                 "mock_live_execution_blocked",
                 extra={
-                    "owner_user_id": owner_user_id,
+                    "owner_user_id": (
+                        owner_user_id
+                    ),
                 },
             )
 
             return NoWalletConnectedAdapter(
                 (
-                    "Simulated/mock tokens cannot be "
-                    "executed in live mode."
+                    "Simulated/mock tokens cannot "
+                    "be executed in live mode."
                 )
             )
 
 
         # --------------------------------------------------------------
-        # Pump.fun
-        #
-        # IMPORTANT:
-        #
-        # We do this BEFORE loading the wallet because the Pump.fun
-        # execution adapter is not installed yet.
-        #
-        # This guarantees that a Pump.fun token cannot accidentally fall
-        # through into WalletExecutionAdapter.
-        # --------------------------------------------------------------
-
-        if source == SOURCE_PUMPFUN:
-
-            logger.info(
-                "pumpfun_execution_adapter_selected",
-                extra={
-                    "owner_user_id": owner_user_id,
-                    "status": "waiting_for_adapter",
-                },
-            )
-
-            return (
-                self._pumpfun_adapter
-            )
-
-
-        # --------------------------------------------------------------
-        # Existing Anoncoin/Meteora path
+        # Both real sources require a wallet.
         # --------------------------------------------------------------
 
         if owner_user_id is None:
@@ -311,18 +273,21 @@ class ExecutionRouter:
 
 
         # --------------------------------------------------------------
-        # Retrieve admin wallet
+        # Load admin wallet.
+        #
+        # The same connected wallet used by the Telegram admin is used
+        # for both Anoncoin and Pump.fun.
         # --------------------------------------------------------------
 
-        raw_key = (
-            await secrets_manager
-            .get_wallet_private_key(
-                owner_user_id
+        keypair = (
+            await self._load_wallet_adapter(
+                owner_user_id,
+                source,
             )
         )
 
 
-        if not raw_key:
+        if keypair is None:
 
             return NoWalletConnectedAdapter(
                 (
@@ -334,50 +299,76 @@ class ExecutionRouter:
 
 
         # --------------------------------------------------------------
-        # Decode wallet key
+        # PUMP.FUN
+        #
+        # IMPORTANT:
+        #
+        # This branch happens before the Anoncoin/Meteora adapter.
+        #
+        # Therefore a Pump.fun token can NEVER accidentally be sent
+        # through Meteora DBC/Jupiter.
         # --------------------------------------------------------------
 
-        try:
+        if source == SOURCE_PUMPFUN:
 
-            keypair = load_keypair(
-                raw_key
-            )
-
-        except InvalidWalletKeyError as exc:
-
-            logger.error(
-                "stored_wallet_key_invalid",
+            logger.info(
+                "pumpfun_execution_adapter_selected",
                 extra={
                     "owner_user_id": (
                         owner_user_id
                     ),
+                    "source": source,
+                    "wallet": str(
+                        keypair.pubkey()
+                    ),
                 },
             )
 
-            return NoWalletConnectedAdapter(
-                (
-                    "Stored wallet key is invalid: "
-                    f"{exc}"
-                )
+            return PumpFunExecutionAdapter(
+                keypair=keypair,
+                rpc_url=(
+                    settings.solana_rpc_url
+                ),
+                default_slippage_bps=(
+                    settings.default_slippage_bps
+                ),
             )
 
 
         # --------------------------------------------------------------
-        # Existing Anoncoin/Meteora wallet adapter
+        # ANONCOIN / METEORA
         # --------------------------------------------------------------
 
-        logger.debug(
-            "anoncoin_wallet_execution_adapter_selected",
-            extra={
-                "owner_user_id": owner_user_id,
-                "source": source,
-            },
-        )
+        if source == SOURCE_ANONCOIN:
+
+            logger.debug(
+                "anoncoin_wallet_execution_adapter_selected",
+                extra={
+                    "owner_user_id": (
+                        owner_user_id
+                    ),
+                    "source": source,
+                    "wallet": str(
+                        keypair.pubkey()
+                    ),
+                },
+            )
+
+            return WalletExecutionAdapter(
+                keypair,
+                settings.solana_rpc_url,
+                self._jupiter,
+                settings.default_slippage_bps,
+            )
 
 
-        return WalletExecutionAdapter(
-            keypair,
-            settings.solana_rpc_url,
-            self._jupiter,
-            settings.default_slippage_bps,
+        # --------------------------------------------------------------
+        # Defensive fallback
+        # --------------------------------------------------------------
+
+        return NoWalletConnectedAdapter(
+            (
+                "No execution adapter is available "
+                f"for source: {source}"
+            )
         )
