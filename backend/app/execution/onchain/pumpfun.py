@@ -74,6 +74,11 @@ PUMPFUN_BUILDER_PATH = (
     / "pumpfun_build_tx.js"
 )
 
+PUMPFUN_SELL_BUILDER_PATH = (
+    _DBC_BUILDER_DIR
+    / "pumpfun_sell_build_tx.js"
+)
+
 
 # ---------------------------------------------------------------------------
 # Errors
@@ -1079,6 +1084,259 @@ async def build_unsigned_buy_transaction(
             "owner": owner_pubkey,
             "amount_lamports": (
                 amount_lamports_int
+            ),
+            "slippage_bps": (
+                slippage_bps_int
+            ),
+            "blockhash": blockhash,
+            "last_valid_block_height": (
+                last_valid_block_height
+            ),
+            "priority_fee_micro_lamports": (
+                result.get(
+                    "priority_fee_micro_lamports"
+                )
+            ),
+            "priority_fee_source": (
+                result.get(
+                    "priority_fee_source"
+                )
+            ),
+        },
+    )
+
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Pump.fun SELL transaction builder
+# ---------------------------------------------------------------------------
+
+async def build_unsigned_sell_transaction(
+    *,
+    mint: str,
+    owner_pubkey: str,
+    amount_tokens_raw: int,
+    slippage_bps: int,
+    rpc_url: str,
+) -> dict:
+    """Build an unsigned Pump.fun SELL transaction.
+
+    The transaction is constructed by the dedicated Node/Pump.fun SDK
+    SELL builder.
+
+    This function never receives a private key, never signs and never
+    submits a transaction.
+    """
+
+    if not mint:
+        raise PumpFunTransactionBuildError(
+            "mint_missing"
+        )
+
+    if not owner_pubkey:
+        raise PumpFunTransactionBuildError(
+            "owner_pubkey_missing"
+        )
+
+    if not rpc_url:
+        raise PumpFunTransactionBuildError(
+            "rpc_url_missing"
+        )
+
+    try:
+        amount_tokens_raw_int = int(
+            amount_tokens_raw
+        )
+    except (
+        TypeError,
+        ValueError,
+    ) as exc:
+        raise PumpFunTransactionBuildError(
+            "amount_tokens_raw_invalid"
+        ) from exc
+
+    if amount_tokens_raw_int <= 0:
+        raise PumpFunTransactionBuildError(
+            "amount_tokens_raw_must_be_positive"
+        )
+
+    try:
+        slippage_bps_int = int(
+            slippage_bps
+        )
+    except (
+        TypeError,
+        ValueError,
+    ) as exc:
+        raise PumpFunTransactionBuildError(
+            "slippage_bps_invalid"
+        ) from exc
+
+    if (
+        slippage_bps_int < 0
+        or slippage_bps_int > 10_000
+    ):
+        raise PumpFunTransactionBuildError(
+            "slippage_bps_out_of_range"
+        )
+
+    if not PUMPFUN_SELL_BUILDER_PATH.exists():
+        raise PumpFunTransactionBuildError(
+            "pumpfun_sell_builder_not_found: "
+            f"{PUMPFUN_SELL_BUILDER_PATH}"
+        )
+
+    payload = {
+        "action": "sell",
+        "baseMint": mint,
+        "ownerPubkey": owner_pubkey,
+        "amountTokensRaw": str(
+            amount_tokens_raw_int
+        ),
+        "slippageBps": slippage_bps_int,
+        "rpcUrl": rpc_url,
+    }
+
+    process = (
+        await asyncio.create_subprocess_exec(
+            "node",
+            str(
+                PUMPFUN_SELL_BUILDER_PATH
+            ),
+            cwd=str(
+                _DBC_BUILDER_DIR
+            ),
+            stdin=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+    )
+
+    stdin_data = (
+        json.dumps(
+            payload
+        ).encode("utf-8")
+    )
+
+    try:
+        stdout, stderr = (
+            await asyncio.wait_for(
+                process.communicate(
+                    stdin_data
+                ),
+                timeout=20,
+            )
+        )
+    except asyncio.TimeoutError:
+        try:
+            process.kill()
+        except ProcessLookupError:
+            pass
+
+        await process.communicate()
+
+        raise PumpFunTransactionBuildError(
+            "pumpfun_sell_builder_timeout"
+        )
+
+    stdout_text = (
+        stdout
+        .decode(
+            "utf-8",
+            errors="replace",
+        )
+        .strip()
+    )
+
+    stderr_text = (
+        stderr
+        .decode(
+            "utf-8",
+            errors="replace",
+        )
+        .strip()
+    )
+
+    if not stdout_text:
+        raise PumpFunTransactionBuildError(
+            "pumpfun_sell_builder_empty_response"
+            + (
+                f": {stderr_text}"
+                if stderr_text
+                else ""
+            )
+        )
+
+    try:
+        result = json.loads(
+            stdout_text.splitlines()[-1]
+        )
+    except json.JSONDecodeError as exc:
+        raise PumpFunTransactionBuildError(
+            "pumpfun_sell_builder_invalid_json: "
+            f"{stdout_text[-1000:]}"
+        ) from exc
+
+    if not result.get(
+        "success",
+        False,
+    ):
+        error = result.get(
+            "error",
+            "unknown Pump.fun SELL builder error",
+        )
+
+        raise PumpFunTransactionBuildError(
+            str(error)
+        )
+
+    transaction_b64 = result.get(
+        "transaction_b64"
+    )
+
+    blockhash = result.get(
+        "blockhash"
+    )
+
+    last_valid_block_height = result.get(
+        "last_valid_block_height"
+    )
+
+    if not transaction_b64:
+        raise PumpFunTransactionBuildError(
+            "pumpfun_sell_builder_missing_transaction"
+        )
+
+    if not blockhash:
+        raise PumpFunTransactionBuildError(
+            "pumpfun_sell_builder_missing_blockhash"
+        )
+
+    if (
+        last_valid_block_height
+        is None
+    ):
+        raise PumpFunTransactionBuildError(
+            "pumpfun_sell_builder_missing_last_valid_block_height"
+        )
+
+    if stderr_text:
+        logger.debug(
+            "pumpfun_sell_builder_stderr",
+            extra={
+                "mint": mint,
+                "stderr": stderr_text[-2000:],
+            },
+        )
+
+    logger.info(
+        "pumpfun_unsigned_sell_transaction_built",
+        extra={
+            "mint": mint,
+            "owner": owner_pubkey,
+            "amount_tokens_raw": (
+                amount_tokens_raw_int
             ),
             "slippage_bps": (
                 slippage_bps_int
