@@ -871,6 +871,7 @@ class ScannerService:
                 entry_volume_24h_usd=(
                     token.volume_24h_usd
                 ),
+                source=token.source,
             )
 
             await repo.update_order(
