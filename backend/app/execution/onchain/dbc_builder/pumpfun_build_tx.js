@@ -22,8 +22,8 @@
  * - This file never submits a transaction.
  * - ownerPubkey is only used as the transaction payer/user.
  *
- * The Pump.fun SDK is responsible for constructing the current bonding-curve
- * account list, including current fee-recipient requirements.
+ * The Pump.fun SDK is responsible for constructing the current
+ * bonding-curve account list, including current fee-recipient requirements.
  */
 
 const {
@@ -33,10 +33,13 @@ const {
   ComputeBudgetProgram,
 } = require("@solana/web3.js");
 
+const pumpSdkModule = require("@pump-fun/pump-sdk");
+
 const {
   PumpSdk,
+  OnlinePumpSdk,
   getBuyTokenAmountFromSolAmount,
-} = require("@pump-fun/pump-sdk");
+} = pumpSdkModule;
 
 const BN = require("bn.js");
 const bs58 = require("bs58");
@@ -50,21 +53,37 @@ const {
 // Configuration
 // ---------------------------------------------------------------------------
 
-// Helius High is appropriate for latency-sensitive launch transactions.
 const PRIORITY_LEVEL = "High";
 
-// Used only if Helius priority estimation is unavailable.
 const FALLBACK_PRIORITY_FEE_MICROLAMPORTS = 10_000;
 
-// Pump SDK slippage is expressed as a percentage.
-//
-// Example:
-//     300 bps = 3%
-//     500 bps = 5%
-function slippageBpsToPercent(slippageBps) {
-  const bps = Number(slippageBps);
 
-  if (!Number.isFinite(bps) || bps < 0) {
+// ---------------------------------------------------------------------------
+// Slippage
+// ---------------------------------------------------------------------------
+//
+// Pump SDK expects slippage as a percentage:
+//
+//     1   = 1%
+//     3   = 3%
+//     5   = 5%
+//
+// Our Python side supplies basis points:
+//
+//     300 bps = 3%
+//
+
+function slippageBpsToPercent(
+  slippageBps
+) {
+  const bps = Number(
+    slippageBps
+  );
+
+  if (
+    !Number.isFinite(bps) ||
+    bps < 0
+  ) {
     return 3;
   }
 
@@ -73,21 +92,120 @@ function slippageBpsToPercent(slippageBps) {
 
 
 // ---------------------------------------------------------------------------
+// Pump SDK compatibility
+// ---------------------------------------------------------------------------
+//
+// Different installed versions/builds of @pump-fun/pump-sdk can expose
+// their online RPC functionality differently.
+//
+// Some expose the RPC methods through PumpSdk.
+// Newer SDK surfaces may expose OnlinePumpSdk.
+//
+// The previous deployment failed with:
+//
+//     sdk.fetchGlobal is not a function
+//
+// Therefore we deliberately detect the available implementation instead
+// of assuming one class.
+//
+// ---------------------------------------------------------------------------
+
+function createPumpSdk(
+  connection
+) {
+  const candidates = [];
+
+  if (
+    typeof OnlinePumpSdk ===
+    "function"
+  ) {
+    candidates.push({
+      name: "OnlinePumpSdk",
+      Constructor: OnlinePumpSdk,
+    });
+  }
+
+  if (
+    typeof PumpSdk ===
+    "function"
+  ) {
+    candidates.push({
+      name: "PumpSdk",
+      Constructor: PumpSdk,
+    });
+  }
+
+  for (
+    const candidate of candidates
+  ) {
+    try {
+      const sdk = new candidate.Constructor(
+        connection
+      );
+
+      const requiredMethods = [
+        "fetchGlobal",
+        "fetchBuyState",
+        "buyInstructions",
+      ];
+
+      const missingMethods =
+        requiredMethods.filter(
+          (method) =>
+            typeof sdk[method] !==
+            "function"
+        );
+
+      if (
+        missingMethods.length === 0
+      ) {
+        return {
+          sdk,
+          name: candidate.name,
+        };
+      }
+
+    } catch (error) {
+      console.error(
+        `Pump.fun SDK candidate ${candidate.name} initialization failed: ${
+          error?.message || error
+        }`
+      );
+    }
+  }
+
+  throw new Error(
+    "pumpfun_sdk_incompatible: " +
+    "no installed Pump.fun SDK class exposes " +
+    "fetchGlobal, fetchBuyState and buyInstructions"
+  );
+}
+
+
+// ---------------------------------------------------------------------------
 // stdin
 // ---------------------------------------------------------------------------
 
 function readStdin() {
-  return new Promise((resolve) => {
-    let data = "";
+  return new Promise(
+    (resolve) => {
+      let data = "";
 
-    process.stdin.on("data", (chunk) => {
-      data += chunk;
-    });
+      process.stdin.on(
+        "data",
+        (chunk) => {
+          data += chunk;
+        }
+      );
 
-    process.stdin.on("end", () => {
-      resolve(data);
-    });
-  });
+      process.stdin.on(
+        "end",
+        () => {
+          resolve(data);
+        }
+      );
+    }
+  );
 }
 
 
@@ -99,64 +217,93 @@ async function getPriorityFeeEstimate(
   connection,
   transaction
 ) {
-  const serialized = transaction.serialize({
-    requireAllSignatures: false,
-    verifySignatures: false,
-  });
+  const serialized =
+    transaction.serialize({
+      requireAllSignatures: false,
+      verifySignatures: false,
+    });
 
-  const serializedBase58 = bs58.encode(
-    serialized
-  );
+  const serializedBase58 =
+    bs58.encode(
+      serialized
+    );
 
-  const response = await fetch(
-    connection.rpcEndpoint,
-    {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify({
-        jsonrpc: "2.0",
-        id: "anon-tradebot-pumpfun-priority-fee",
-        method: "getPriorityFeeEstimate",
-        params: [
-          {
-            transaction: serializedBase58,
-            options: {
-              priorityLevel: PRIORITY_LEVEL,
-              recommended: true,
+  const response =
+    await fetch(
+      connection.rpcEndpoint,
+      {
+        method: "POST",
+
+        headers: {
+          "Content-Type":
+            "application/json",
+        },
+
+        body: JSON.stringify({
+          jsonrpc: "2.0",
+
+          id:
+            "anon-tradebot-pumpfun-priority-fee",
+
+          method:
+            "getPriorityFeeEstimate",
+
+          params: [
+            {
+              transaction:
+                serializedBase58,
+
+              options: {
+                priorityLevel:
+                  PRIORITY_LEVEL,
+
+                recommended:
+                  true,
+              },
             },
-          },
-        ],
-      }),
-    }
-  );
+          ],
+        }),
+      }
+    );
 
-  if (!response.ok) {
+  if (
+    !response.ok
+  ) {
     throw new Error(
       `Helius priority fee request failed with HTTP ${response.status}`
     );
   }
 
-  const body = await response.json();
+  const body =
+    await response.json();
 
-  if (body.error) {
+  if (
+    body.error
+  ) {
     throw new Error(
-      `Helius priority fee RPC error: ${JSON.stringify(body.error)}`
+      `Helius priority fee RPC error: ${JSON.stringify(
+        body.error
+      )}`
     );
   }
 
   const estimate =
-    body?.result?.priorityFeeEstimate;
+    body?.result
+      ?.priorityFeeEstimate;
 
   if (
-    estimate === undefined ||
+    estimate ===
+      undefined ||
     estimate === null ||
-    !Number.isFinite(Number(estimate)) ||
+    !Number.isFinite(
+      Number(estimate)
+    ) ||
     Number(estimate) < 0
   ) {
     throw new Error(
-      `Invalid Helius priority fee estimate: ${JSON.stringify(body)}`
+      `Invalid Helius priority fee estimate: ${JSON.stringify(
+        body
+      )}`
     );
   }
 
@@ -175,6 +322,7 @@ function hasComputeUnitPriceInstruction(
 ) {
   return transaction.instructions.some(
     (instruction) => {
+
       if (
         !instruction.programId.equals(
           ComputeBudgetProgram.programId
@@ -194,8 +342,10 @@ function hasComputeUnitPriceInstruction(
       //
       // 2 = SetComputeUnitLimit
       // 3 = SetComputeUnitPrice
-      //
-      return instruction.data[0] === 3;
+
+      return (
+        instruction.data[0] === 3
+      );
     }
   );
 }
@@ -209,10 +359,13 @@ function requirePositiveInteger(
   value,
   field
 ) {
-  const parsed = Number(value);
+  const parsed =
+    Number(value);
 
   if (
-    !Number.isSafeInteger(parsed) ||
+    !Number.isSafeInteger(
+      parsed
+    ) ||
     parsed <= 0
   ) {
     throw new Error(
@@ -229,9 +382,21 @@ function requirePositiveInteger(
 // ---------------------------------------------------------------------------
 
 async function main() {
-  const raw = await readStdin();
+  const raw =
+    await readStdin();
 
-  const input = JSON.parse(raw);
+  let input;
+
+  try {
+    input =
+      JSON.parse(raw);
+  } catch (error) {
+    throw new Error(
+      `invalid_json_input: ${
+        error?.message || error
+      }`
+    );
+  }
 
   const {
     action,
@@ -265,53 +430,108 @@ async function main() {
     );
   }
 
-  if (action !== "buy") {
+  if (
+    action !== "buy"
+  ) {
     throw new Error(
       "pumpfun_builder_only_supports_buy"
     );
   }
 
 
-  const lamports = requirePositiveInteger(
-    amountLamports,
-    "amount_lamports"
-  );
+  const lamports =
+    requirePositiveInteger(
+      amountLamports,
+      "amount_lamports"
+    );
 
 
-  // Validate public keys before making RPC requests.
-  const mint = new PublicKey(
-    baseMint
-  );
+  // -------------------------------------------------------------------------
+  // Validate public keys
+  // -------------------------------------------------------------------------
 
-  const user = new PublicKey(
-    ownerPubkey
-  );
+  let mint;
+  let user;
+
+  try {
+    mint =
+      new PublicKey(
+        baseMint
+      );
+
+    user =
+      new PublicKey(
+        ownerPubkey
+      );
+
+  } catch (error) {
+
+    throw new Error(
+      `invalid_public_key: ${
+        error?.message || error
+      }`
+    );
+  }
 
 
   // -------------------------------------------------------------------------
   // Connection
   // -------------------------------------------------------------------------
 
-  const connection = new Connection(
-    rpcUrl,
-    {
-      commitment: "processed",
-    }
-  );
+  const connection =
+    new Connection(
+      rpcUrl,
+      {
+        commitment:
+          "processed",
+      }
+    );
 
 
   // -------------------------------------------------------------------------
   // Pump SDK
   // -------------------------------------------------------------------------
+  //
+  // This is the critical compatibility fix.
+  //
+  // We no longer blindly execute:
+  //
+  //     new PumpSdk(connection)
+  //
+  // followed by:
+  //
+  //     sdk.fetchGlobal()
+  //
+  // Instead, we verify the installed implementation actually exposes the
+  // online methods before using it.
+  //
 
-  const sdk = new PumpSdk(
-    connection
+  const sdkInfo =
+    createPumpSdk(
+      connection
+    );
+
+  const sdk =
+    sdkInfo.sdk;
+
+
+  console.error(
+    `Pump.fun SDK selected: ${sdkInfo.name}`
   );
 
 
   // -------------------------------------------------------------------------
   // Fetch current Pump.fun global state
   // -------------------------------------------------------------------------
+
+  if (
+    typeof sdk.fetchGlobal !==
+    "function"
+  ) {
+    throw new Error(
+      "pumpfun_sdk_fetch_global_unavailable"
+    );
+  }
 
   const global =
     await sdk.fetchGlobal();
@@ -326,40 +546,44 @@ async function main() {
 
   // -------------------------------------------------------------------------
   // Fetch current Pump.fun fee configuration
-  //
-  // Newer Pump.fun deployments use fee configuration as part of the
-  // bonding-curve quote calculation.
   // -------------------------------------------------------------------------
 
-  let feeConfig = null;
+  let feeConfig =
+    null;
 
-  try {
-    feeConfig =
-      await sdk.fetchFeeConfig();
-  } catch (error) {
-    // Some SDK versions/builds do not require feeConfig for the instruction
-    // builder itself. We therefore keep this optional.
-    //
-    // The quote function below will only receive it when available.
-    console.error(
-      `Pump.fun fee config unavailable: ${
-        error?.message || error
-      }`
-    );
+  if (
+    typeof sdk.fetchFeeConfig ===
+    "function"
+  ) {
+    try {
+
+      feeConfig =
+        await sdk.fetchFeeConfig();
+
+    } catch (error) {
+
+      console.error(
+        "Pump.fun fee config unavailable; " +
+        `continuing without it: ${
+          error?.message || error
+        }`
+      );
+    }
   }
 
 
   // -------------------------------------------------------------------------
   // Fetch live bonding-curve state
-  //
-  // This obtains:
-  //
-  // - bondingCurve
-  // - bondingCurveAccountInfo
-  // - associatedUserAccountInfo
-  //
-  // The SDK handles the current account layout.
   // -------------------------------------------------------------------------
+
+  if (
+    typeof sdk.fetchBuyState !==
+    "function"
+  ) {
+    throw new Error(
+      "pumpfun_sdk_fetch_buy_state_unavailable"
+    );
+  }
 
   const buyState =
     await sdk.fetchBuyState(
@@ -379,16 +603,21 @@ async function main() {
     bondingCurveAccountInfo,
     bondingCurve,
     associatedUserAccountInfo,
+    tokenProgram,
   } = buyState;
 
 
-  if (!bondingCurveAccountInfo) {
+  if (
+    !bondingCurveAccountInfo
+  ) {
     throw new Error(
       "pumpfun_bonding_curve_account_info_missing"
     );
   }
 
-  if (!bondingCurve) {
+  if (
+    !bondingCurve
+  ) {
     throw new Error(
       "pumpfun_bonding_curve_state_missing"
     );
@@ -396,11 +625,12 @@ async function main() {
 
 
   // -------------------------------------------------------------------------
-  // Do not attempt to buy a completed/migrated bonding curve.
+  // Do not buy completed/migrated curves
   // -------------------------------------------------------------------------
 
   if (
-    bondingCurve.complete === true
+    bondingCurve.complete ===
+    true
   ) {
     throw new Error(
       "pumpfun_bonding_curve_already_complete"
@@ -410,64 +640,122 @@ async function main() {
 
   // -------------------------------------------------------------------------
   // SOL amount
-  //
-  // This is the maximum SOL the user is allowing the transaction to spend.
   // -------------------------------------------------------------------------
 
-  const solAmount = new BN(
-    String(lamports)
-  );
+  const solAmount =
+    new BN(
+      String(lamports)
+    );
 
 
   // -------------------------------------------------------------------------
   // Calculate expected token amount
-  //
-  // Pump SDK calculates the bonding-curve output using the live global
-  // state, fee configuration and bonding-curve state.
-  //
-  // We support both the current fee-aware signature and the older SDK
-  // signature as a compatibility fallback.
   // -------------------------------------------------------------------------
+
+  if (
+    typeof getBuyTokenAmountFromSolAmount !==
+    "function"
+  ) {
+    throw new Error(
+      "pumpfun_sdk_buy_quote_function_unavailable"
+    );
+  }
 
   let tokenAmount;
 
-  try {
-    if (feeConfig) {
+
+  // Current fee-aware API
+  if (
+    feeConfig
+  ) {
+
+    try {
+
       tokenAmount =
         getBuyTokenAmountFromSolAmount({
           global,
+
           feeConfig,
+
           mintSupply:
-            bondingCurve.tokenTotalSupply,
+            bondingCurve
+              .tokenTotalSupply,
+
           bondingCurve,
-          amount: solAmount,
+
+          amount:
+            solAmount,
         });
-    } else {
+
+    } catch (firstError) {
+
+      // Compatibility fallback for older SDK signatures.
+
+      try {
+
+        tokenAmount =
+          getBuyTokenAmountFromSolAmount(
+            global,
+            bondingCurve,
+            solAmount
+          );
+
+      } catch (secondError) {
+
+        throw new Error(
+          "pumpfun_buy_quote_failed: " +
+          `${
+            secondError?.message ||
+            firstError
+          }`
+        );
+      }
+    }
+
+  } else {
+
+    // Older SDK / no fee config.
+
+    try {
+
       tokenAmount =
         getBuyTokenAmountFromSolAmount(
           global,
           bondingCurve,
           solAmount
         );
-    }
-  } catch (firstError) {
-    try {
-      tokenAmount =
-        getBuyTokenAmountFromSolAmount({
-          global,
-          bondingCurve,
-          amount: solAmount,
-        });
-    } catch (secondError) {
-      throw new Error(
-        "pumpfun_buy_quote_failed: " +
-        `${secondError?.message || firstError}`
-      );
+
+    } catch (firstError) {
+
+      try {
+
+        tokenAmount =
+          getBuyTokenAmountFromSolAmount({
+            global,
+
+            bondingCurve,
+
+            amount:
+              solAmount,
+          });
+
+      } catch (secondError) {
+
+        throw new Error(
+          "pumpfun_buy_quote_failed: " +
+          `${
+            secondError?.message ||
+            firstError
+          }`
+        );
+      }
     }
   }
 
 
-  if (!tokenAmount) {
+  if (
+    !tokenAmount
+  ) {
     throw new Error(
       "pumpfun_token_amount_calculation_failed"
     );
@@ -503,37 +791,87 @@ async function main() {
 
   // -------------------------------------------------------------------------
   // Build Pump.fun buy instructions
-  //
-  // The official SDK constructs the current Pump.fun bonding-curve
-  // instruction set and ATA handling.
   // -------------------------------------------------------------------------
+  //
+  // IMPORTANT:
+  //
+  // If fetchBuyState returned tokenProgram, use it.
+  // This allows the SDK to correctly handle Token / Token-2022.
+  //
+  // We also pass the state returned by fetchBuyState rather than manually
+  // reconstructing the state.
+  //
 
-  const instructions =
-    await sdk.buyInstructions({
-      global,
-      bondingCurveAccountInfo,
-      bondingCurve,
-      associatedUserAccountInfo,
-      mint,
-      user,
+  if (
+    typeof sdk.buyInstructions !==
+    "function"
+  ) {
+    throw new Error(
+      "pumpfun_sdk_buy_instructions_unavailable"
+    );
+  }
 
-      // Exact token quantity expected from the current curve.
-      amount: tokenAmountBN,
 
-      // Maximum SOL allowed to be spent.
-      solAmount,
+  const instructionParams = {
+    global,
 
-      // Pump SDK expects percentage, not basis points.
-      slippage: slippagePercent,
+    bondingCurveAccountInfo,
 
-      // Explicitly use the standard SPL Token program.
-      tokenProgram: TOKEN_PROGRAM_ID,
-    });
+    bondingCurve,
+
+    associatedUserAccountInfo,
+
+    mint,
+
+    user,
+
+    amount:
+      tokenAmountBN,
+
+    solAmount,
+
+    slippage:
+      slippagePercent,
+  };
+
+
+  if (
+    tokenProgram
+  ) {
+    instructionParams.tokenProgram =
+      tokenProgram;
+  } else {
+    instructionParams.tokenProgram =
+      TOKEN_PROGRAM_ID;
+  }
+
+
+  let instructions;
+
+  try {
+
+    instructions =
+      await sdk.buyInstructions(
+        instructionParams
+      );
+
+  } catch (error) {
+
+    throw new Error(
+      "pumpfun_buy_instructions_failed: " +
+      `${
+        error?.message ||
+        error
+      }`
+    );
+  }
 
 
   if (
     !instructions ||
-    !Array.isArray(instructions) ||
+    !Array.isArray(
+      instructions
+    ) ||
     instructions.length === 0
   ) {
     throw new Error(
@@ -546,9 +884,11 @@ async function main() {
   // Build unsigned transaction
   // -------------------------------------------------------------------------
 
-  const tx = new Transaction();
+  const tx =
+    new Transaction();
 
-  tx.feePayer = user;
+  tx.feePayer =
+    user;
 
   tx.add(
     ...instructions
@@ -557,9 +897,6 @@ async function main() {
 
   // -------------------------------------------------------------------------
   // Initial blockhash
-  //
-  // We need a blockhash before priority-fee estimation because Helius should
-  // inspect the actual transaction as closely as possible.
   // -------------------------------------------------------------------------
 
   const initialBlockhash =
@@ -583,6 +920,7 @@ async function main() {
 
 
   try {
+
     priorityFeeMicroLamports =
       await getPriorityFeeEstimate(
         connection,
@@ -597,7 +935,8 @@ async function main() {
     console.error(
       "Pump.fun Helius priority fee estimation failed; " +
       `using fallback: ${
-        feeError?.message || feeError
+        feeError?.message ||
+        feeError
       }`
     );
   }
@@ -618,10 +957,11 @@ async function main() {
   ) {
 
     tx.add(
-      ComputeBudgetProgram.setComputeUnitPrice({
-        microLamports:
-          priorityFeeMicroLamports,
-      })
+      ComputeBudgetProgram
+        .setComputeUnitPrice({
+          microLamports:
+            priorityFeeMicroLamports,
+        })
     );
 
     priorityFeeInstructionAdded =
@@ -630,11 +970,7 @@ async function main() {
 
 
   // -------------------------------------------------------------------------
-  // Refresh blockhash AFTER all instructions have been added.
-  //
-  // This is important because the transaction will be signed later by
-  // Python. We want the returned transaction and expiry information to
-  // correspond to the final transaction.
+  // Refresh blockhash AFTER all instructions
   // -------------------------------------------------------------------------
 
   const finalBlockhash =
@@ -652,8 +988,11 @@ async function main() {
 
   const serialized =
     tx.serialize({
-      requireAllSignatures: false,
-      verifySignatures: false,
+      requireAllSignatures:
+        false,
+
+      verifySignatures:
+        false,
     });
 
 
@@ -663,7 +1002,8 @@ async function main() {
 
   process.stdout.write(
     JSON.stringify({
-      success: true,
+      success:
+        true,
 
       transaction_b64:
         serialized.toString(
@@ -674,7 +1014,8 @@ async function main() {
         finalBlockhash.blockhash,
 
       last_valid_block_height:
-        finalBlockhash.lastValidBlockHeight,
+        finalBlockhash
+          .lastValidBlockHeight,
 
       base_mint:
         mint.toBase58(),
@@ -690,7 +1031,8 @@ async function main() {
 
       slippage_bps:
         Number(
-          slippageBps || 300
+          slippageBps ||
+          300
         ),
 
       slippage_percent:
@@ -713,8 +1055,22 @@ async function main() {
 
       bonding_curve:
         bondingCurveAccountInfo.pubkey
-          ? bondingCurveAccountInfo.pubkey.toBase58()
+          ? bondingCurveAccountInfo
+              .pubkey
+              .toBase58()
           : null,
+
+      token_program:
+        tokenProgram
+          ? tokenProgram.toBase58
+            ? tokenProgram.toBase58()
+            : String(
+                tokenProgram
+              )
+          : TOKEN_PROGRAM_ID.toBase58(),
+
+      pump_sdk_class:
+        sdkInfo.name,
 
       action:
         "buy",
@@ -728,20 +1084,26 @@ async function main() {
 // Error handling
 // ---------------------------------------------------------------------------
 
-main().catch((err) => {
+main().catch(
+  (err) => {
 
-  process.stdout.write(
-    JSON.stringify({
-      success: false,
+    process.stdout.write(
+      JSON.stringify({
+        success:
+          false,
 
-      error:
-        String(
-          (err && err.message) ||
-          err
-        ),
-    }) + "\n"
-  );
+        error:
+          String(
+            (
+              err &&
+              err.message
+            ) ||
+            err
+          ),
+      }) + "\n"
+    );
 
-  // The Python wrapper treats the JSON response as the authoritative result.
-  process.exit(0);
-});
+    // Python wrapper treats the JSON response as authoritative.
+    process.exit(0);
+  }
+);
