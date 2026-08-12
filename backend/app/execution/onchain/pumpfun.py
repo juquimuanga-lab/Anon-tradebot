@@ -1,51 +1,39 @@
-"""Pump.fun bonding-curve market data.
-
-This module is READ-ONLY.
+"""Pump.fun bonding-curve market data and transaction building.
 
 Responsibilities:
 
-- Derive a Pump.fun bonding-curve PDA from a token mint.
-- Read the bonding-curve account directly through Solana RPC.
-- Decode the current bonding-curve reserves.
+- Derive Pump.fun bonding-curve PDA.
+- Read bonding-curve state directly through Solana RPC.
+- Decode current bonding-curve reserves.
 - Read token decimals/supply.
-- Calculate the live Pump.fun token price in SOL/USD.
-- Calculate market cap and available curve liquidity.
-- Detect whether the bonding curve has completed/migrated.
+- Calculate live Pump.fun token price.
+- Calculate market cap and curve liquidity.
+- Detect completed/migrated bonding curves.
+- Build an UNSIGNED Pump.fun BUY transaction through the Node/Pump SDK
+  transaction builder.
 
-It intentionally does NOT:
+Security:
 
-- sign transactions
-- submit transactions
-- buy tokens
-- sell tokens
-- use Meteora
-- use Jupiter for launch-price discovery
+- This module never receives a private key.
+- This module never signs a transaction.
+- This module never submits a transaction.
+- Signing remains in Python's existing wallet/RPC pipeline.
 
-The trading adapter will be added separately.
+Pump.fun transaction construction is delegated to:
 
-Pump.fun bonding curve:
+    backend/app/execution/onchain/dbc_builder/pumpfun_build_tx.js
 
-    PDA = ["bonding-curve", mint]
-
-Price:
-
-    SOL/token =
-        virtual_sol_reserves / virtual_token_reserves
-
-adjusted for the token's base-unit decimals and SOL lamports.
-
-Market cap:
-
-    price_usd * token_total_supply
-
-The Pump.fun program documentation describes the bonding curve as using
-virtual token and SOL reserves for pricing and real reserves for actual
-curve inventory. A curve becomes complete when real token reserves reach
-zero. 
+That JavaScript builder uses the official Pump.fun SDK and returns an
+unsigned transaction to this module.
 """
 
+import asyncio
+import base64
+import json
 import logging
+import os
 import struct
+from pathlib import Path
 from typing import Optional
 
 from solana.rpc.async_api import AsyncClient
@@ -65,15 +53,26 @@ PUMPFUN_PROGRAM_ID = Pubkey.from_string(
     "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P"
 )
 
+BONDING_CURVE_SEED = b"bonding-curve"
 
-# Pump.fun bonding-curve PDA seed.
-BONDING_CURVE_SEED = (
-    b"bonding-curve"
+SOL_LAMPORTS_PER_SOL = 1_000_000_000
+
+
+# ---------------------------------------------------------------------------
+# Builder configuration
+# ---------------------------------------------------------------------------
+
+_THIS_DIR = Path(__file__).resolve()
+
+_DBC_BUILDER_DIR = (
+    _THIS_DIR.parent
+    / "dbc_builder"
 )
 
-
-# Native SOL.
-SOL_LAMPORTS_PER_SOL = 1_000_000_000
+PUMPFUN_BUILDER_PATH = (
+    _DBC_BUILDER_DIR
+    / "pumpfun_build_tx.js"
+)
 
 
 # ---------------------------------------------------------------------------
@@ -93,7 +92,13 @@ class PumpFunPoolNotFound(
 class PumpFunInvalidAccount(
     PumpFunError
 ):
-    """Raised when the bonding curve account cannot be decoded."""
+    """Raised when a Pump.fun account cannot be decoded."""
+
+
+class PumpFunTransactionBuildError(
+    PumpFunError
+):
+    """Raised when the Pump.fun transaction builder fails."""
 
 
 # ---------------------------------------------------------------------------
@@ -175,7 +180,6 @@ def get_bonding_curve_address(
             f"invalid Pump.fun mint: {mint}"
         ) from exc
 
-
     address, bump = (
         Pubkey.find_program_address(
             [
@@ -217,47 +221,66 @@ def _read_u64(
     )[0]
 
 
+def _decode_account_data(
+    raw_data,
+) -> bytes:
+    """Normalize Solana RPC account data into bytes."""
+
+    if isinstance(
+        raw_data,
+        tuple,
+    ):
+
+        encoded = raw_data[0]
+
+        try:
+
+            return base64.b64decode(
+                encoded
+            )
+
+        except Exception as exc:
+
+            raise PumpFunInvalidAccount(
+                "failed to decode Pump.fun "
+                "bonding curve account"
+            ) from exc
+
+    if isinstance(
+        raw_data,
+        bytes,
+    ):
+
+        return raw_data
+
+    raise PumpFunInvalidAccount(
+        "unexpected Solana account-data format"
+    )
+
+
 def decode_bonding_curve(
     address: str,
     data: bytes,
 ) -> PumpFunBondingCurve:
-    """Decode a Pump.fun BondingCurve account.
+    """Decode a Pump.fun BondingCurve account."""
 
-    Anchor account data starts with an 8-byte discriminator.
+    # 8-byte discriminator +
+    # 5 x u64 +
+    # 1-byte bool.
+    min_prefix_length = (
+        8
+        + (5 * 8)
+        + 1
+    )
 
-    Current core fields:
-
-        virtual_token_reserves  u64
-        virtual_sol_reserves    u64
-        real_token_reserves     u64
-        real_sol_reserves       u64
-        token_total_supply      u64
-        complete                 bool
-
-    Newer Pump.fun deployments append creator and feature flags.
-
-    We decode the stable prefix first and then conditionally decode the
-    appended fields when present.
-
-    This means a newer 150-byte bonding curve account remains compatible
-    with the price reader.
-    """
-
-    # 8-byte Anchor account discriminator.
-    MIN_PREFIX_LENGTH = 8 + (
-        5 * 8
-    ) + 1
-
-    if len(data) < MIN_PREFIX_LENGTH:
+    if len(data) < min_prefix_length:
 
         raise PumpFunInvalidAccount(
             "bonding curve account data is too short: "
             f"{len(data)} bytes"
         )
 
-
     offset = 8
-
 
     virtual_token_reserves = (
         _read_u64(
@@ -268,7 +291,6 @@ def decode_bonding_curve(
 
     offset += 8
 
-
     virtual_sol_reserves = (
         _read_u64(
             data,
@@ -277,7 +299,6 @@ def decode_bonding_curve(
     )
 
     offset += 8
-
 
     real_token_reserves = (
         _read_u64(
@@ -288,7 +309,6 @@ def decode_bonding_curve(
 
     offset += 8
 
-
     real_sol_reserves = (
         _read_u64(
             data,
@@ -297,7 +317,6 @@ def decode_bonding_curve(
     )
 
     offset += 8
-
 
     token_total_supply = (
         _read_u64(
@@ -308,16 +327,14 @@ def decode_bonding_curve(
 
     offset += 8
 
-
     complete = (
         data[offset] != 0
     )
 
     offset += 1
 
-
     # -----------------------------------------------------------------------
-    # Newer creator field
+    # Optional newer creator field
     # -----------------------------------------------------------------------
 
     creator = None
@@ -344,9 +361,8 @@ def decode_bonding_curve(
                 exc_info=True,
             )
 
-
     # -----------------------------------------------------------------------
-    # Newer feature flags
+    # Optional feature flags
     # -----------------------------------------------------------------------
 
     is_mayhem_mode = None
@@ -359,7 +375,6 @@ def decode_bonding_curve(
 
         offset += 1
 
-
     is_cashback_coin = None
 
     if len(data) > offset:
@@ -368,29 +383,37 @@ def decode_bonding_curve(
             data[offset] != 0
         )
 
-
     return PumpFunBondingCurve(
         address=address,
+
         virtual_token_reserves=(
             virtual_token_reserves
         ),
+
         virtual_sol_reserves=(
             virtual_sol_reserves
         ),
+
         real_token_reserves=(
             real_token_reserves
         ),
+
         real_sol_reserves=(
             real_sol_reserves
         ),
+
         token_total_supply=(
             token_total_supply
         ),
+
         complete=complete,
+
         creator=creator,
+
         is_mayhem_mode=(
             is_mayhem_mode
         ),
+
         is_cashback_coin=(
             is_cashback_coin
         ),
@@ -435,7 +458,7 @@ async def _get_token_decimals(
 
 
 # ---------------------------------------------------------------------------
-# Pool state
+# Bonding curve
 # ---------------------------------------------------------------------------
 
 async def get_bonding_curve(
@@ -476,61 +499,18 @@ async def get_bonding_curve(
                 f"exists for {mint}"
             )
 
-        raw_data = account.data
-
-        # Solana RPC normally returns:
-        #
-        #     (base64_string, encoding)
-        #
-        # for base64 account data.
-        if isinstance(
-            raw_data,
-            tuple,
-        ):
-
-            encoded = raw_data[0]
-
-            import base64
-
-            try:
-
-                data = base64.b64decode(
-                    encoded
-                )
-
-            except Exception as exc:
-
-                raise PumpFunInvalidAccount(
-                    "failed to decode Pump.fun "
-                    "bonding curve account"
-                ) from exc
-
-        elif isinstance(
-            raw_data,
-            bytes,
-        ):
-
-            data = raw_data
-
-        else:
-
-            raise PumpFunInvalidAccount(
-                "unexpected Solana account-data format"
-            )
-
-
-        curve = (
-            decode_bonding_curve(
-                str(curve_address),
-                data,
-            )
+        data = _decode_account_data(
+            account.data
         )
 
-        return curve
+    return decode_bonding_curve(
+        str(curve_address),
+        data,
+    )
 
 
 # ---------------------------------------------------------------------------
-# Price
+# Pool information
 # ---------------------------------------------------------------------------
 
 async def get_pool_info(
@@ -539,31 +519,7 @@ async def get_pool_info(
     sol_usd: Optional[float] = None,
     commitment: str = "processed",
 ) -> dict:
-    """Return Pump.fun bonding-curve market information.
-
-    Returned fields intentionally mirror the Meteora information shape
-    where possible so the scanner can use a common TokenSnapshot model.
-
-    Price is derived from the live virtual reserves:
-
-        SOL/token =
-            virtual_sol_reserves / 1e9
-            /
-            virtual_token_reserves / 10^decimals
-
-    Market cap:
-
-        price_usd * token_total_supply
-
-    Liquidity:
-
-        real_sol_reserves converted to USD
-
-    NOTE:
-
-    `real_sol_reserves` is the SOL accumulated by the bonding curve.
-    It is not the same concept as a traditional AMM pool TVL.
-    """
+    """Return normalized Pump.fun bonding-curve market information."""
 
     mint_pubkey = Pubkey.from_string(
         mint
@@ -575,14 +531,9 @@ async def get_pool_info(
         )
     )
 
-
     async with AsyncClient(
         rpc_url
     ) as client:
-
-        # ---------------------------------------------------------------
-        # Read bonding curve and token decimals concurrently.
-        # ---------------------------------------------------------------
 
         curve_task = asyncio.create_task(
             client.get_account_info(
@@ -626,7 +577,6 @@ async def get_pool_info(
 
             raise
 
-
         account = (
             account_response.value
         )
@@ -638,57 +588,14 @@ async def get_pool_info(
                 f"exists for {mint}"
             )
 
-
-        raw_data = account.data
-
-
-        if isinstance(
-            raw_data,
-            tuple,
-        ):
-
-            encoded = raw_data[0]
-
-            import base64
-
-            try:
-
-                data = base64.b64decode(
-                    encoded
-                )
-
-            except Exception as exc:
-
-                raise PumpFunInvalidAccount(
-                    "failed to decode Pump.fun "
-                    "bonding curve account"
-                ) from exc
-
-        elif isinstance(
-            raw_data,
-            bytes,
-        ):
-
-            data = raw_data
-
-        else:
-
-            raise PumpFunInvalidAccount(
-                "unexpected Solana account-data format"
-            )
-
-
-        curve = (
-            decode_bonding_curve(
-                str(curve_address),
-                data,
-            )
+        data = _decode_account_data(
+            account.data
         )
 
-
-    # -----------------------------------------------------------------------
-    # Validate curve
-    # -----------------------------------------------------------------------
+    curve = decode_bonding_curve(
+        str(curve_address),
+        data,
+    )
 
     if (
         curve.virtual_token_reserves
@@ -709,11 +616,6 @@ async def get_pool_info(
             "Pump.fun virtual SOL reserves "
             "are zero"
         )
-
-
-    # -----------------------------------------------------------------------
-    # Base-unit conversions
-    # -----------------------------------------------------------------------
 
     token_unit = (
         10 ** decimals
@@ -744,7 +646,6 @@ async def get_pool_info(
         / token_unit
     )
 
-
     if virtual_tokens <= 0:
 
         raise PumpFunInvalidAccount(
@@ -752,16 +653,10 @@ async def get_pool_info(
             "is zero"
         )
 
-
-    # -----------------------------------------------------------------------
-    # Live price
-    # -----------------------------------------------------------------------
-
     price_sol_per_token = (
         virtual_sol
         / virtual_tokens
     )
-
 
     if (
         price_sol_per_token
@@ -773,15 +668,8 @@ async def get_pool_info(
             "is non-positive"
         )
 
-
-    # -----------------------------------------------------------------------
-    # SOL/USD
-    # -----------------------------------------------------------------------
-
     if sol_usd is None:
 
-        # Import locally to avoid making the Pump.fun module depend on the
-        # scanner price feed at import time.
         from app.scanners import price_feed
 
         sol_usd = (
@@ -790,11 +678,9 @@ async def get_pool_info(
             )
         )
 
-
     sol_usd = float(
         sol_usd
     )
-
 
     if sol_usd <= 0:
 
@@ -802,36 +688,27 @@ async def get_pool_info(
             "invalid SOL/USD price"
         )
 
-
     price_usd = (
         price_sol_per_token
         * sol_usd
     )
-
 
     market_cap_sol = (
         price_sol_per_token
         * total_supply
     )
 
-
     market_cap_usd = (
         market_cap_sol
         * sol_usd
     )
-
 
     liquidity_usd = (
         real_sol
         * sol_usd
     )
 
-
-    # -----------------------------------------------------------------------
-    # Return normalized data
-    # -----------------------------------------------------------------------
-
-    result = {
+    return {
         "success": True,
 
         "source": "pumpfun",
@@ -845,17 +722,13 @@ async def get_pool_info(
             or ""
         ),
 
-        "token_decimals": (
-            decimals
-        ),
+        "token_decimals": decimals,
 
         "price_sol_per_token": (
             price_sol_per_token
         ),
 
-        "price_usd": (
-            price_usd
-        ),
+        "price_usd": price_usd,
 
         "supply_tokens": (
             total_supply
@@ -919,25 +792,321 @@ async def get_pool_info(
     }
 
 
-    logger.debug(
-        "pumpfun_pool_info",
+# ---------------------------------------------------------------------------
+# Pump.fun transaction builder
+# ---------------------------------------------------------------------------
+
+async def build_unsigned_buy_transaction(
+    *,
+    mint: str,
+    owner_pubkey: str,
+    amount_lamports: int,
+    slippage_bps: int,
+    rpc_url: str,
+) -> dict:
+    """Build an unsigned Pump.fun BUY transaction.
+
+    The transaction is constructed by the Node/Pump.fun SDK builder.
+
+    Returns:
+
+        {
+            "transaction_b64": "...",
+            "blockhash": "...",
+            "last_valid_block_height": ...,
+            ...
+        }
+
+    The transaction is NOT signed and NOT submitted here.
+    """
+
+    if not mint:
+        raise PumpFunTransactionBuildError(
+            "mint_missing"
+        )
+
+    if not owner_pubkey:
+        raise PumpFunTransactionBuildError(
+            "owner_pubkey_missing"
+        )
+
+    if not rpc_url:
+        raise PumpFunTransactionBuildError(
+            "rpc_url_missing"
+        )
+
+    try:
+
+        amount_lamports_int = int(
+            amount_lamports
+        )
+
+    except (
+        TypeError,
+        ValueError,
+    ) as exc:
+
+        raise PumpFunTransactionBuildError(
+            "amount_lamports_invalid"
+        ) from exc
+
+    if amount_lamports_int <= 0:
+
+        raise PumpFunTransactionBuildError(
+            "amount_lamports_must_be_positive"
+        )
+
+    try:
+
+        slippage_bps_int = int(
+            slippage_bps
+        )
+
+    except (
+        TypeError,
+        ValueError,
+    ) as exc:
+
+        raise PumpFunTransactionBuildError(
+            "slippage_bps_invalid"
+        ) from exc
+
+    if (
+        slippage_bps_int < 0
+        or slippage_bps_int > 10_000
+    ):
+
+        raise PumpFunTransactionBuildError(
+            "slippage_bps_out_of_range"
+        )
+
+    if not PUMPFUN_BUILDER_PATH.exists():
+
+        raise PumpFunTransactionBuildError(
+            "pumpfun_builder_not_found: "
+            f"{PUMPFUN_BUILDER_PATH}"
+        )
+
+    payload = {
+        "action": "buy",
+
+        "baseMint": mint,
+
+        "ownerPubkey": owner_pubkey,
+
+        "amountLamports": (
+            str(
+                amount_lamports_int
+            )
+        ),
+
+        "slippageBps": (
+            slippage_bps_int
+        ),
+
+        "rpcUrl": rpc_url,
+    }
+
+    # -----------------------------------------------------------------------
+    # Run Node builder.
+    #
+    # cwd is the existing dbc_builder directory so Node resolves:
+    #
+    #     @pump-fun/pump-sdk
+    #
+    # from its installed node_modules.
+    # -----------------------------------------------------------------------
+
+    process = (
+        await asyncio.create_subprocess_exec(
+            "node",
+            str(
+                PUMPFUN_BUILDER_PATH
+            ),
+            cwd=str(
+                _DBC_BUILDER_DIR
+            ),
+            stdin=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+    )
+
+    stdin_data = (
+        json.dumps(
+            payload
+        ).encode("utf-8")
+    )
+
+    try:
+
+        stdout, stderr = (
+            await asyncio.wait_for(
+                process.communicate(
+                    stdin_data
+                ),
+                timeout=20,
+            )
+        )
+
+    except asyncio.TimeoutError:
+
+        try:
+            process.kill()
+        except ProcessLookupError:
+            pass
+
+        await process.communicate()
+
+        raise PumpFunTransactionBuildError(
+            "pumpfun_builder_timeout"
+        )
+
+    stdout_text = (
+        stdout
+        .decode(
+            "utf-8",
+            errors="replace",
+        )
+        .strip()
+    )
+
+    stderr_text = (
+        stderr
+        .decode(
+            "utf-8",
+            errors="replace",
+        )
+        .strip()
+    )
+
+    if not stdout_text:
+
+        raise PumpFunTransactionBuildError(
+            "pumpfun_builder_empty_response"
+            + (
+                f": {stderr_text}"
+                if stderr_text
+                else ""
+            )
+        )
+
+    try:
+
+        result = json.loads(
+            stdout_text.splitlines()[-1]
+        )
+
+    except json.JSONDecodeError as exc:
+
+        raise PumpFunTransactionBuildError(
+            "pumpfun_builder_invalid_json: "
+            f"{stdout_text[-1000:]}"
+        ) from exc
+
+    if not result.get(
+        "success",
+        False,
+    ):
+
+        error = result.get(
+            "error",
+            "unknown builder error",
+        )
+
+        raise PumpFunTransactionBuildError(
+            str(error)
+        )
+
+    transaction_b64 = (
+        result.get(
+            "transaction_b64"
+        )
+    )
+
+    blockhash = (
+        result.get(
+            "blockhash"
+        )
+    )
+
+    last_valid_block_height = (
+        result.get(
+            "last_valid_block_height"
+        )
+    )
+
+    if not transaction_b64:
+
+        raise PumpFunTransactionBuildError(
+            "pumpfun_builder_missing_transaction"
+        )
+
+    if not blockhash:
+
+        raise PumpFunTransactionBuildError(
+            "pumpfun_builder_missing_blockhash"
+        )
+
+    if (
+        last_valid_block_height
+        is None
+    ):
+
+        raise PumpFunTransactionBuildError(
+            "pumpfun_builder_missing_last_valid_block_height"
+        )
+
+    # Keep stderr visible in debug logs but don't treat normal diagnostic
+    # output as a transaction-builder failure when JSON succeeded.
+
+    if stderr_text:
+
+        logger.debug(
+            "pumpfun_builder_stderr",
+            extra={
+                "mint": mint,
+                "stderr": stderr_text[
+                    -2000:
+                ],
+            },
+        )
+
+    logger.info(
+        "pumpfun_unsigned_transaction_built",
         extra={
             "mint": mint,
-            "bonding_curve": str(
-                curve_address
+            "owner": owner_pubkey,
+            "amount_lamports": (
+                amount_lamports_int
             ),
-            "price_sol": (
-                price_sol_per_token
+            "slippage_bps": (
+                slippage_bps_int
             ),
-            "price_usd": price_usd,
-            "market_cap_usd": (
-                market_cap_usd
+            "blockhash": blockhash,
+            "last_valid_block_height": (
+                last_valid_block_height
             ),
-            "complete": (
-                curve.complete
+            "priority_fee_micro_lamports": (
+                result.get(
+                    "priority_fee_micro_lamports"
+                )
+            ),
+            "priority_fee_source": (
+                result.get(
+                    "priority_fee_source"
+                )
             ),
         },
     )
 
-
     return result
+
+
+# ---------------------------------------------------------------------------
+# Convenience alias
+# ---------------------------------------------------------------------------
+
+build_buy_transaction = (
+    build_unsigned_buy_transaction
+)
