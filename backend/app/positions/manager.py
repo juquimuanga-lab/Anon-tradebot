@@ -211,6 +211,7 @@ class PositionManager:
                 self._execution_router.get_adapter(
                     position.mode,
                     owner_user_id,
+                    source=position.source,
                 )
             )
 
@@ -606,6 +607,7 @@ class PositionManager:
                 self._execution_router.get_adapter(
                     position.mode,
                     position.owner_user_id,
+                    source=position.source,
                 )
             )
 
