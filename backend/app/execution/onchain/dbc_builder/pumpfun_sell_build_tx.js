@@ -293,6 +293,57 @@ function requirePositiveInteger(
   return parsed;
 }
 
+// ---------------------------------------------------------------------------
+// Direct wallet token balance
+// ---------------------------------------------------------------------------
+//
+// The installed Pump.fun SDK does not reliably expose getTokenBalance().
+// Read the wallet's parsed token accounts directly from Solana RPC.
+//
+// This supports normal SPL Token and Token-2022 accounts.
+// ---------------------------------------------------------------------------
+
+async function getWalletTokenBalance(
+  connection,
+  user,
+  mint
+) {
+  const response =
+    await connection.getParsedTokenAccountsByOwner(
+      user,
+      {
+        mint,
+      },
+      "processed"
+    );
+
+  let totalBalance =
+    new BN(0);
+
+  for (
+    const account of response.value
+  ) {
+    const tokenAmount =
+      account?.account?.data?.parsed
+        ?.info?.tokenAmount?.amount;
+
+    if (
+      tokenAmount === undefined ||
+      tokenAmount === null
+    ) {
+      continue;
+    }
+
+    totalBalance =
+      totalBalance.add(
+        new BN(
+          String(tokenAmount)
+        )
+      );
+  }
+
+  return totalBalance;
+}
 
 // ---------------------------------------------------------------------------
 // Main
@@ -503,11 +554,10 @@ async function main() {
   // -------------------------------------------------------------------------
 
   const requiredOnlineMethods = [
-    "fetchGlobal",
-    "fetchFeeConfig",
-    "fetchSellState",
-    "getTokenBalance",
-  ];
+  "fetchGlobal",
+  "fetchFeeConfig",
+  "fetchSellState",
+];
 
   for (
     const method of
@@ -629,10 +679,11 @@ async function main() {
   // -------------------------------------------------------------------------
 
   const walletBalance =
-    await onlineSdk.getTokenBalance(
-      mint,
-      user
-    );
+  await getWalletTokenBalance(
+    connection,
+    user,
+    mint
+  );
 
 
   if (
