@@ -1,20 +1,33 @@
 /**
  * Pump.fun unsigned SELL transaction builder.
  *
- * Python:
- *   - supplies the wallet public key
- *   - supplies the mint
- *   - supplies the exact raw token amount
- *   - signs the returned transaction
- *   - broadcasts/confirms it
+ * Architecture:
  *
- * This file:
- *   - never receives a private key
- *   - never signs
- *   - never broadcasts
+ *     Python
+ *        ↓
+ *     this file
+ *        ↓
+ *     OnlinePumpSdk
+ *        ↓
+ *     current Pump.fun bonding-curve state
+ *        ↓
+ *     PumpSdk sell instructions
+ *        ↓
+ *     unsigned transaction
+ *        ↓
+ *     Python signs
+ *        ↓
+ *     solana_rpc.py broadcasts/confirms
  *
- * Pump SDK 1.36.x is used for the current Pump.fun bonding-curve
- * sell instruction set.
+ * IMPORTANT:
+ *
+ * - No private key is ever passed to this file.
+ * - This file never signs a transaction.
+ * - This file never broadcasts a transaction.
+ * - ownerPubkey is only used as the transaction payer/user.
+ *
+ * Pump.fun bonding-curve sells only.
+ * Graduated tokens must be routed through the AMM executor.
  */
 
 const {
@@ -26,6 +39,7 @@ const {
 
 const {
   PumpSdk,
+  OnlinePumpSdk,
   getSellSolAmountFromTokenAmount,
 } = require("@pump-fun/pump-sdk");
 
@@ -43,34 +57,33 @@ const FALLBACK_PRIORITY_FEE_MICROLAMPORTS = 10_000;
 
 
 // ---------------------------------------------------------------------------
-// stdin
+// Slippage
 // ---------------------------------------------------------------------------
+//
+// Python supplies basis points.
+//
+//     100 bps = 1%
+//     300 bps = 3%
+//     500 bps = 5%
+//
+// Pump SDK expects percentage:
+//
+//     1 = 1%
+//     3 = 3%
+//     5 = 5%
+//
 
-function readStdin() {
-  return new Promise((resolve, reject) => {
-    let data = "";
+function slippageBpsToPercent(
+  slippageBps
+) {
+  const bps = Number(
+    slippageBps
+  );
 
-    process.stdin.on("data", (chunk) => {
-      data += chunk;
-    });
-
-    process.stdin.on("end", () => {
-      resolve(data);
-    });
-
-    process.stdin.on("error", reject);
-  });
-}
-
-
-// ---------------------------------------------------------------------------
-// Helpers
-// ---------------------------------------------------------------------------
-
-function slippageBpsToPercent(slippageBps) {
-  const bps = Number(slippageBps);
-
-  if (!Number.isFinite(bps) || bps < 0) {
+  if (
+    !Number.isFinite(bps) ||
+    bps < 0
+  ) {
     return 3;
   }
 
@@ -78,96 +91,127 @@ function slippageBpsToPercent(slippageBps) {
 }
 
 
-function hasComputeUnitPriceInstruction(transaction) {
-  return transaction.instructions.some((instruction) => {
-    if (
-      !instruction.programId.equals(
-        ComputeBudgetProgram.programId
-      )
-    ) {
-      return false;
-    }
+// ---------------------------------------------------------------------------
+// stdin
+// ---------------------------------------------------------------------------
 
-    if (!instruction.data || instruction.data.length === 0) {
-      return false;
-    }
+function readStdin() {
+  return new Promise(
+    (resolve, reject) => {
+      let data = "";
 
-    return instruction.data[0] === 3;
-  });
+      process.stdin.on(
+        "data",
+        (chunk) => {
+          data += chunk;
+        }
+      );
+
+      process.stdin.on(
+        "end",
+        () => {
+          resolve(data);
+        }
+      );
+
+      process.stdin.on(
+        "error",
+        reject
+      );
+    }
+  );
 }
 
 
 // ---------------------------------------------------------------------------
-// Helius priority fee
+// Helius priority fee estimation
 // ---------------------------------------------------------------------------
 
 async function getPriorityFeeEstimate(
   connection,
   transaction
 ) {
-  const serialized = transaction.serialize({
-    requireAllSignatures: false,
-    verifySignatures: false,
-  });
+  const serialized =
+    transaction.serialize({
+      requireAllSignatures:
+        false,
 
-  const serializedBase58 = bs58.encode(
-    serialized
-  );
+      verifySignatures:
+        false,
+    });
 
-  const response = await fetch(
-    connection.rpcEndpoint,
-    {
-      method: "POST",
+  const serializedBase58 =
+    bs58.encode(
+      serialized
+    );
 
-      headers: {
-        "Content-Type": "application/json",
-      },
+  const response =
+    await fetch(
+      connection.rpcEndpoint,
+      {
+        method: "POST",
 
-      body: JSON.stringify({
-        jsonrpc: "2.0",
+        headers: {
+          "Content-Type":
+            "application/json",
+        },
 
-        id:
-          "anon-tradebot-pumpfun-sell-priority-fee",
+        body: JSON.stringify({
+          jsonrpc: "2.0",
 
-        method:
-          "getPriorityFeeEstimate",
+          id:
+            "anon-tradebot-pumpfun-sell-priority-fee",
 
-        params: [
-          {
-            transaction: serializedBase58,
+          method:
+            "getPriorityFeeEstimate",
 
-            options: {
-              priorityLevel:
-                PRIORITY_LEVEL,
+          params: [
+            {
+              transaction:
+                serializedBase58,
 
-              recommended: true,
+              options: {
+                priorityLevel:
+                  PRIORITY_LEVEL,
+
+                recommended:
+                  true,
+              },
             },
-          },
-        ],
-      }),
-    }
-  );
+          ],
+        }),
+      }
+    );
 
-  if (!response.ok) {
+  if (
+    !response.ok
+  ) {
     throw new Error(
       `Helius priority fee request failed with HTTP ${response.status}`
     );
   }
 
-  const body = await response.json();
+  const body =
+    await response.json();
 
-  if (body.error) {
+  if (
+    body.error
+  ) {
     throw new Error(
       "Helius priority fee RPC error: " +
-      JSON.stringify(body.error)
+      JSON.stringify(
+        body.error
+      )
     );
   }
 
   const estimate =
-    body?.result?.priorityFeeEstimate;
+    body?.result
+      ?.priorityFeeEstimate;
 
   if (
-    estimate === undefined ||
+    estimate ===
+      undefined ||
     estimate === null ||
     !Number.isFinite(
       Number(estimate)
@@ -187,19 +231,103 @@ async function getPriorityFeeEstimate(
 
 
 // ---------------------------------------------------------------------------
+// Compute Budget detection
+// ---------------------------------------------------------------------------
+
+function hasComputeUnitPriceInstruction(
+  transaction
+) {
+  return transaction.instructions.some(
+    (instruction) => {
+
+      if (
+        !instruction.programId.equals(
+          ComputeBudgetProgram.programId
+        )
+      ) {
+        return false;
+      }
+
+      if (
+        !instruction.data ||
+        instruction.data.length === 0
+      ) {
+        return false;
+      }
+
+      // Compute Budget:
+      //
+      // 2 = SetComputeUnitLimit
+      // 3 = SetComputeUnitPrice
+
+      return (
+        instruction.data[0] === 3
+      );
+    }
+  );
+}
+
+
+// ---------------------------------------------------------------------------
+// Positive integer validation
+// ---------------------------------------------------------------------------
+
+function requirePositiveInteger(
+  value,
+  field
+) {
+  const parsed =
+    Number(value);
+
+  if (
+    !Number.isSafeInteger(
+      parsed
+    ) ||
+    parsed <= 0
+  ) {
+    throw new Error(
+      `${field}_must_be_positive_integer`
+    );
+  }
+
+  return parsed;
+}
+
+
+// ---------------------------------------------------------------------------
 // Main
 // ---------------------------------------------------------------------------
 
 async function main() {
-  const raw = await readStdin();
 
-  if (!raw.trim()) {
+  const raw =
+    await readStdin();
+
+  if (
+    !raw.trim()
+  ) {
     throw new Error(
       "empty_stdin_payload"
     );
   }
 
-  const input = JSON.parse(raw);
+  let input;
+
+  try {
+
+    input =
+      JSON.parse(raw);
+
+  } catch (error) {
+
+    throw new Error(
+      `invalid_json_input: ${
+        error?.message ||
+        error
+      }`
+    );
+  }
+
 
   const {
     action,
@@ -212,36 +340,46 @@ async function main() {
 
 
   // -------------------------------------------------------------------------
-  // Validate input
+  // Validate
   // -------------------------------------------------------------------------
 
-  if (!rpcUrl) {
+  if (
+    !rpcUrl
+  ) {
     throw new Error(
       "rpc_url_missing"
     );
   }
 
-  if (!baseMint) {
+  if (
+    !baseMint
+  ) {
     throw new Error(
       "base_mint_missing"
     );
   }
 
-  if (!ownerPubkey) {
+  if (
+    !ownerPubkey
+  ) {
     throw new Error(
       "owner_pubkey_missing"
     );
   }
 
-  if (action !== "sell") {
+  if (
+    action !== "sell"
+  ) {
     throw new Error(
       "pumpfun_sell_builder_requires_sell_action"
     );
   }
 
   if (
-    amountTokensRaw === undefined ||
-    amountTokensRaw === null
+    amountTokensRaw ===
+      undefined ||
+    amountTokensRaw ===
+      null
   ) {
     throw new Error(
       "amount_tokens_raw_missing"
@@ -250,16 +388,18 @@ async function main() {
 
 
   // -------------------------------------------------------------------------
-  // Raw SPL token amount
-  //
-  // NEVER use JavaScript floating-point arithmetic for token base units.
+  // Raw token amount
   // -------------------------------------------------------------------------
+  //
+  // NEVER use JavaScript floating point for SPL token base units.
+  //
 
-  const amount = new BN(
-    String(
-      amountTokensRaw
-    )
-  );
+  const amount =
+    new BN(
+      String(
+        amountTokensRaw
+      )
+    );
 
   if (
     amount.lte(
@@ -276,68 +416,157 @@ async function main() {
   // Public keys
   // -------------------------------------------------------------------------
 
-  const mint = new PublicKey(
-    baseMint
-  );
+  let mint;
+  let user;
 
-  const user = new PublicKey(
-    ownerPubkey
-  );
+  try {
+
+    mint =
+      new PublicKey(
+        baseMint
+      );
+
+    user =
+      new PublicKey(
+        ownerPubkey
+      );
+
+  } catch (error) {
+
+    throw new Error(
+      `invalid_public_key: ${
+        error?.message ||
+        error
+      }`
+    );
+  }
 
 
   // -------------------------------------------------------------------------
-  // Connection / SDK
+  // Connection
   // -------------------------------------------------------------------------
 
-  const connection = new Connection(
-    rpcUrl,
-    {
-      commitment: "processed",
-    }
-  );
-
-  const sdk = new PumpSdk(
-    connection
-  );
+  const connection =
+    new Connection(
+      rpcUrl,
+      {
+        commitment:
+          "processed",
+      }
+    );
 
 
   // -------------------------------------------------------------------------
-  // Fetch current Pump.fun state
+  // Online Pump SDK
+  // -------------------------------------------------------------------------
   //
-  // fetchSellState() determines the correct token program for the mint.
-  // We use that returned tokenProgram rather than hard-coding the legacy
-  // SPL Token program.
+  // IMPORTANT:
+  //
+  // OnlinePumpSdk is used for RPC-backed state fetching.
+  //
+  // It provides:
+  //
+  //     fetchGlobal()
+  //     fetchFeeConfig()
+  //     fetchSellState()
+  //     getTokenBalance()
+  //
+  // The instruction builder itself remains PumpSdk-compatible.
+  //
+
+  if (
+    typeof OnlinePumpSdk !==
+    "function"
+  ) {
+    throw new Error(
+      "pumpfun_online_sdk_unavailable"
+    );
+  }
+
+  if (
+    typeof PumpSdk !==
+    "function"
+  ) {
+    throw new Error(
+      "pumpfun_sdk_unavailable"
+    );
+  }
+
+  const onlineSdk =
+    new OnlinePumpSdk(
+      connection
+    );
+
+
   // -------------------------------------------------------------------------
+  // Verify required online methods
+  // -------------------------------------------------------------------------
+
+  const requiredOnlineMethods = [
+    "fetchGlobal",
+    "fetchFeeConfig",
+    "fetchSellState",
+    "getTokenBalance",
+  ];
+
+  for (
+    const method of
+      requiredOnlineMethods
+  ) {
+
+    if (
+      typeof onlineSdk[method] !==
+      "function"
+    ) {
+      throw new Error(
+        `pumpfun_online_sdk_missing_method:${method}`
+      );
+    }
+  }
+
+
+  // -------------------------------------------------------------------------
+  // Fetch all required state
+  // -------------------------------------------------------------------------
+  //
+  // Do these in parallel to reduce latency.
+  //
 
   const [
     global,
     feeConfig,
     sellState,
   ] = await Promise.all([
-    sdk.fetchGlobal(),
+    onlineSdk.fetchGlobal(),
 
-    sdk.fetchFeeConfig(),
+    onlineSdk.fetchFeeConfig(),
 
-    sdk.fetchSellState(
+    onlineSdk.fetchSellState(
       mint,
       user
     ),
   ]);
 
 
-  if (!global) {
+  if (
+    !global
+  ) {
     throw new Error(
       "pumpfun_global_state_not_found"
     );
   }
 
-  if (!feeConfig) {
+  if (
+    !feeConfig
+  ) {
     throw new Error(
       "pumpfun_fee_config_not_found"
     );
   }
 
-  if (!sellState) {
+  if (
+    !sellState
+  ) {
     throw new Error(
       "pumpfun_sell_state_not_found"
     );
@@ -351,19 +580,25 @@ async function main() {
   } = sellState;
 
 
-  if (!bondingCurveAccountInfo) {
+  if (
+    !bondingCurveAccountInfo
+  ) {
     throw new Error(
       "pumpfun_bonding_curve_account_info_missing"
     );
   }
 
-  if (!bondingCurve) {
+  if (
+    !bondingCurve
+  ) {
     throw new Error(
       "pumpfun_bonding_curve_state_missing"
     );
   }
 
-  if (!tokenProgram) {
+  if (
+    !tokenProgram
+  ) {
     throw new Error(
       "pumpfun_token_program_missing_from_sell_state"
     );
@@ -371,11 +606,17 @@ async function main() {
 
 
   // -------------------------------------------------------------------------
-  // Bonding-curve sell only
+  // Bonding curve completion check
   // -------------------------------------------------------------------------
+  //
+  // A completed bonding curve has migrated to the AMM.
+  //
+  // Do NOT attempt to sell it through the bonding-curve instruction.
+  //
 
   if (
-    bondingCurve.complete === true
+    bondingCurve.complete ===
+    true
   ) {
     throw new Error(
       "pumpfun_bonding_curve_completed_sell_requires_graduated_executor"
@@ -384,22 +625,21 @@ async function main() {
 
 
   // -------------------------------------------------------------------------
-  // Verify current wallet token balance.
-  //
-  // Both values are raw token units.
+  // Wallet token balance
   // -------------------------------------------------------------------------
 
   const walletBalance =
-    await sdk.getTokenBalance(
+    await onlineSdk.getTokenBalance(
       mint,
-      user,
-      tokenProgram
+      user
     );
 
 
   if (
-    walletBalance === undefined ||
-    walletBalance === null
+    walletBalance ===
+      undefined ||
+    walletBalance ===
+      null
   ) {
     throw new Error(
       "pumpfun_token_balance_unavailable"
@@ -407,8 +647,14 @@ async function main() {
   }
 
 
+  const walletBalanceBN =
+    new BN(
+      walletBalance.toString()
+    );
+
+
   if (
-    walletBalance.lte(
+    walletBalanceBN.lte(
       new BN(0)
     )
   ) {
@@ -418,9 +664,13 @@ async function main() {
   }
 
 
+  // -------------------------------------------------------------------------
+  // Never attempt to sell more than the wallet owns
+  // -------------------------------------------------------------------------
+
   if (
     amount.gt(
-      walletBalance
+      walletBalanceBN
     )
   ) {
     throw new Error(
@@ -430,25 +680,64 @@ async function main() {
 
 
   // -------------------------------------------------------------------------
-  // Calculate expected SOL output.
+  // Calculate expected SOL received
   // -------------------------------------------------------------------------
+  //
+  // Current Pump SDK requires:
+  //
+  //     global
+  //     feeConfig
+  //     mintSupply
+  //     bondingCurve
+  //     amount
+  //
+  // This keeps the quote aligned with current Pump.fun fee configuration.
+  //
 
-  const expectedSolAmount =
-    getSellSolAmountFromTokenAmount({
-      global,
-
-      feeConfig,
-
-      mintSupply:
-        bondingCurve.tokenTotalSupply,
-
-      bondingCurve,
-
-      amount,
-    });
+  if (
+    typeof getSellSolAmountFromTokenAmount !==
+    "function"
+  ) {
+    throw new Error(
+      "pumpfun_sell_quote_function_unavailable"
+    );
+  }
 
 
-  if (!expectedSolAmount) {
+  let expectedSolAmount;
+
+  try {
+
+    expectedSolAmount =
+      getSellSolAmountFromTokenAmount({
+        global,
+
+        feeConfig,
+
+        mintSupply:
+          bondingCurve
+            .tokenTotalSupply,
+
+        bondingCurve,
+
+        amount,
+      });
+
+  } catch (error) {
+
+    throw new Error(
+      "pumpfun_sell_quote_failed: " +
+      `${
+        error?.message ||
+        error
+      }`
+    );
+  }
+
+
+  if (
+    !expectedSolAmount
+  ) {
     throw new Error(
       "pumpfun_sell_sol_amount_calculation_failed"
     );
@@ -486,42 +775,67 @@ async function main() {
   // Mayhem mode
   // -------------------------------------------------------------------------
 
-  const mayhemMode = Boolean(
-    bondingCurve.isMayhemMode ??
-    bondingCurve.is_mayhem_mode ??
-    false
-  );
+  const mayhemMode =
+    Boolean(
+      bondingCurve.isMayhemMode ??
+      bondingCurve.is_mayhem_mode ??
+      false
+    );
 
 
   // -------------------------------------------------------------------------
-  // Build Pump.fun SELL instructions.
+  // Build sell instructions
+  // -------------------------------------------------------------------------
   //
-  // Spreading sellState passes the SDK-detected tokenProgram and the
-  // other current sell-state accounts into the instruction builder.
-  // -------------------------------------------------------------------------
+  // Use the online state returned by fetchSellState.
+  //
+  // This is important because it contains the current token program and
+  // bonding curve account information.
+  //
 
-  const instructions =
-    await sdk.sellInstructions({
-      ...sellState,
+  const sellInstructionParams = {
+    ...sellState,
 
-      global,
+    global,
 
-      mint,
+    mint,
 
-      user,
+    user,
 
-      amount,
+    amount,
 
-      solAmount:
-        expectedSolBN,
+    solAmount:
+      expectedSolBN,
 
-      slippage:
-        slippagePercent,
+    slippage:
+      slippagePercent,
 
-      mayhemMode,
+    mayhemMode,
 
-      cashback: false,
-    });
+    cashback:
+      false,
+  };
+
+
+  let instructions;
+
+  try {
+
+    instructions =
+      await onlineSdk.sellInstructions(
+        sellInstructionParams
+      );
+
+  } catch (error) {
+
+    throw new Error(
+      "pumpfun_sell_instructions_failed: " +
+      `${
+        error?.message ||
+        error
+      }`
+    );
+  }
 
 
   if (
@@ -529,7 +843,8 @@ async function main() {
     !Array.isArray(
       instructions
     ) ||
-    instructions.length === 0
+    instructions.length ===
+      0
   ) {
     throw new Error(
       "pumpfun_sell_instructions_empty"
@@ -538,12 +853,14 @@ async function main() {
 
 
   // -------------------------------------------------------------------------
-  // Build transaction
+  // Build unsigned transaction
   // -------------------------------------------------------------------------
 
-  const tx = new Transaction();
+  const tx =
+    new Transaction();
 
-  tx.feePayer = user;
+  tx.feePayer =
+    user;
 
   tx.add(
     ...instructions
@@ -598,7 +915,7 @@ async function main() {
 
 
   // -------------------------------------------------------------------------
-  // Add priority fee if the SDK hasn't already done so.
+  // Add priority fee if not already present
   // -------------------------------------------------------------------------
 
   let priorityFeeInstructionAdded =
@@ -612,10 +929,11 @@ async function main() {
   ) {
 
     tx.add(
-      ComputeBudgetProgram.setComputeUnitPrice({
-        microLamports:
-          priorityFeeMicroLamports,
-      })
+      ComputeBudgetProgram
+        .setComputeUnitPrice({
+          microLamports:
+            priorityFeeMicroLamports,
+        })
     );
 
     priorityFeeInstructionAdded =
@@ -642,18 +960,22 @@ async function main() {
 
   const serialized =
     tx.serialize({
-      requireAllSignatures: false,
-      verifySignatures: false,
+      requireAllSignatures:
+        false,
+
+      verifySignatures:
+        false,
     });
 
 
   // -------------------------------------------------------------------------
-  // Return unsigned transaction to Python
+  // Return transaction to Python
   // -------------------------------------------------------------------------
 
   process.stdout.write(
     JSON.stringify({
-      success: true,
+      success:
+        true,
 
       transaction_b64:
         serialized.toString(
@@ -664,7 +986,8 @@ async function main() {
         finalBlockhash.blockhash,
 
       last_valid_block_height:
-        finalBlockhash.lastValidBlockHeight,
+        finalBlockhash
+          .lastValidBlockHeight,
 
       base_mint:
         mint.toBase58(),
@@ -676,7 +999,7 @@ async function main() {
         amount.toString(),
 
       wallet_token_balance_raw:
-        walletBalance.toString(),
+        walletBalanceBN.toString(),
 
       token_program:
         tokenProgram.toBase58(),
@@ -691,7 +1014,8 @@ async function main() {
 
       slippage_bps:
         Number(
-          slippageBps ?? 300
+          slippageBps ??
+          300
         ),
 
       slippage_percent:
@@ -716,8 +1040,11 @@ async function main() {
         instructions.length,
 
       bonding_curve:
-        bondingCurveAccountInfo.pubkey
-          ? bondingCurveAccountInfo.pubkey.toBase58()
+        bondingCurveAccountInfo
+          .pubkey
+          ? bondingCurveAccountInfo
+              .pubkey
+              .toBase58()
           : null,
 
       action:
@@ -736,12 +1063,22 @@ main().catch(
 
     process.stdout.write(
       JSON.stringify({
-        success: false,
+        success:
+          false,
 
         error:
           String(
-            (err &&
-              err.message) ||
+            (
+              err &&
+              err.message
+            ) ||
             err
           ),
-      })
+      }) + "\n"
+    );
+
+    // The Python wrapper treats the JSON response as the authoritative
+    // result, so return exit code 0 with success=false.
+    process.exit(0);
+  }
+);
