@@ -16,3 +16,4 @@ respx
 solders
 solana
 base58
+websockets>=15,<16
