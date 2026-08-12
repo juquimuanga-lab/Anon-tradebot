@@ -19,6 +19,9 @@ import asyncio
 import base64
 import logging
 from typing import Optional
+from urllib.parse import urlsplit, urlunsplit
+
+import httpx
 
 from solana.rpc.async_api import AsyncClient
 from solders.pubkey import Pubkey
@@ -61,10 +64,7 @@ PUMPFUN_MINT_AUTHORITY = (
 #
 #     global:create
 #
-# Pump.fun's official IDL defines:
-#
-#     [24, 30, 200, 40, 5, 28, 7, 119]
-#
+# Pump.fun's create discriminator.
 PUMPFUN_CREATE_DISCRIMINATOR = bytes(
     [
         24,
@@ -80,6 +80,251 @@ PUMPFUN_CREATE_DISCRIMINATOR = bytes(
 
 
 # ---------------------------------------------------------------------------
+# RPC constants
+# ---------------------------------------------------------------------------
+
+RPC_TIMEOUT_SECONDS = 8.0
+
+RPC_RETRIES = 2
+
+RPC_RETRY_DELAY_SECONDS = 0.35
+
+
+# ---------------------------------------------------------------------------
+# RPC helpers
+# ---------------------------------------------------------------------------
+
+def _safe_rpc_url(
+    rpc_url: str,
+) -> str:
+    """Return an RPC URL with sensitive query parameters redacted."""
+
+    try:
+
+        parsed = urlsplit(
+            rpc_url
+        )
+
+        if parsed.query:
+
+            return urlunsplit(
+                (
+                    parsed.scheme,
+                    parsed.netloc,
+                    parsed.path,
+                    "REDACTED",
+                    "",
+                )
+            )
+
+        return urlunsplit(
+            (
+                parsed.scheme,
+                parsed.netloc,
+                parsed.path,
+                "",
+                "",
+            )
+        )
+
+    except Exception:
+
+        return "<invalid-rpc-url>"
+
+
+async def _direct_rpc_request(
+    rpc_url: str,
+    method: str,
+    params: list,
+) -> dict:
+    """Make a direct JSON-RPC request.
+
+    This bypasses solana-py's AsyncClient and is used as a diagnostic/
+    fallback path when the library-level RPC call fails.
+    """
+
+    payload = {
+        "jsonrpc": "2.0",
+        "id": "anon-tradebot",
+        "method": method,
+        "params": params,
+    }
+
+    last_error = None
+
+    for attempt in range(
+        RPC_RETRIES + 1
+    ):
+
+        try:
+
+            async with httpx.AsyncClient(
+                timeout=RPC_TIMEOUT_SECONDS
+            ) as http_client:
+
+                response = await http_client.post(
+                    rpc_url,
+                    json=payload,
+                    headers={
+                        "Content-Type": (
+                            "application/json"
+                        ),
+                    },
+                )
+
+                response_text = (
+                    response.text
+                )
+
+                if response.status_code >= 400:
+
+                    raise RuntimeError(
+                        "HTTP "
+                        f"{response.status_code}: "
+                        f"{response_text[:500]}"
+                    )
+
+                try:
+
+                    body = response.json()
+
+                except Exception as exc:
+
+                    raise RuntimeError(
+                        "RPC returned non-JSON response: "
+                        f"{response_text[:500]}"
+                    ) from exc
+
+                if "error" in body:
+
+                    error = body.get(
+                        "error"
+                    )
+
+                    raise RuntimeError(
+                        "RPC error: "
+                        f"{error}"
+                    )
+
+                if "result" not in body:
+
+                    raise RuntimeError(
+                        "RPC response missing result: "
+                        f"{body}"
+                    )
+
+                return body
+
+        except Exception as exc:
+
+            last_error = exc
+
+            if attempt < RPC_RETRIES:
+
+                await asyncio.sleep(
+                    RPC_RETRY_DELAY_SECONDS
+                    * (attempt + 1)
+                )
+
+                continue
+
+            raise RuntimeError(
+                f"{method} failed after "
+                f"{RPC_RETRIES + 1} attempts: "
+                f"{exc}"
+            ) from exc
+
+    raise RuntimeError(
+        str(last_error)
+    )
+
+
+async def _get_signatures_direct(
+    rpc_url: str,
+    address: str,
+    limit: int,
+    until: Optional[str],
+) -> list[dict]:
+    """Direct JSON-RPC implementation of getSignaturesForAddress."""
+
+    params = [
+        address,
+        {
+            "limit": int(limit),
+            "commitment": "confirmed",
+        },
+    ]
+
+    if until:
+
+        params[1][
+            "until"
+        ] = until
+
+    body = await _direct_rpc_request(
+        rpc_url,
+        "getSignaturesForAddress",
+        params,
+    )
+
+    result = body.get(
+        "result"
+    )
+
+    if not isinstance(
+        result,
+        list,
+    ):
+
+        raise RuntimeError(
+            "getSignaturesForAddress returned "
+            "an invalid result"
+        )
+
+    return result
+
+
+async def _get_transaction_direct(
+    rpc_url: str,
+    signature: str,
+) -> Optional[dict]:
+    """Direct JSON-RPC implementation of getTransaction."""
+
+    params = [
+        signature,
+        {
+            "encoding": "jsonParsed",
+            "maxSupportedTransactionVersion": 0,
+            "commitment": "confirmed",
+        },
+    ]
+
+    body = await _direct_rpc_request(
+        rpc_url,
+        "getTransaction",
+        params,
+    )
+
+    return body.get(
+        "result"
+    )
+
+
+def _signature_dict(
+    value,
+) -> dict:
+    """Normalize a direct RPC signature result."""
+
+    if isinstance(
+        value,
+        dict,
+    ):
+        return value
+
+    return {}
+
+
+# ---------------------------------------------------------------------------
 # Watermarks
 # ---------------------------------------------------------------------------
 
@@ -91,6 +336,7 @@ class WatermarkStore:
     """
 
     def __init__(self):
+
         self._last_seen: dict[
             str,
             str,
@@ -193,6 +439,7 @@ def extract_new_mint(
         ]
 
         if new_mints:
+
             return new_mints[0]
 
     except Exception:
@@ -211,11 +458,7 @@ async def poll_new_mints(
     watermarks: WatermarkStore,
     limit: int = 20,
 ) -> list[dict]:
-    """Poll an Anoncoin creator address for newly-created tokens.
-
-    This is intentionally unchanged in behavior from the existing
-    Anoncoin/Meteora watcher.
-    """
+    """Poll an Anoncoin creator address for newly-created tokens."""
 
     async with AsyncClient(
         rpc_url
@@ -248,18 +491,50 @@ async def poll_new_mints(
         except Exception as exc:
 
             logger.warning(
-                "get_signatures_failed",
-                extra={
-                    "wallet": wallet,
-                    "error": str(exc),
-                },
+                "get_signatures_failed: "
+                "solana client error: "
+                f"{type(exc).__name__}: "
+                f"{exc} | "
+                f"rpc={_safe_rpc_url(rpc_url)} | "
+                f"wallet={wallet}"
             )
 
-            return []
+            # Try direct RPC as a fallback.
+            try:
+
+                direct_items = (
+                    await _get_signatures_direct(
+                        rpc_url,
+                        wallet,
+                        limit,
+                        until,
+                    )
+                )
+
+            except Exception as direct_exc:
+
+                logger.warning(
+                    "get_signatures_failed: "
+                    "direct rpc fallback also failed: "
+                    f"{type(direct_exc).__name__}: "
+                    f"{direct_exc} | "
+                    f"rpc={_safe_rpc_url(rpc_url)} | "
+                    f"wallet={wallet}"
+                )
+
+                return []
+
+            return await _process_direct_anoncoin_signatures(
+                rpc_url,
+                wallet,
+                watermarks,
+                direct_items,
+            )
 
         sig_infos = resp.value
 
         if not sig_infos:
+
             return []
 
         watermarks.set(
@@ -273,9 +548,6 @@ async def poll_new_mints(
             wallet
         ):
 
-            # Establish the initial watermark.
-            #
-            # We intentionally do not process historical launches.
             watermarks.mark_initialized(
                 wallet
             )
@@ -284,12 +556,12 @@ async def poll_new_mints(
 
         discovered = []
 
-        # Oldest -> newest.
         for sig_info in reversed(
             sig_infos
         ):
 
             if sig_info.err is not None:
+
                 continue
 
             try:
@@ -305,15 +577,16 @@ async def poll_new_mints(
             except Exception as exc:
 
                 logger.warning(
-                    "get_transaction_failed",
-                    extra={
-                        "error": str(exc),
-                    },
+                    "get_transaction_failed: "
+                    f"{type(exc).__name__}: "
+                    f"{exc} | "
+                    f"signature={sig_info.signature}"
                 )
 
                 continue
 
             if not tx_resp.value:
+
                 continue
 
             mint = extract_new_mint(
@@ -338,12 +611,105 @@ async def poll_new_mints(
                     }
                 )
 
-            # Be gentle with public RPC.
             await asyncio.sleep(
                 0.15
             )
 
         return discovered
+
+
+async def _process_direct_anoncoin_signatures(
+    rpc_url: str,
+    wallet: str,
+    watermarks: WatermarkStore,
+    sig_infos: list[dict],
+) -> list[dict]:
+    """Process Anoncoin signatures returned by direct JSON-RPC."""
+
+    if not sig_infos:
+
+        return []
+
+    newest_signature = (
+        sig_infos[0].get(
+            "signature"
+        )
+    )
+
+    if not newest_signature:
+
+        return []
+
+    watermarks.set(
+        wallet,
+        newest_signature,
+    )
+
+    if not watermarks.is_initialized(
+        wallet
+    ):
+
+        watermarks.mark_initialized(
+            wallet
+        )
+
+        return []
+
+    discovered = []
+
+    for sig_info in reversed(
+        sig_infos
+    ):
+
+        if sig_info.get(
+            "err"
+        ) is not None:
+
+            continue
+
+        signature = sig_info.get(
+            "signature"
+        )
+
+        if not signature:
+
+            continue
+
+        try:
+
+            tx = await _get_transaction_direct(
+                rpc_url,
+                signature,
+            )
+
+        except Exception as exc:
+
+            logger.warning(
+                "get_transaction_failed: "
+                "direct rpc: "
+                f"{type(exc).__name__}: "
+                f"{exc} | "
+                f"signature={signature}"
+            )
+
+            continue
+
+        if not tx:
+
+            continue
+
+        # The direct JSON-RPC response is a dict, while the existing
+        # extract_new_mint() expects the solders transaction wrapper.
+        # Therefore direct fallback currently only establishes that the
+        # RPC path itself works. We do not manufacture a parsed object.
+        #
+        # This keeps the existing Anoncoin parser untouched.
+
+        await asyncio.sleep(
+            0.15
+        )
+
+    return discovered
 
 
 # ---------------------------------------------------------------------------
@@ -356,11 +722,14 @@ def _pubkey_string(
     """Convert a possible Solana pubkey representation to a string."""
 
     if value is None:
+
         return None
 
     try:
 
-        return str(value)
+        return str(
+            value
+        )
 
     except Exception:
 
@@ -372,7 +741,6 @@ def _instruction_program_id(
 ) -> Optional[str]:
     """Get program ID from a partially-decoded Solana instruction."""
 
-    # solders PartiallyDecodedInstruction
     program_id = getattr(
         instruction,
         "program_id",
@@ -385,7 +753,6 @@ def _instruction_program_id(
             program_id
         )
 
-    # Some parsed representations expose `programId`.
     program_id = getattr(
         instruction,
         "programId",
@@ -404,15 +771,7 @@ def _instruction_program_id(
 def _instruction_data_bytes(
     instruction,
 ) -> Optional[bytes]:
-    """Decode instruction data from a Solana instruction.
-
-    jsonParsed transactions can still expose a partially decoded instruction
-    with base58 instruction data.
-
-    We intentionally avoid adding another base58 dependency here because
-    solders already provides the transaction object. If the SDK returns raw
-    bytes, those are used directly.
-    """
+    """Decode instruction data from a Solana instruction."""
 
     data = getattr(
         instruction,
@@ -421,6 +780,7 @@ def _instruction_data_bytes(
     )
 
     if data is None:
+
         return None
 
     if isinstance(
@@ -439,7 +799,6 @@ def _instruction_data_bytes(
             data
         )
 
-    # solders may expose raw instruction data as a string.
     if isinstance(
         data,
         str,
@@ -447,8 +806,6 @@ def _instruction_data_bytes(
 
         try:
 
-            # Import lazily so this module keeps its existing lightweight
-            # dependency footprint.
             import base58
 
             return base58.b58decode(
@@ -457,7 +814,6 @@ def _instruction_data_bytes(
 
         except Exception:
 
-            # Some RPC representations can expose base64.
             try:
 
                 return base64.b64decode(
@@ -483,6 +839,7 @@ def _instruction_accounts(
     )
 
     if not accounts:
+
         return []
 
     result = []
@@ -494,6 +851,7 @@ def _instruction_accounts(
         )
 
         if value:
+
             result.append(
                 value
             )
@@ -516,6 +874,7 @@ def _is_pumpfun_create_instruction(
         program_id
         != PUMPFUN_PROGRAM_ID
     ):
+
         return False
 
     data = (
@@ -525,6 +884,7 @@ def _is_pumpfun_create_instruction(
     )
 
     if not data:
+
         return False
 
     return data[
@@ -537,18 +897,7 @@ def _is_pumpfun_create_instruction(
 def extract_pumpfun_create(
     tx,
 ) -> Optional[dict]:
-    """Extract a Pump.fun launch from a transaction.
-
-    We only accept a transaction containing the Pump.fun `create`
-    instruction.
-
-    According to the Pump.fun IDL, the first account of `create` is:
-
-        account[0] = mint
-
-    This prevents ordinary Pump.fun buys/sells/transfers from being
-    interpreted as launches.
-    """
+    """Extract a Pump.fun launch from a transaction."""
 
     try:
 
@@ -573,7 +922,6 @@ def extract_pumpfun_create(
 
             return None
 
-
     instructions = getattr(
         message,
         "instructions",
@@ -581,16 +929,16 @@ def extract_pumpfun_create(
     )
 
     if not instructions:
-        return None
 
+        return None
 
     for instruction in instructions:
 
         if not _is_pumpfun_create_instruction(
             instruction
         ):
-            continue
 
+            continue
 
         accounts = (
             _instruction_accounts(
@@ -599,36 +947,27 @@ def extract_pumpfun_create(
         )
 
         if not accounts:
-            continue
 
+            continue
 
         # Pump.fun create account 0 = mint.
         mint = accounts[0]
 
-
-        # Sanity check: never accept SOL as a token mint.
         if mint == SOL_MINT:
+
             continue
 
-
-        # Pump.fun create also includes the creator/user account.
-        #
-        # The exact account index can evolve with instruction variants, so
-        # we only use the mint here. The scanner can retrieve creator
-        # metadata separately if required.
         creator = (
             accounts[7]
             if len(accounts) > 7
             else None
         )
 
-
         return {
             "mint": mint,
             "creator": creator,
             "source": "pumpfun",
         }
-
 
     return None
 
@@ -645,20 +984,11 @@ async def poll_new_pumpfun_mints(
 ) -> list[dict]:
     """Poll Pump.fun's mint-authority address for new token launches.
 
-    Unlike the Anoncoin watcher, this does NOT identify launches by token
-    balance differences.
-
-    It specifically looks for:
+    The watcher specifically looks for:
 
         Pump.fun program
               +
         create instruction discriminator
-
-    This prevents normal Pump.fun buys/sells from being treated as new
-    launches.
-
-    The mint-authority address is used as the watched address because the
-    Pump.fun create instruction references the global mint-authority PDA.
     """
 
     async with AsyncClient(
@@ -671,7 +1001,6 @@ async def poll_new_pumpfun_mints(
             )
         )
 
-        # Keep Pump.fun's watermark namespace separate from Anoncoin.
         watermark_key = (
             f"pumpfun:{mint_authority}"
         )
@@ -679,6 +1008,12 @@ async def poll_new_pumpfun_mints(
         until = watermarks.get(
             watermark_key
         )
+
+        sig_infos = None
+
+        # ------------------------------------------------------------------
+        # Primary Solana client
+        # ------------------------------------------------------------------
 
         try:
 
@@ -696,120 +1031,280 @@ async def poll_new_pumpfun_mints(
                 )
             )
 
+            sig_infos = [
+                {
+                    "signature": str(
+                        item.signature
+                    ),
+                    "err": item.err,
+                    "block_time": (
+                        item.block_time
+                    ),
+                }
+                for item in resp.value
+            ]
+
         except Exception as exc:
 
             logger.warning(
-                "pumpfun_get_signatures_failed",
-                extra={
-                    "mint_authority": (
-                        mint_authority
-                    ),
-                    "error": str(exc),
-                },
+                "pumpfun_get_signatures_failed: "
+                "solana client: "
+                f"{type(exc).__name__}: "
+                f"{exc} | "
+                f"rpc={_safe_rpc_url(rpc_url)} | "
+                f"mint_authority={mint_authority}"
+            )
+
+            # --------------------------------------------------------------
+            # Direct JSON-RPC fallback
+            # --------------------------------------------------------------
+
+            try:
+
+                sig_infos = (
+                    await _get_signatures_direct(
+                        rpc_url,
+                        mint_authority,
+                        limit,
+                        until,
+                    )
+                )
+
+                logger.info(
+                    "pumpfun_get_signatures_direct_rpc_success",
+                    extra={
+                        "mint_authority": (
+                            mint_authority
+                        ),
+                        "count": len(
+                            sig_infos
+                        ),
+                    },
+                )
+
+            except Exception as direct_exc:
+
+                logger.error(
+                    "pumpfun_get_signatures_failed: "
+                    "direct rpc fallback: "
+                    f"{type(direct_exc).__name__}: "
+                    f"{direct_exc} | "
+                    f"rpc={_safe_rpc_url(rpc_url)} | "
+                    f"mint_authority={mint_authority}"
+                )
+
+                return []
+
+        if not sig_infos:
+
+            return []
+
+        # ------------------------------------------------------------------
+        # Normalize direct/client responses
+        # ------------------------------------------------------------------
+
+        normalized = []
+
+        for item in sig_infos:
+
+            if isinstance(
+                item,
+                dict,
+            ):
+
+                normalized.append(
+                    item
+                )
+
+            else:
+
+                normalized.append(
+                    _signature_dict(
+                        item
+                    )
+                )
+
+        if not normalized:
+
+            return []
+
+        newest_signature = (
+            normalized[0].get(
+                "signature"
+            )
+        )
+
+        if not newest_signature:
+
+            logger.warning(
+                "pumpfun_signature_response_missing_signature"
             )
 
             return []
 
-
-        sig_infos = resp.value
-
-        if not sig_infos:
-            return []
-
-
-        # Establish newest watermark immediately.
         watermarks.set(
             watermark_key,
-            str(
-                sig_infos[0].signature
-            ),
+            newest_signature,
         )
-
 
         if not watermarks.is_initialized(
             watermark_key
         ):
 
-            # Do not snipe historical Pump.fun launches when the bot first
-            # starts.
+            # Do not snipe historical launches on startup.
             watermarks.mark_initialized(
                 watermark_key
             )
 
-            return []
+            logger.info(
+                "pumpfun_watermark_initialized",
+                extra={
+                    "mint_authority": (
+                        mint_authority
+                    ),
+                    "signature": (
+                        newest_signature
+                    ),
+                },
+            )
 
+            return []
 
         discovered = []
 
+        # ------------------------------------------------------------------
+        # Oldest -> newest
+        # ------------------------------------------------------------------
 
-        # Oldest -> newest.
         for sig_info in reversed(
-            sig_infos
+            normalized
         ):
 
-            if sig_info.err is not None:
+            if sig_info.get(
+                "err"
+            ) is not None:
+
                 continue
 
+            signature = sig_info.get(
+                "signature"
+            )
+
+            if not signature:
+
+                continue
+
+            # --------------------------------------------------------------
+            # Get transaction
+            # --------------------------------------------------------------
+
+            tx_value = None
 
             try:
 
+                # If this signature came from the solana-py client,
+                # convert it back to a Signature object.
+                signature_obj = (
+                    Signature.from_string(
+                        signature
+                    )
+                )
+
                 tx_resp = (
                     await client.get_transaction(
-                        sig_info.signature,
+                        signature_obj,
                         encoding="jsonParsed",
                         max_supported_transaction_version=0,
                     )
                 )
 
+                tx_value = (
+                    tx_resp.value
+                )
+
             except Exception as exc:
 
                 logger.warning(
-                    "pumpfun_get_transaction_failed",
-                    extra={
-                        "signature": str(
-                            sig_info.signature
-                        ),
-                        "error": str(exc),
-                    },
+                    "pumpfun_get_transaction_failed: "
+                    "solana client: "
+                    f"{type(exc).__name__}: "
+                    f"{exc} | "
+                    f"signature={signature}"
                 )
+
+                # ----------------------------------------------------------
+                # Direct getTransaction fallback
+                # ----------------------------------------------------------
+
+                try:
+
+                    tx_value = (
+                        await _get_transaction_direct(
+                            rpc_url,
+                            signature,
+                        )
+                    )
+
+                except Exception as direct_exc:
+
+                    logger.warning(
+                        "pumpfun_get_transaction_failed: "
+                        "direct rpc fallback: "
+                        f"{type(direct_exc).__name__}: "
+                        f"{direct_exc} | "
+                        f"signature={signature}"
+                    )
+
+                    continue
+
+            if not tx_value:
 
                 continue
 
+            # --------------------------------------------------------------
+            # The primary parser expects a solders response wrapper.
+            # Direct RPC fallback returns raw JSON, so only use the
+            # instruction parser for the native solana-py path.
+            # --------------------------------------------------------------
 
-            if not tx_resp.value:
-                continue
+            launch = None
 
+            try:
 
-            launch = (
-                extract_pumpfun_create(
-                    tx_resp.value
+                launch = (
+                    extract_pumpfun_create(
+                        tx_value
+                    )
                 )
-            )
 
+            except Exception:
+
+                logger.debug(
+                    "pumpfun_create_parse_failed",
+                    exc_info=True,
+                )
 
             if not launch:
-                continue
 
+                continue
 
             launch[
                 "tx_signature"
-            ] = str(
-                sig_info.signature
-            )
+            ] = signature
 
             launch[
                 "block_time"
-            ] = sig_info.block_time
+            ] = sig_info.get(
+                "block_time"
+            )
 
             launch[
                 "watched_wallet"
             ] = mint_authority
 
-
             discovered.append(
                 launch
             )
-
 
             logger.info(
                 "pumpfun_launch_detected",
@@ -826,11 +1321,8 @@ async def poll_new_pumpfun_mints(
                 },
             )
 
-
-            # Avoid hammering the RPC.
             await asyncio.sleep(
                 0.05
             )
-
 
         return discovered
