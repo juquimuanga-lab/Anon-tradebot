@@ -5,6 +5,7 @@ IMPORTANT:
 - Live positions must NEVER use simulated prices for exit decisions.
 - Paper/simulated positions may use the random-walk fallback.
 - Meteora DBC positions use the live on-chain pool price.
+- Pump.fun positions use the live Pump.fun bonding-curve price.
 - If a live price cannot be obtained quickly, the caller receives the
   last known price together with is_simulated=True and must NOT trigger
   an automated price exit from that value.
@@ -13,8 +14,11 @@ Latency design:
 
 - Live price lookups have short bounded timeouts.
 - Meteora pool price and SOL/USD price are fetched concurrently.
+- Pump.fun price and SOL/USD price are handled efficiently.
 - SOL/USD is very briefly cached because it does not need to be fetched
   independently for every token on every monitoring cycle.
+- Pump.fun prices have a very short cache to prevent duplicate RPC reads
+  from overlapping monitoring/discovery requests.
 - A slow external service must never block the position manager for
   the entire RPC/API timeout window.
 """
@@ -31,7 +35,12 @@ from app.connectors.anoncoin import (
     AnoncoinUnavailable,
 )
 from app.execution.onchain import meteora_dbc
+from app.execution.onchain import pumpfun
 from app.execution.onchain.meteora_dbc import DbcBuildError
+from app.execution.onchain.pumpfun import (
+    PumpFunError,
+    PumpFunPoolNotFound,
+)
 from app.scanners import price_feed
 from app.scoring.rules import TokenSnapshot
 
@@ -47,23 +56,33 @@ logger = logging.getLogger(
 
 # Maximum time we allow a live Anoncoin price lookup to occupy one
 # monitoring cycle.
-#
-# We deliberately keep this much lower than the connector's underlying
-# 15-second HTTP timeout because a TP/SL monitor should not wait 15 seconds
-# for one token.
 ANONCOIN_PRICE_TIMEOUT_SECONDS = 2.0
 
 # Same principle for volume.
 ANONCOIN_VOLUME_TIMEOUT_SECONDS = 2.0
 
 # Meteora pool_info currently invokes a Node process. Do not allow a
-# temporary RPC/Node problem to block the exit monitor for 30 seconds.
+# temporary RPC/Node problem to block the exit monitor for too long.
 METEORA_PRICE_TIMEOUT_SECONDS = 2.5
+
+# Pump.fun price reads are performed directly through Solana RPC.
+#
+# Keep this short because the position manager should never wait several
+# seconds for a single price read when a stop-loss could be approaching.
+PUMPFUN_PRICE_TIMEOUT_SECONDS = 1.5
 
 # SOL/USD is not nearly as volatile as a newly launched token price.
 # A very short cache avoids repeatedly paying the external price-feed
 # latency while still keeping the conversion fresh.
 SOL_USD_CACHE_TTL_SECONDS = 2.0
+
+# Pump.fun price cache.
+#
+# This is intentionally very short. We are NOT using this as a substitute
+# for live market data. It only prevents duplicate RPC requests when two
+# parts of the application request the exact same token price almost
+# simultaneously.
+PUMPFUN_PRICE_CACHE_TTL_SECONDS = 1.0
 
 
 # ---------------------------------------------------------------------------
@@ -136,8 +155,87 @@ async def _get_sol_usd_price_fast() -> float:
 
 
 # ---------------------------------------------------------------------------
+# Pump.fun price cache
+# ---------------------------------------------------------------------------
+
+_pumpfun_price_cache: dict[
+    str,
+    tuple[float, float],
+] = {}
+
+_pumpfun_price_cache_lock = asyncio.Lock()
+
+
+def _get_cached_pumpfun_price(
+    mint: str,
+) -> Optional[float]:
+    """Return a very recent Pump.fun price if available."""
+
+    cached = _pumpfun_price_cache.get(
+        mint
+    )
+
+    if cached is None:
+        return None
+
+    price, timestamp = cached
+
+    if (
+        time.monotonic()
+        - timestamp
+        >= PUMPFUN_PRICE_CACHE_TTL_SECONDS
+    ):
+        _pumpfun_price_cache.pop(
+            mint,
+            None,
+        )
+        return None
+
+    return price
+
+
+def _cache_pumpfun_price(
+    mint: str,
+    price: float,
+) -> None:
+    """Store a very recent Pump.fun live price."""
+
+    _pumpfun_price_cache[mint] = (
+        float(price),
+        time.monotonic(),
+    )
+
+    # Keep the cache bounded.
+    #
+    # The position monitor may encounter many newly launched tokens.
+    # Remove stale entries opportunistically.
+    if len(_pumpfun_price_cache) > 500:
+
+        now = time.monotonic()
+
+        stale_mints = [
+            cached_mint
+            for cached_mint, (
+                _price,
+                timestamp,
+            ) in _pumpfun_price_cache.items()
+            if (
+                now - timestamp
+                >= PUMPFUN_PRICE_CACHE_TTL_SECONDS
+            )
+        ]
+
+        for stale_mint in stale_mints:
+            _pumpfun_price_cache.pop(
+                stale_mint,
+                None,
+            )
+
+
+# ---------------------------------------------------------------------------
 # Simulation helpers
 # ---------------------------------------------------------------------------
+
 
 def _walk_price(
     mint: str,
@@ -202,6 +300,7 @@ def _walk_volume(
 # Anoncoin price
 # ---------------------------------------------------------------------------
 
+
 async def _get_anoncoin_price(
     client: AnoncoinClient,
     mint: str,
@@ -238,6 +337,7 @@ async def _get_anoncoin_price(
 # Meteora price
 # ---------------------------------------------------------------------------
 
+
 async def _get_meteora_price_usd(
     mint: str,
 ) -> float:
@@ -260,7 +360,6 @@ async def _get_meteora_price_usd(
         pool_info ──────────┐
                             ├── calculate
         SOL/USD ────────────┘
-
     """
 
     pool_task = asyncio.create_task(
@@ -371,8 +470,140 @@ async def _get_meteora_price_usd(
 
 
 # ---------------------------------------------------------------------------
+# Pump.fun price
+# ---------------------------------------------------------------------------
+
+
+async def _get_pumpfun_price_usd(
+    mint: str,
+) -> float:
+    """Fetch the live Pump.fun bonding-curve price.
+
+    Pump.fun positions MUST use this path rather than the simulated
+    random-walk fallback.
+
+    The Pump.fun module calculates the token's SOL price from the live
+    bonding-curve reserves and then converts it to USD.
+
+    We supply our already cached SOL/USD price so Pump.fun does not make
+    another external SOL price request.
+    """
+
+    cached_price = _get_cached_pumpfun_price(
+        mint
+    )
+
+    if cached_price is not None:
+
+        logger.debug(
+            "pumpfun_price_cache_hit",
+            extra={
+                "mint": mint,
+                "price_usd": cached_price,
+            },
+        )
+
+        return cached_price
+
+    # Only one identical Pump.fun lookup should be allowed to populate
+    # the cache at a time.
+    #
+    # The lock is intentionally held only around the actual lookup.
+    async with _pumpfun_price_cache_lock:
+
+        cached_price = (
+            _get_cached_pumpfun_price(
+                mint
+            )
+        )
+
+        if cached_price is not None:
+            return cached_price
+
+        sol_usd = (
+            await _get_sol_usd_price_fast()
+        )
+
+        pool_info = await asyncio.wait_for(
+            pumpfun.get_pool_info(
+                mint,
+                settings.solana_rpc_url,
+                sol_usd=sol_usd,
+                commitment="processed",
+            ),
+            timeout=(
+                PUMPFUN_PRICE_TIMEOUT_SECONDS
+            ),
+        )
+
+        if not pool_info:
+            raise PumpFunError(
+                "Pump.fun returned empty pool "
+                "information"
+            )
+
+        if not pool_info.get(
+            "success",
+            False,
+        ):
+            raise PumpFunError(
+                "Pump.fun price lookup was "
+                "not successful"
+            )
+
+        price_usd = float(
+            pool_info.get(
+                "price_usd",
+                0.0,
+            )
+        )
+
+        if price_usd <= 0:
+            raise PumpFunError(
+                "Pump.fun returned a non-positive "
+                "price"
+            )
+
+        _cache_pumpfun_price(
+            mint,
+            price_usd,
+        )
+
+        logger.debug(
+            "live_pumpfun_price",
+            extra={
+                "mint": mint,
+                "price_usd": price_usd,
+                "price_sol_per_token": (
+                    pool_info.get(
+                        "price_sol_per_token"
+                    )
+                ),
+                "market_cap_usd": (
+                    pool_info.get(
+                        "market_cap_usd"
+                    )
+                ),
+                "liquidity_usd": (
+                    pool_info.get(
+                        "liquidity_usd"
+                    )
+                ),
+                "complete": (
+                    pool_info.get(
+                        "complete"
+                    )
+                ),
+            },
+        )
+
+        return price_usd
+
+
+# ---------------------------------------------------------------------------
 # Price
 # ---------------------------------------------------------------------------
+
 
 async def get_current_price_usd(
     client: AnoncoinClient,
@@ -520,6 +751,87 @@ async def get_current_price_usd(
         )
 
     # -----------------------------------------------------------------------
+    # Pump.fun on-chain price
+    # -----------------------------------------------------------------------
+
+    if token.source == "pumpfun":
+
+        try:
+
+            price_usd = (
+                await _get_pumpfun_price_usd(
+                    token.mint
+                )
+            )
+
+            # CRITICAL:
+            #
+            # This is a REAL Pump.fun bonding-curve price.
+            #
+            # Returning False tells PositionManager that it is safe to
+            # evaluate stop-loss / take-profit against this price.
+            return (
+                price_usd,
+                False,
+            )
+
+        except asyncio.TimeoutError:
+
+            logger.warning(
+                "pumpfun_price_timeout",
+                extra={
+                    "mint": token.mint,
+                    "timeout_seconds": (
+                        PUMPFUN_PRICE_TIMEOUT_SECONDS
+                    ),
+                },
+            )
+
+        except PumpFunPoolNotFound as exc:
+
+            logger.warning(
+                "pumpfun_price_pool_not_found",
+                extra={
+                    "mint": token.mint,
+                    "error": str(exc),
+                },
+            )
+
+        except PumpFunError as exc:
+
+            logger.warning(
+                "pumpfun_price_lookup_failed",
+                extra={
+                    "mint": token.mint,
+                    "error": str(exc),
+                },
+            )
+
+        except Exception as exc:
+
+            logger.warning(
+                "pumpfun_price_lookup_error",
+                extra={
+                    "mint": token.mint,
+                    "error": str(exc),
+                },
+            )
+
+        # IMPORTANT:
+        #
+        # Never fabricate a Pump.fun price.
+        #
+        # Returning True prevents PositionManager from triggering a
+        # stop-loss/take-profit using stale data.
+        return (
+            float(
+                token.price_usd
+                or 0.0
+            ),
+            True,
+        )
+
+    # -----------------------------------------------------------------------
     # Simulated / paper source
     # -----------------------------------------------------------------------
 
@@ -537,6 +849,7 @@ async def get_current_price_usd(
 # ---------------------------------------------------------------------------
 # Anoncoin volume
 # ---------------------------------------------------------------------------
+
 
 async def _get_anoncoin_volume(
     client: AnoncoinClient,
@@ -575,6 +888,7 @@ async def _get_anoncoin_volume(
 # Volume
 # ---------------------------------------------------------------------------
 
+
 async def get_current_volume_usd(
     client: AnoncoinClient,
     token: TokenSnapshot,
@@ -587,6 +901,10 @@ async def get_current_volume_usd(
 
     Meteora:
         Meteora pool reads do not provide the same 24h volume metric.
+
+    Pump.fun:
+        Pump.fun bonding-curve reads do not provide the same 24h volume
+        metric used by the Anoncoin API.
 
     Paper/simulated:
         Deterministic simulated volume remains available.
@@ -670,6 +988,24 @@ async def get_current_volume_usd(
         )
 
     # -----------------------------------------------------------------------
+    # Pump.fun
+    # -----------------------------------------------------------------------
+
+    if token.source == "pumpfun":
+
+        # Pump.fun bonding curve data does not provide the same 24h volume
+        # metric used by the Anoncoin API.
+        #
+        # Never fabricate live volume.
+        return (
+            float(
+                token.volume_24h_usd
+                or 0.0
+            ),
+            True,
+        )
+
+    # -----------------------------------------------------------------------
     # Paper / simulated
     # -----------------------------------------------------------------------
 
@@ -681,4 +1017,4 @@ async def get_current_volume_usd(
             tick,
         ),
         True,
-    )
+)
