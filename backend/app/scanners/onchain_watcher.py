@@ -60,11 +60,12 @@ PUMPFUN_MINT_AUTHORITY = (
 )
 
 
-# Anchor discriminator for:
+# Anchor discriminators for Pump.fun token creation instructions.
 #
 #     global:create
+#     global:create_v2
 #
-# Pump.fun's create discriminator.
+# create_v2 is the current Token-2022 creation instruction.
 PUMPFUN_CREATE_DISCRIMINATOR = bytes(
     [
         24,
@@ -76,6 +77,24 @@ PUMPFUN_CREATE_DISCRIMINATOR = bytes(
         7,
         119,
     ]
+)
+
+PUMPFUN_CREATE_V2_DISCRIMINATOR = bytes(
+    [
+        214,
+        144,
+        76,
+        236,
+        95,
+        139,
+        49,
+        180,
+    ]
+)
+
+PUMPFUN_CREATE_DISCRIMINATORS = (
+    PUMPFUN_CREATE_DISCRIMINATOR,
+    PUMPFUN_CREATE_V2_DISCRIMINATOR,
 )
 
 
@@ -722,24 +741,39 @@ def _pubkey_string(
     """Convert a possible Solana pubkey representation to a string."""
 
     if value is None:
+        return None
+
+    if isinstance(
+        value,
+        dict,
+    ):
+        # jsonParsed / raw RPC account-key representations.
+        for key in (
+            "pubkey",
+            "publicKey",
+            "address",
+        ):
+            if key in value:
+                return _pubkey_string(
+                    value[key]
+                )
 
         return None
 
     try:
-
         return str(
             value
         )
 
     except Exception:
-
         return None
 
 
 def _instruction_program_id(
     instruction,
+    account_keys=None,
 ) -> Optional[str]:
-    """Get program ID from a partially-decoded Solana instruction."""
+    """Get program ID from native or raw JSON-RPC instruction."""
 
     program_id = getattr(
         instruction,
@@ -748,7 +782,6 @@ def _instruction_program_id(
     )
 
     if program_id is not None:
-
         return _pubkey_string(
             program_id
         )
@@ -760,10 +793,50 @@ def _instruction_program_id(
     )
 
     if program_id is not None:
-
         return _pubkey_string(
             program_id
         )
+
+    if isinstance(
+        instruction,
+        dict,
+    ):
+        program_id = instruction.get(
+            "programId"
+        )
+
+        if program_id is not None:
+            return _pubkey_string(
+                program_id
+            )
+
+        # Partially-decoded JSON-RPC instructions may expose the
+        # program as an account-key index.
+        program_index = instruction.get(
+            "programIdIndex"
+        )
+
+        if (
+            program_index is not None
+            and account_keys
+        ):
+            try:
+                program_index = int(
+                    program_index
+                )
+
+                if (
+                    0 <= program_index
+                    < len(account_keys)
+                ):
+                    return _pubkey_string(
+                        account_keys[
+                            program_index
+                        ]
+                    )
+
+            except Exception:
+                pass
 
     return None
 
@@ -773,39 +846,54 @@ def _instruction_data_bytes(
 ) -> Optional[bytes]:
     """Decode instruction data from a Solana instruction."""
 
-    data = getattr(
+    if isinstance(
         instruction,
-        "data",
-        None,
-    )
+        dict,
+    ):
+        data = instruction.get(
+            "data"
+        )
+
+    else:
+        data = getattr(
+            instruction,
+            "data",
+            None,
+        )
 
     if data is None:
-
         return None
 
     if isinstance(
         data,
         bytes,
     ):
-
         return data
 
     if isinstance(
         data,
         bytearray,
     ):
-
         return bytes(
             data
         )
 
     if isinstance(
         data,
+        list,
+    ):
+        try:
+            return bytes(
+                data
+            )
+        except Exception:
+            return None
+
+    if isinstance(
+        data,
         str,
     ):
-
         try:
-
             import base58
 
             return base58.b58decode(
@@ -815,13 +903,11 @@ def _instruction_data_bytes(
         except Exception:
 
             try:
-
                 return base64.b64decode(
                     data
                 )
 
             except Exception:
-
                 return None
 
     return None
@@ -829,44 +915,213 @@ def _instruction_data_bytes(
 
 def _instruction_accounts(
     instruction,
+    account_keys=None,
 ) -> list[str]:
-    """Return account addresses from a partially-decoded instruction."""
+    """Return account addresses from native or raw RPC instruction."""
 
-    accounts = getattr(
+    if isinstance(
         instruction,
-        "accounts",
-        None,
-    )
+        dict,
+    ):
+        accounts = instruction.get(
+            "accounts"
+        )
+
+    else:
+        accounts = getattr(
+            instruction,
+            "accounts",
+            None,
+        )
 
     if not accounts:
-
         return []
 
     result = []
 
     for account in accounts:
 
-        value = _pubkey_string(
-            account
-        )
-
-        if value:
-
-            result.append(
-                value
+        # Native solders instructions contain Pubkey objects.
+        if not isinstance(
+            account,
+            int,
+        ):
+            value = _pubkey_string(
+                account
             )
+
+            if value:
+                result.append(
+                    value
+                )
+
+            continue
+
+        # Raw JSON-RPC instructions may contain account-key indexes.
+        if (
+            account_keys
+            and 0 <= int(account)
+            < len(account_keys)
+        ):
+            value = _pubkey_string(
+                account_keys[
+                    int(account)
+                ]
+            )
+
+            if value:
+                result.append(
+                    value
+                )
 
     return result
 
 
+def _read_borsh_string(
+    data: bytes,
+    offset: int,
+) -> tuple[Optional[str], int]:
+    """Read a Borsh UTF-8 string from instruction arguments."""
+
+    if (
+        offset + 4
+        > len(data)
+    ):
+        return None, offset
+
+    length = int.from_bytes(
+        data[
+            offset:offset + 4
+        ],
+        byteorder="little",
+        signed=False,
+    )
+
+    offset += 4
+
+    if (
+        length < 0
+        or offset + length
+        > len(data)
+    ):
+        return None, offset
+
+    raw = data[
+        offset:offset + length
+    ]
+
+    offset += length
+
+    try:
+        return (
+            raw.decode(
+                "utf-8"
+            ),
+            offset,
+        )
+
+    except UnicodeDecodeError:
+        return None, offset
+
+
+def _extract_pumpfun_creator_from_data(
+    data: Optional[bytes],
+) -> Optional[str]:
+    """Extract creator pubkey from Pump.fun create/create_v2 args.
+
+    Both creation instructions encode:
+        name: string
+        symbol: string
+        uri: string
+        creator: pubkey
+
+    The remaining boolean arguments differ by instruction version,
+    so only the stable prefix is decoded here.
+    """
+
+    if not data:
+        return None
+
+    if data.startswith(
+        PUMPFUN_CREATE_V2_DISCRIMINATOR
+    ):
+        offset = len(
+            PUMPFUN_CREATE_V2_DISCRIMINATOR
+        )
+
+    elif data.startswith(
+        PUMPFUN_CREATE_DISCRIMINATOR
+    ):
+        offset = len(
+            PUMPFUN_CREATE_DISCRIMINATOR
+        )
+
+    else:
+        return None
+
+    for _ in range(3):
+        _, offset = _read_borsh_string(
+            data,
+            offset,
+        )
+
+        if offset > len(data):
+            return None
+
+    if (
+        offset + 32
+        > len(data)
+    ):
+        return None
+
+    creator_bytes = data[
+        offset:offset + 32
+    ]
+
+    try:
+        return str(
+            Pubkey.from_bytes(
+                creator_bytes
+            )
+        )
+
+    except Exception:
+        return None
+
+
+def _pumpfun_create_version(
+    instruction,
+) -> Optional[str]:
+    data = _instruction_data_bytes(
+        instruction
+    )
+
+    if not data:
+        return None
+
+    if data.startswith(
+        PUMPFUN_CREATE_V2_DISCRIMINATOR
+    ):
+        return "create_v2"
+
+    if data.startswith(
+        PUMPFUN_CREATE_DISCRIMINATOR
+    ):
+        return "create"
+
+    return None
+
+
 def _is_pumpfun_create_instruction(
     instruction,
+    account_keys=None,
 ) -> bool:
-    """Return True only for Pump.fun's actual create instruction."""
+    """Return True for Pump.fun create or create_v2."""
 
     program_id = (
         _instruction_program_id(
-            instruction
+            instruction,
+            account_keys,
         )
     )
 
@@ -874,7 +1129,6 @@ def _is_pumpfun_create_instruction(
         program_id
         != PUMPFUN_PROGRAM_ID
     ):
-
         return False
 
     data = (
@@ -884,23 +1138,139 @@ def _is_pumpfun_create_instruction(
     )
 
     if not data:
-
         return False
 
-    return data[
-        : len(
-            PUMPFUN_CREATE_DISCRIMINATOR
+    return any(
+        data.startswith(
+            discriminator
         )
-    ] == PUMPFUN_CREATE_DISCRIMINATOR
+        for discriminator in (
+            PUMPFUN_CREATE_DISCRIMINATORS
+        )
+    )
 
 
-def extract_pumpfun_create(
+def _raw_transaction_account_keys(
+    tx: dict,
+) -> list:
+    """Return raw RPC account keys from getTransaction."""
+
+    message = (
+        tx.get(
+            "transaction",
+            {},
+        )
+        .get(
+            "message",
+            {},
+        )
+    )
+
+    return message.get(
+        "accountKeys",
+        [],
+    )
+
+
+def _raw_transaction_instructions(
+    tx: dict,
+) -> list:
+    """Return raw outer instructions from getTransaction."""
+
+    message = (
+        tx.get(
+            "transaction",
+            {},
+        )
+        .get(
+            "message",
+            {},
+        )
+    )
+
+    return message.get(
+        "instructions",
+        []
+    )
+
+
+def _extract_pumpfun_create_from_instructions(
+    instructions,
+    account_keys=None,
+) -> Optional[dict]:
+    """Extract a Pump.fun launch from a list of instructions."""
+
+    if not instructions:
+        return None
+
+    for instruction in instructions:
+
+        if not _is_pumpfun_create_instruction(
+            instruction,
+            account_keys,
+        ):
+            continue
+
+        accounts = (
+            _instruction_accounts(
+                instruction,
+                account_keys,
+            )
+        )
+
+        if not accounts:
+            continue
+
+        # Pump.fun create/create_v2 account 0 is the new mint.
+        mint = accounts[0]
+
+        if (
+            not mint
+            or mint == SOL_MINT
+        ):
+            continue
+
+        data = (
+            _instruction_data_bytes(
+                instruction
+            )
+        )
+
+        creator = (
+            _extract_pumpfun_creator_from_data(
+                data
+            )
+        )
+
+        # Legacy create has the user/creator at account index 7.
+        # Keep this fallback for older transactions if Borsh decoding
+        # is unavailable.
+        if (
+            creator is None
+            and len(accounts) > 7
+        ):
+            creator = accounts[7]
+
+        return {
+            "mint": mint,
+            "creator": creator,
+            "source": "pumpfun",
+            "instruction": (
+                _pumpfun_create_version(
+                    instruction
+                )
+            ),
+        }
+
+    return None
+
+
+def _extract_pumpfun_create_from_native_tx(
     tx,
 ) -> Optional[dict]:
-    """Extract a Pump.fun launch from a transaction."""
+    """Extract a Pump.fun launch from a solders transaction response."""
 
     try:
-
         message = (
             tx.transaction.transaction.message
         )
@@ -908,7 +1278,6 @@ def extract_pumpfun_create(
     except Exception:
 
         try:
-
             message = (
                 tx.transaction.message
             )
@@ -928,48 +1297,64 @@ def extract_pumpfun_create(
         None,
     )
 
-    if not instructions:
+    return (
+        _extract_pumpfun_create_from_instructions(
+            instructions
+        )
+    )
 
+
+def _extract_pumpfun_create_from_raw_tx(
+    tx: dict,
+) -> Optional[dict]:
+    """Extract a Pump.fun launch from raw JSON-RPC getTransaction data."""
+
+    if not isinstance(
+        tx,
+        dict,
+    ):
         return None
 
-    for instruction in instructions:
+    account_keys = (
+        _raw_transaction_account_keys(
+            tx
+        )
+    )
 
-        if not _is_pumpfun_create_instruction(
-            instruction
-        ):
+    instructions = (
+        _raw_transaction_instructions(
+            tx
+        )
+    )
 
-            continue
+    return (
+        _extract_pumpfun_create_from_instructions(
+            instructions,
+            account_keys,
+        )
+    )
 
-        accounts = (
-            _instruction_accounts(
-                instruction
-            )
+
+def extract_pumpfun_create(
+    tx,
+) -> Optional[dict]:
+    """Extract a Pump.fun create/create_v2 launch.
+
+    Supports both the native solana-py/solders response and the raw
+    JSON-RPC fallback response.
+    """
+
+    if isinstance(
+        tx,
+        dict,
+    ):
+        return _extract_pumpfun_create_from_raw_tx(
+            tx
         )
 
-        if not accounts:
-
-            continue
-
-        # Pump.fun create account 0 = mint.
-        mint = accounts[0]
-
-        if mint == SOL_MINT:
-
-            continue
-
-        creator = (
-            accounts[7]
-            if len(accounts) > 7
-            else None
-        )
-
-        return {
-            "mint": mint,
-            "creator": creator,
-            "source": "pumpfun",
-        }
-
-    return None
+    return _extract_pumpfun_create_from_native_tx(
+        tx
+    )
 
 
 # ---------------------------------------------------------------------------
