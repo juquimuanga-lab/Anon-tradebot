@@ -97,6 +97,18 @@ SOURCE_PUMPFUN = "pumpfun"
 SOURCE_MOCK = "mock_simulated"
 
 
+def _is_anoncoin_source(source: str) -> bool:
+    """True for any Anoncoin-origin source tag.
+
+    Covers both the on-chain watcher tag (anoncoin_onchain) and the
+    legacy Anoncoin-API discovery tag (anoncoin), so the
+    anoncoin_trading_enabled toggle applies no matter which path
+    produced the token.
+    """
+
+    return bool(source) and source.startswith("anoncoin")
+
+
 # ---------------------------------------------------------------------------
 # Scanner service
 # ---------------------------------------------------------------------------
@@ -668,6 +680,44 @@ class ScannerService:
 
         if not state.trading_enabled:
             return False
+
+        if (
+            _is_anoncoin_source(token.source)
+            and not state.anoncoin_trading_enabled
+        ):
+
+            await repo.save_trade_decision(
+                token.mint,
+                rule_row.id,
+                "skip",
+                (
+                    "Anoncoin trading is currently "
+                    "disabled (/enableanoncoin to "
+                    "resume) - skipped"
+                ),
+                score_result.score,
+            )
+
+            return True
+
+        if (
+            token.source == SOURCE_PUMPFUN
+            and not state.pumpfun_trading_enabled
+        ):
+
+            await repo.save_trade_decision(
+                token.mint,
+                rule_row.id,
+                "skip",
+                (
+                    "Pump.fun trading is currently "
+                    "disabled (/enablepumpfun to "
+                    "resume) - skipped"
+                ),
+                score_result.score,
+            )
+
+            return True
 
         if (
             state.mode == "live"
