@@ -36,6 +36,8 @@ async def get_or_create_bot_state() -> BotState:
                 id=1,
                 mode=settings.trading_mode,
                 trading_enabled=True,
+                anoncoin_trading_enabled=True,
+                pumpfun_trading_enabled=True,
                 paper_balance_sol=(
                     settings.paper_starting_balance_sol
                 ),
