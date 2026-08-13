@@ -69,7 +69,55 @@ async def disable_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
           InlineKeyboardButton("Cancel", callback_data=f"confirm:{token}:no")]]
     )
     await update.message.reply_text(
-        "This will immediately pause ALL automated trading. Confirm?", reply_markup=keyboard
+        "This will immediately pause ALL automated trading - no new buys, and no "
+        "automated stop loss / take profit / trailing stop on positions you already "
+        "have open. Manual `/positions close <id>` still works while paused. Confirm?",
+        parse_mode="Markdown",
+        reply_markup=keyboard,
+    )
+
+
+@admin_required
+async def enableanoncoin_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await repo.update_bot_state(anoncoin_trading_enabled=True)
+    await repo.write_audit_log(str(update.effective_user.id), "enable_anoncoin", {})
+    await update.message.reply_text("Anoncoin trading resumed (Pump.fun unaffected).")
+
+
+@admin_required
+async def disableanoncoin_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    token = confirmation_store.create("disable_anoncoin", {})
+    keyboard = InlineKeyboardMarkup(
+        [[InlineKeyboardButton("Confirm disable Anoncoin", callback_data=f"confirm:{token}:yes"),
+          InlineKeyboardButton("Cancel", callback_data=f"confirm:{token}:no")]]
+    )
+    await update.message.reply_text(
+        "This pauses new Anoncoin buys only - Pump.fun keeps trading, and any open "
+        "Anoncoin positions you already hold keep their automated stop loss / take "
+        "profit. Confirm?",
+        reply_markup=keyboard,
+    )
+
+
+@admin_required
+async def enablepumpfun_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await repo.update_bot_state(pumpfun_trading_enabled=True)
+    await repo.write_audit_log(str(update.effective_user.id), "enable_pumpfun", {})
+    await update.message.reply_text("Pump.fun trading resumed (Anoncoin unaffected).")
+
+
+@admin_required
+async def disablepumpfun_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    token = confirmation_store.create("disable_pumpfun", {})
+    keyboard = InlineKeyboardMarkup(
+        [[InlineKeyboardButton("Confirm disable Pump.fun", callback_data=f"confirm:{token}:yes"),
+          InlineKeyboardButton("Cancel", callback_data=f"confirm:{token}:no")]]
+    )
+    await update.message.reply_text(
+        "This pauses new Pump.fun buys only - Anoncoin keeps trading, and any open "
+        "Pump.fun positions you already hold keep their automated stop loss / take "
+        "profit. Confirm?",
+        reply_markup=keyboard,
     )
 
 
@@ -123,6 +171,16 @@ async def confirmation_callback(update: Update, context: ContextTypes.DEFAULT_TY
         await repo.update_bot_state(trading_enabled=False)
         await repo.write_audit_log(str(update.effective_user.id), "disable_all_confirmed", {})
         await query.edit_message_text("All automated trading has been paused.")
+
+    elif entry.action == "disable_anoncoin":
+        await repo.update_bot_state(anoncoin_trading_enabled=False)
+        await repo.write_audit_log(str(update.effective_user.id), "disable_anoncoin_confirmed", {})
+        await query.edit_message_text("Anoncoin trading paused. Pump.fun is unaffected.")
+
+    elif entry.action == "disable_pumpfun":
+        await repo.update_bot_state(pumpfun_trading_enabled=False)
+        await repo.write_audit_log(str(update.effective_user.id), "disable_pumpfun_confirmed", {})
+        await query.edit_message_text("Pump.fun trading paused. Anoncoin is unaffected.")
 
     elif entry.action == "switch_mode":
         mode = entry.payload["mode"]
