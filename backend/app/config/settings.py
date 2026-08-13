@@ -115,6 +115,52 @@ class Settings(BaseSettings):
         validation_alias="PUMPFUN_PROGRAM_ID",
     )
 
+
+    # ------------------------------------------------------------------
+    # Solana Tracker / Smart Money (Phase 1)
+    #
+    # Phase 1 is observational only. It NEVER becomes a required
+    # qualification condition and does not change the existing trade
+    # decision path.
+    # ------------------------------------------------------------------
+
+    solana_tracker_api_key: Optional[str] = Field(
+        default=None,
+        validation_alias="SOLANA_TRACKER_API_KEY",
+    )
+
+    smart_money_wallets_raw: str = Field(
+        default=(
+            "6cNjLym8bDZ5JFGFSDom2us27iF7EBHYUXdFCdC5zWhX"
+        ),
+        validation_alias="SMART_MONEY_WALLETS",
+    )
+
+    smart_money_enabled: bool = Field(
+        default=True,
+        validation_alias="SMART_MONEY_ENABLED",
+    )
+
+    smart_money_min_buy_usd: float = Field(
+        default=50.0,
+        validation_alias="SMART_MONEY_MIN_BUY_USD",
+    )
+
+    smart_money_max_trades_per_token: int = Field(
+        default=100,
+        validation_alias="SMART_MONEY_MAX_TRADES_PER_TOKEN",
+    )
+
+    smart_money_trade_lookback_seconds: int = Field(
+        default=180,
+        validation_alias="SMART_MONEY_TRADE_LOOKBACK_SECONDS",
+    )
+
+    smart_money_wallet_cache_seconds: int = Field(
+        default=3600,
+        validation_alias="SMART_MONEY_WALLET_CACHE_SECONDS",
+    )
+
     # ------------------------------------------------------------------
     # Persistence
     # ------------------------------------------------------------------
@@ -233,6 +279,17 @@ class Settings(BaseSettings):
     def creator_watchlist(self) -> List[str]:
         return _split_csv(
             self.creator_watchlist_raw
+        )
+
+
+    # ------------------------------------------------------------------
+    # Smart-money wallet list
+    # ------------------------------------------------------------------
+
+    @property
+    def smart_money_wallets(self) -> List[str]:
+        return _split_csv(
+            self.smart_money_wallets_raw
         )
 
 
