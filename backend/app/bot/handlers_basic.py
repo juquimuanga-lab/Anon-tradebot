@@ -25,6 +25,10 @@ HELP_TEXT = (
     "/activaterule <id> - switch which of your own rules is active (see /listrules for IDs)\n"
     "/enable - resume automated trading\n"
     "/disable - pause automated trading (confirm)\n"
+    "/enableanoncoin - resume Anoncoin trading only\n"
+    "/disableanoncoin - pause Anoncoin trading only (confirm)\n"
+    "/enablepumpfun - resume Pump.fun trading only\n"
+    "/disablepumpfun - pause Pump.fun trading only (confirm)\n"
     "/paper - switch to paper mode (confirm)\n"
     "/live - switch to live mode (confirm)\n"
     "\nEach admin's rules run independently - activating or editing your rule "
@@ -65,6 +69,8 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
     text = (
         f"*Mode:* {state.mode} | *Trading enabled:* {state.trading_enabled}\n"
+        f"*Anoncoin trading:* {state.anoncoin_trading_enabled} | "
+        f"*Pump.fun trading:* {state.pumpfun_trading_enabled}\n"
         f"*Your active rule:* {rule_line}\n"
         f"*Connected APIs:* Anoncoin: {anoncoin_connected}, Helius: {helius_connected}\n"
         f"*Your wallet:* {wallet_line}\n"
