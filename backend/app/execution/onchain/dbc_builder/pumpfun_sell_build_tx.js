@@ -642,7 +642,7 @@ async function main() {
   // NEVER use JavaScript floating point for SPL token base units.
   //
 
-  const amount =
+  let amount =
     new BN(
       String(
         amountTokensRaw
@@ -915,15 +915,33 @@ async function main() {
   // -------------------------------------------------------------------------
   // Never attempt to sell more than the wallet owns
   // -------------------------------------------------------------------------
+  //
+  // The requested amount is computed upstream from the position size
+  // Python has tracked in its database, which starts as an ESTIMATE at
+  // buy time (SOL spent / quoted price) rather than the exact amount
+  // actually received. Pump.fun's bonding curve means the real fill is
+  // always slightly worse than the quote, so this estimate can end up a
+  // little higher than what the wallet truly holds.
+  //
+  // Previously this threw and aborted the sell outright, which left
+  // stop-loss exits stuck retrying the same oversized amount forever
+  // (and flooding Telegram with repeated "sell failed" alerts) instead
+  // of actually getting out of the position.
+  //
+  // Clamp down to the wallet's real, on-chain balance and sell that
+  // instead. This can only ever sell less than or equal to what was
+  // requested, never more, so it never risks selling tokens the wallet
+  // doesn't have.
+
+  let amountClamped = false;
 
   if (
     amount.gt(
       walletBalanceBN
     )
   ) {
-    throw new Error(
-      "pumpfun_sell_amount_exceeds_wallet_balance"
-    );
+    amount = walletBalanceBN;
+    amountClamped = true;
   }
 
 
@@ -1267,6 +1285,9 @@ if (
 
       amount_tokens_raw:
         amount.toString(),
+
+      amount_clamped:
+        amountClamped,
 
       wallet_token_balance_raw:
         walletBalanceBN.toString(),
