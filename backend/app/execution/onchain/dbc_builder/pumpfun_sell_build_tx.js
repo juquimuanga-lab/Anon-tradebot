@@ -1,8 +1,6 @@
 /**
  * Pump.fun unsigned SELL transaction builder.
  *
- * V6
- *
  * Architecture:
  *
  *     Python
@@ -31,18 +29,11 @@
  * Pump.fun bonding-curve sells only.
  * Graduated tokens must be routed through the AMM executor.
  *
- * V6 FIXES:
- *
- * 1. UserVolumeAccumulator is inserted as the FIRST
- *    remaining account, not appended to the end.
- *
- * 2. Existing accumulator entries are removed and reinserted
- *    at the correct remaining-account position.
- *
- * 3. The accumulator is always writable.
- *
- * 4. Existing ATA / Token-2022 / wallet-balance protections
- *    from V5 are preserved.
+ * V6:
+ * - Uses the Pump SDK/IDL account layout directly.
+ * - Does NOT manually append UserVolumeAccumulator as a remaining account.
+ * - The current Pump SDK supplies UserVolumeAccumulator in the fixed sell
+ *   account list; manually appending it creates an invalid cashback account.
  */
 
 const {
@@ -57,7 +48,6 @@ const {
   OnlinePumpSdk,
   getSellSolAmountFromTokenAmount,
   bondingCurvePda,
-  userVolumeAccumulatorPda,
 } = require("@pump-fun/pump-sdk");
 
 const {
@@ -68,6 +58,7 @@ const {
   TOKEN_2022_PROGRAM_ID,
   ASSOCIATED_TOKEN_PROGRAM_ID,
 } = require("@solana/spl-token");
+
 
 const BN = require("bn.js");
 const bs58 = require("bs58");
@@ -97,7 +88,7 @@ const FALLBACK_PRIORITY_FEE_MICROLAMPORTS = 10_000;
 //     1 = 1%
 //     3 = 3%
 //     5 = 5%
-// ---------------------------------------------------------------------------
+//
 
 function slippageBpsToPercent(
   slippageBps
@@ -324,11 +315,10 @@ function requirePositiveInteger(
 // Direct wallet token balance
 // ---------------------------------------------------------------------------
 //
+// The installed Pump.fun SDK does not reliably expose getTokenBalance().
 // Read the wallet's parsed token accounts directly from Solana RPC.
 //
-// This supports:
-// - classic SPL Token
-// - Token-2022
+// This supports normal SPL Token and Token-2022 accounts.
 // ---------------------------------------------------------------------------
 
 async function getWalletTokenBalance(
@@ -377,6 +367,16 @@ async function getWalletTokenBalance(
 // ---------------------------------------------------------------------------
 // Resolve the token program from the actual mint account
 // ---------------------------------------------------------------------------
+//
+// fetchSellState() defaults to classic TOKEN_PROGRAM_ID when no
+// tokenProgram is passed in, and pump.fun's current token creation path
+// (createV2) mints under TOKEN_2022_PROGRAM_ID. Relying on that default
+// derives the associated token account at the wrong address for any
+// Token-2022 mint.
+//
+// The mint account's owner is authoritative, so resolve the token program
+// directly from the mint before asking the SDK for sell state.
+// ---------------------------------------------------------------------------
 
 async function resolveActualTokenProgram(
   connection,
@@ -419,301 +419,23 @@ async function resolveActualTokenProgram(
 }
 
 
-// ---------------------------------------------------------------------------
-// Pump UserVolumeAccumulator
-// ---------------------------------------------------------------------------
-//
-// Pump's bonding-curve Sell instruction requires the Pump-program
-// UserVolumeAccumulator PDA as the FIRST REMAINING ACCOUNT.
-//
-// IMPORTANT:
-//
-// The account is NOT simply appended to the end of the complete
-// account list.
-//
-// Pump's current documentation specifies:
-//
-//     remaining_accounts[0] = UserVolumeAccumulator
-//
-// and:
-//
-//     isWritable = true
-//
-// ---------------------------------------------------------------------------
-
-const PUMP_PROGRAM_ID =
-  new PublicKey(
-    "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P"
-  );
-
-
-function resolveUserVolumeAccumulatorPda(
-  user
-) {
-  if (
-    typeof userVolumeAccumulatorPda ===
-    "function"
-  ) {
-    return userVolumeAccumulatorPda(
-      user
-    );
-  }
-
-  const [
-    pda
-  ] =
-    PublicKey.findProgramAddressSync(
-      [
-        Buffer.from(
-          "user_volume_accumulator"
-        ),
-
-        user.toBuffer(),
-      ],
-
-      PUMP_PROGRAM_ID
-    );
-
-  return pda;
-}
-
-
-async function prepareUserVolumeAccumulator(
-  connection,
-  user,
-  payer,
-  offlineSdk
-) {
-  const accumulator =
-    resolveUserVolumeAccumulatorPda(
-      user
-    );
-
-  const accountInfo =
-    await connection.getAccountInfo(
-      accumulator,
-      "processed"
-    );
-
-  if (
-    accountInfo
-  ) {
-    return {
-      accumulator,
-
-      setupInstructions: [],
-
-      initialized: false,
-    };
-  }
-
-  if (
-    !offlineSdk ||
-    typeof offlineSdk.initUserVolumeAccumulator !==
-      "function"
-  ) {
-    throw new Error(
-      "pumpfun_init_user_volume_accumulator_method_unavailable"
-    );
-  }
-
-  const initInstruction =
-    await offlineSdk.initUserVolumeAccumulator({
-      payer,
-
-      user,
-    });
-
-  return {
-    accumulator,
-
-    setupInstructions: [
-      initInstruction,
-    ],
-
-    initialized: true,
-  };
-}
-
 
 // ---------------------------------------------------------------------------
-// V6 FIX:
-// Put UserVolumeAccumulator at remaining-account index ZERO.
-//
-// This is the critical fix for:
-//
-//     Error Code: 6073
-//     InvalidCashbackAccumulator
-//
-// V5 incorrectly moved/appended the accumulator to the end of
-// sellInstruction.keys.
-//
-// The Pump instruction has a fixed account section followed by
-// remaining accounts.
-//
-// Current Pump documentation requires:
-//
-//     remaining_accounts[0] = UserVolumeAccumulator
-//
-// Therefore the accumulator belongs immediately AFTER the fixed
-// Pump Sell accounts.
-//
-// For the current bonding-curve Sell layout, the fixed account
-// section contains 16 accounts.
-//
-// Therefore:
-//
-//     keys[16] = UserVolumeAccumulator
-//
-// If an older/newer SDK has already included the accumulator,
-// we remove it first and put it back at the correct position.
-//
-// ---------------------------------------------------------------------------
-
-const PUMP_BONDING_CURVE_SELL_FIXED_ACCOUNT_COUNT = 16;
-
-
-function ensureUserVolumeAccumulatorRemainingAccount(
-  instructions,
-  accumulator
-) {
-  if (
-    !instructions ||
-    !Array.isArray(
-      instructions
-    ) ||
-    instructions.length === 0
-  ) {
-    throw new Error(
-      "pumpfun_sell_instructions_empty"
-    );
-  }
-
-  // The Pump Sell instruction is the final instruction returned
-  // by the raw/high-level builder in our execution path.
-  const sellInstruction =
-    instructions[
-      instructions.length - 1
-    ];
-
-  if (
-    !sellInstruction ||
-    !Array.isArray(
-      sellInstruction.keys
-    )
-  ) {
-    throw new Error(
-      "pumpfun_sell_instruction_keys_missing"
-    );
-  }
-
-
-  // ---------------------------------------------------------------
-  // Remove EVERY existing occurrence first.
-  // ---------------------------------------------------------------
-  //
-  // This prevents duplicate accumulator accounts if an SDK version
-  // already included one.
-  // ---------------------------------------------------------------
-
-  sellInstruction.keys =
-    sellInstruction.keys.filter(
-      (key) => {
-        if (
-          !key ||
-          !key.pubkey
-        ) {
-          return true;
-        }
-
-        return !key.pubkey.equals(
-          accumulator
-        );
-      }
-    );
-
-
-  // ---------------------------------------------------------------
-  // Insert accumulator as FIRST remaining account.
-  // ---------------------------------------------------------------
-
-  const fixedAccountCount =
-    PUMP_BONDING_CURVE_SELL_FIXED_ACCOUNT_COUNT;
-
-  if (
-    sellInstruction.keys.length <
-    fixedAccountCount
-  ) {
-    throw new Error(
-      "pumpfun_sell_instruction_has_fewer_than_expected_fixed_accounts"
-    );
-  }
-
-
-  sellInstruction.keys.splice(
-    fixedAccountCount,
-    0,
-    {
-      pubkey:
-        accumulator,
-
-      isSigner:
-        false,
-
-      isWritable:
-        true,
-    }
-  );
-
-
-  // ---------------------------------------------------------------
-  // Verify our own construction.
-  // ---------------------------------------------------------------
-
-  const accumulatorIndex =
-    sellInstruction.keys.findIndex(
-      (key) =>
-        key &&
-        key.pubkey &&
-        key.pubkey.equals(
-          accumulator
-        )
-    );
-
-  if (
-    accumulatorIndex !==
-    fixedAccountCount
-  ) {
-    throw new Error(
-      `pumpfun_user_volume_accumulator_wrong_position:index=${accumulatorIndex}`
-    );
-  }
-
-  if (
-    sellInstruction.keys[
-      fixedAccountCount
-    ].isWritable !== true
-  ) {
-    throw new Error(
-      "pumpfun_user_volume_accumulator_not_writable"
-    );
-  }
-
-
-  console.error(
-    "Pump.fun V6: UserVolumeAccumulator attached at remaining-account index 0"
-  );
-}
-
-
-// ---------------------------------------------------------------------------
-// Prepare Pump.fun bonding curve ATA
+// FIX: Prepare Pump.fun bonding curve ATA
 // ---------------------------------------------------------------------------
 //
-// Pump.fun's Sell instruction expects the bonding curve's associated
-// token account to already be initialized.
+// Pump.fun's Sell instruction expects the bonding curve's associated token
+// account to already be initialized.
 //
-// If that ATA does not exist, create it idempotently before Sell.
+// If that ATA does not exist, the Sell instruction fails:
+//
+//     AccountNotInitialized
+//     Error Number: 3012
+//     account: associatedbondingcurve
+//
+// We therefore derive the ATA from the ACTUAL bonding curve PDA and mint,
+// check whether it exists, and create it idempotently before the Sell
+// instruction when necessary.
 // ---------------------------------------------------------------------------
 
 async function prepareBondingCurveAta(
@@ -738,14 +460,10 @@ async function prepareBondingCurveAta(
       "processed"
     );
 
-  if (
-    accountInfo
-  ) {
+  if (accountInfo) {
     return {
       associatedBondingCurve,
-
       setupInstructions: [],
-
       ataCreated: false,
     };
   }
@@ -762,11 +480,9 @@ async function prepareBondingCurveAta(
 
   return {
     associatedBondingCurve,
-
     setupInstructions: [
       createInstruction,
     ],
-
     ataCreated: true,
   };
 }
@@ -798,18 +514,12 @@ async function prepareCanonicalSellAccount(
       "processed"
     );
 
-  if (
-    associatedAccountInfo
-  ) {
+  if (associatedAccountInfo) {
     return {
       associatedTokenAddress,
-
       setupInstructions: [],
-
       ataCreated: false,
-
-      tokensMovedToAta:
-        new BN(0),
+      tokensMovedToAta: new BN(0),
     };
   }
 
@@ -839,9 +549,7 @@ async function prepareCanonicalSellAccount(
     const rawAmount =
       info?.tokenAmount?.amount;
 
-    if (
-      !rawAmount
-    ) {
+    if (!rawAmount) {
       continue;
     }
 
@@ -878,7 +586,6 @@ async function prepareCanonicalSellAccount(
 
     sourceAccounts.push({
       source,
-
       balance,
     });
 
@@ -974,17 +681,15 @@ async function prepareCanonicalSellAccount(
 
   return {
     associatedTokenAddress,
-
     setupInstructions,
-
     ataCreated: true,
-
     tokensMovedToAta:
       new BN(
         amount.toString()
       ),
   };
 }
+
 
 // ---------------------------------------------------------------------------
 // Main
@@ -1206,7 +911,7 @@ async function main() {
 
 
   // -------------------------------------------------------------------------
-  // Fetch current Pump state
+  // Fetch all required state
   // -------------------------------------------------------------------------
 
   const [
@@ -1254,13 +959,11 @@ async function main() {
   const {
     bondingCurveAccountInfo,
     bondingCurve,
-    tokenProgram:
-      sdkTokenProgram,
+    tokenProgram: sdkTokenProgram,
   } = sellState;
 
   const tokenProgram =
     actualTokenProgram;
-
 
   if (
     sdkTokenProgram &&
@@ -1335,7 +1038,6 @@ async function main() {
       walletBalance.toString()
     );
 
-
   if (
     walletBalanceBN.lte(
       new BN(0)
@@ -1351,8 +1053,7 @@ async function main() {
   // Never attempt to sell more than wallet owns
   // -------------------------------------------------------------------------
 
-  let amountClamped =
-    false;
+  let amountClamped = false;
 
   if (
     amount.gt(
@@ -1407,7 +1108,6 @@ async function main() {
     );
   }
 
-
   if (
     !expectedSolAmount
   ) {
@@ -1416,12 +1116,10 @@ async function main() {
     );
   }
 
-
   const expectedSolBN =
     new BN(
       expectedSolAmount.toString()
     );
-
 
   if (
     expectedSolBN.lte(
@@ -1457,15 +1155,14 @@ async function main() {
 
 
   // -------------------------------------------------------------------------
-  // Build Pump.fun Sell parameters
+  // Build sell instructions
   // -------------------------------------------------------------------------
 
   const sellInstructionParams = {
     ...sellState,
 
-    // Always use the token program resolved directly from
-    // the actual mint account.
-
+    // Always force the token program resolved from the mint.
+    // This prevents the SDK from deriving/checking the wrong ATA.
     tokenProgram,
 
     global,
@@ -1489,49 +1186,12 @@ async function main() {
   };
 
 
-  // -------------------------------------------------------------------------
-  // Offline SDK
-  // -------------------------------------------------------------------------
-
   const offlineSdk =
     new PumpSdk();
 
 
   // -------------------------------------------------------------------------
-  // V6:
-  // Prepare UserVolumeAccumulator BEFORE building Sell.
-  // -------------------------------------------------------------------------
-
-  const userVolumeAccumulatorPreparation =
-    await prepareUserVolumeAccumulator(
-      connection,
-
-      user,
-
-      user,
-
-      offlineSdk
-    );
-
-
-  console.error(
-    "Pump.fun V6 UserVolumeAccumulator: " +
-    userVolumeAccumulatorPreparation
-      .accumulator
-      .toBase58()
-  );
-
-  console.error(
-    "Pump.fun V6 accumulator initialized: " +
-    String(
-      userVolumeAccumulatorPreparation
-        .initialized
-    )
-  );
-
-
-  // -------------------------------------------------------------------------
-  // Prepare bonding curve ATA
+  // FIX: Prepare bonding curve ATA BEFORE Pump.fun Sell
   // -------------------------------------------------------------------------
 
   const bondingCurveAddress =
@@ -1539,17 +1199,12 @@ async function main() {
       mint
     );
 
-
   const bondingCurveAtaPreparation =
     await prepareBondingCurveAta(
       connection,
-
       user,
-
       bondingCurveAddress,
-
       mint,
-
       tokenProgram
     );
 
@@ -1561,13 +1216,9 @@ async function main() {
   const sellAccountPreparation =
     await prepareCanonicalSellAccount(
       connection,
-
       user,
-
       mint,
-
       tokenProgram,
-
       amount
     );
 
@@ -1577,16 +1228,12 @@ async function main() {
   // -------------------------------------------------------------------------
 
   let instructions;
-
   let sellBuilderMode;
-
 
   try {
 
     const canonicalAtaExists =
-      !sellAccountPreparation
-        .ataCreated;
-
+      !sellAccountPreparation.ataCreated;
 
     if (
       canonicalAtaExists
@@ -1601,16 +1248,13 @@ async function main() {
         );
       }
 
-
       instructions =
         await offlineSdk.sellInstructions(
           sellInstructionParams
         );
 
-
       sellBuilderMode =
         "high-level";
-
 
     } else {
 
@@ -1623,18 +1267,15 @@ async function main() {
         );
       }
 
-
       instructions = [
         await offlineSdk.getSellInstructionRaw(
           sellInstructionParams
         ),
       ];
 
-
       sellBuilderMode =
         "raw-canonical-ata-recovery";
     }
-
 
   } catch (error) {
 
@@ -1647,10 +1288,6 @@ async function main() {
     );
   }
 
-
-  // -------------------------------------------------------------------------
-  // Validate returned instructions
-  // -------------------------------------------------------------------------
 
   if (
     !instructions ||
@@ -1667,29 +1304,10 @@ async function main() {
 
 
   // -------------------------------------------------------------------------
-  // V6 CRITICAL FIX:
-  //
-  // Put UserVolumeAccumulator at remaining-account index 0.
-  //
-  // DO NOT append it to the end.
-  // -------------------------------------------------------------------------
-
-  ensureUserVolumeAccumulatorRemainingAccount(
-    instructions,
-
-    userVolumeAccumulatorPreparation
-      .accumulator
-  );
-
-
-  // -------------------------------------------------------------------------
   // Prepend required account setup instructions
   // -------------------------------------------------------------------------
 
   const setupInstructions = [
-    ...userVolumeAccumulatorPreparation
-      .setupInstructions,
-
     ...bondingCurveAtaPreparation
       .setupInstructions,
 
@@ -1704,7 +1322,6 @@ async function main() {
   ) {
     instructions = [
       ...setupInstructions,
-
       ...instructions,
     ];
   }
@@ -1717,10 +1334,8 @@ async function main() {
   const tx =
     new Transaction();
 
-
   tx.feePayer =
     user;
-
 
   tx.add(
     ...instructions
@@ -1736,7 +1351,6 @@ async function main() {
       "processed"
     );
 
-
   tx.recentBlockhash =
     initialBlockhash.blockhash;
 
@@ -1748,24 +1362,19 @@ async function main() {
   let priorityFeeMicroLamports =
     FALLBACK_PRIORITY_FEE_MICROLAMPORTS;
 
-
   let priorityFeeSource =
     "fallback";
-
 
   try {
 
     priorityFeeMicroLamports =
       await getPriorityFeeEstimate(
         connection,
-
         tx
       );
 
-
     priorityFeeSource =
       "helius-high";
-
 
   } catch (feeError) {
 
@@ -1786,7 +1395,6 @@ async function main() {
   let priorityFeeInstructionAdded =
     false;
 
-
   if (
     !hasComputeUnitPriceInstruction(
       tx
@@ -1801,10 +1409,10 @@ async function main() {
         })
     );
 
-
     priorityFeeInstructionAdded =
       true;
-    }
+  }
+
 
   // -------------------------------------------------------------------------
   // Final fresh blockhash
@@ -1814,7 +1422,6 @@ async function main() {
     await connection.getLatestBlockhash(
       "processed"
     );
-
 
   tx.recentBlockhash =
     finalBlockhash.blockhash;
@@ -1835,7 +1442,7 @@ async function main() {
 
 
   // -------------------------------------------------------------------------
-  // Return unsigned transaction to Python
+  // Return transaction to Python
   // -------------------------------------------------------------------------
 
   process.stdout.write(
@@ -1920,24 +1527,6 @@ async function main() {
         bondingCurveAtaPreparation
           .ataCreated,
 
-      user_volume_accumulator:
-        userVolumeAccumulatorPreparation
-          .accumulator
-          .toBase58(),
-
-      user_volume_accumulator_initialized:
-        userVolumeAccumulatorPreparation
-          .initialized,
-
-      user_volume_accumulator_attached:
-        true,
-
-      user_volume_accumulator_remaining_index:
-        0,
-
-      pump_program_id:
-        PUMP_PROGRAM_ID.toBase58(),
-
       sell_builder_mode:
         sellBuilderMode,
 
@@ -1972,8 +1561,8 @@ main().catch(
       }) + "\n"
     );
 
-    // The Python wrapper treats the JSON response as the
-    // authoritative result.
+    // The Python wrapper treats the JSON response as the authoritative
+    // result, so return exit code 0 with success=false.
     process.exit(0);
   }
 );
