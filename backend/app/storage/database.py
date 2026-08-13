@@ -87,6 +87,8 @@ def _migrate_add_missing_columns(
         orders.rule_id
         orders.owner_user_id
         positions.source
+        bot_state.anoncoin_trading_enabled
+        bot_state.pumpfun_trading_enabled
     """
 
     inspector = inspect(
@@ -166,6 +168,58 @@ def _migrate_add_missing_columns(
                     ALTER TABLE positions
                     ADD COLUMN source VARCHAR
                     DEFAULT 'anoncoin_onchain'
+                    """
+                )
+            )
+
+    # ---------------------------------------------------------------
+    # Bot state
+    # ---------------------------------------------------------------
+    #
+    # Per-source trading toggles, so Anoncoin and Pump.fun can each be
+    # switched on/off independently instead of only the all-or-nothing
+    # trading_enabled kill switch.
+    #
+    # Existing deployments default both to enabled, preserving current
+    # behaviour (both sources trade) until an admin explicitly narrows
+    # it with /disableanoncoin or /disablepumpfun.
+    # ---------------------------------------------------------------
+
+    if "bot_state" in tables:
+
+        existing_bot_state_columns = {
+            column["name"]
+            for column in inspector.get_columns(
+                "bot_state"
+            )
+        }
+
+        if (
+            "anoncoin_trading_enabled"
+            not in existing_bot_state_columns
+        ):
+
+            conn.execute(
+                text(
+                    """
+                    ALTER TABLE bot_state
+                    ADD COLUMN anoncoin_trading_enabled BOOLEAN
+                    DEFAULT 1
+                    """
+                )
+            )
+
+        if (
+            "pumpfun_trading_enabled"
+            not in existing_bot_state_columns
+        ):
+
+            conn.execute(
+                text(
+                    """
+                    ALTER TABLE bot_state
+                    ADD COLUMN pumpfun_trading_enabled BOOLEAN
+                    DEFAULT 1
                     """
                 )
             )
