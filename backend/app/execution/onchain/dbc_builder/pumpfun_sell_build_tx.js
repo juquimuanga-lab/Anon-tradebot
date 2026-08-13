@@ -354,6 +354,63 @@ async function getWalletTokenBalance(
   return totalBalance;
 }
 
+// ---------------------------------------------------------------------------
+// Resolve the token program from the actual mint account
+// ---------------------------------------------------------------------------
+//
+// fetchSellState() defaults to classic TOKEN_PROGRAM_ID when no
+// tokenProgram is passed in, and pump.fun's current token creation path
+// (createV2) mints under TOKEN_2022_PROGRAM_ID. Relying on that default
+// derives the associated token account at the wrong address for any
+// Token-2022 mint - the account genuinely exists on-chain and holds the
+// tokens, it's just not at the address being checked - which surfaces as
+// "Associated token account not found" and the sell never gets built.
+//
+// The mint account's owner is authoritative, so resolve the token
+// program directly from the mint before asking the SDK for sell state,
+// the same way the buy builder already does.
+// ---------------------------------------------------------------------------
+
+async function resolveActualTokenProgram(
+  connection,
+  mint
+) {
+  const mintAccount =
+    await connection.getAccountInfo(
+      mint,
+      "processed"
+    );
+
+  if (!mintAccount) {
+    throw new Error(
+      "pumpfun_mint_account_not_found"
+    );
+  }
+
+  const owner =
+    mintAccount.owner;
+
+  if (
+    owner.equals(
+      TOKEN_PROGRAM_ID
+    )
+  ) {
+    return TOKEN_PROGRAM_ID;
+  }
+
+  if (
+    owner.equals(
+      TOKEN_2022_PROGRAM_ID
+    )
+  ) {
+    return TOKEN_2022_PROGRAM_ID;
+  }
+
+  throw new Error(
+    `pumpfun_unsupported_mint_program: ${owner.toBase58()}`
+  );
+}
+
 async function prepareCanonicalSellAccount(
   connection,
   user,
@@ -747,6 +804,27 @@ async function main() {
 
 
   // -------------------------------------------------------------------------
+  // Resolve the mint's real token program BEFORE fetching sell state.
+  //
+  // fetchSellState() below derives the associated token account using
+  // whatever tokenProgram it's given (defaulting silently to classic
+  // TOKEN_PROGRAM_ID if omitted). Passing the wrong one means it checks
+  // the wrong address and throws "Associated token account not found"
+  // even though the wallet holds the tokens under Token-2022.
+  // -------------------------------------------------------------------------
+
+  const actualTokenProgram =
+    await resolveActualTokenProgram(
+      connection,
+      mint
+    );
+
+  console.error(
+    `Pump.fun mint token program: ${actualTokenProgram.toBase58()}`
+  );
+
+
+  // -------------------------------------------------------------------------
   // Verify required online methods
   // -------------------------------------------------------------------------
 
@@ -790,7 +868,8 @@ async function main() {
 
     onlineSdk.fetchSellState(
       mint,
-      user
+      user,
+      actualTokenProgram
     ),
   ]);
 
@@ -823,8 +902,25 @@ async function main() {
   const {
     bondingCurveAccountInfo,
     bondingCurve,
-    tokenProgram,
+    tokenProgram: sdkTokenProgram,
   } = sellState;
+
+  const tokenProgram =
+    actualTokenProgram;
+
+  if (
+    sdkTokenProgram &&
+    !sdkTokenProgram.equals(
+      actualTokenProgram
+    )
+  ) {
+    console.error(
+      "Pump.fun token program mismatch; " +
+      `SDK=${sdkTokenProgram.toBase58()} ` +
+      `mintOwner=${actualTokenProgram.toBase58()}. ` +
+      "Using mint owner."
+    );
+  }
 
 
   if (
@@ -840,14 +936,6 @@ async function main() {
   ) {
     throw new Error(
       "pumpfun_bonding_curve_state_missing"
-    );
-  }
-
-  if (
-    !tokenProgram
-  ) {
-    throw new Error(
-      "pumpfun_token_program_missing_from_sell_state"
     );
   }
 
