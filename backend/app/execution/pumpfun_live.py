@@ -490,18 +490,23 @@ class PumpFunExecutionAdapter(
             )
 
         # --------------------------------------------------------------
-        # amount_tokens is the current amount being considered by the
-        # position manager. sell_pct determines how much of that amount
-        # should actually be sold.
+        # amount_tokens is ALREADY the exact amount the position manager
+        # wants sold - it is computed upstream as
+        # position.amount_tokens * (sell_pct / 100), so sell_pct must
+        # NOT be re-applied here.
+        #
+        # sell_pct is accepted purely for validation/logging context
+        # (it must be a valid 0-100 percentage), matching the contract
+        # every other execution adapter (wallet_live, paper) follows:
+        # amount_tokens is the final amount, full stop.
+        #
+        # Previously this multiplied by sell_pct a second time, which
+        # silently undersold any exit where sell_pct < 100 - e.g. a
+        # stop loss firing after an earlier partial take-profit had
+        # already reduced the position's remaining_pct below 100.
         # --------------------------------------------------------------
 
-        tokens_to_sell = (
-            amount_tokens_float
-            * (
-                sell_pct_float
-                / 100.0
-            )
-        )
+        tokens_to_sell = amount_tokens_float
 
         if tokens_to_sell <= 0:
 
@@ -628,6 +633,12 @@ class PumpFunExecutionAdapter(
                         ),
                         "amount_tokens_raw": (
                             amount_tokens_raw
+                        ),
+                        "amount_clamped_to_wallet_balance": (
+                            built.get(
+                                "amount_clamped",
+                                False,
+                            )
                         ),
                         "token_decimals": (
                             decimals
