@@ -438,6 +438,28 @@ class ScannerService:
             source=SOURCE_ANONCOIN,
         )
 
+    @staticmethod
+    def _is_missing_account_error(exc: Exception) -> bool:
+        """Return True for transient Solana RPC errors caused by an account
+        not being available yet.
+
+        Pump.fun launches can be detected before the mint/token account is
+        fully visible through the RPC used by the pool reader. In that case
+        pumpfun.get_pool_info() can surface the raw RPC error:
+        "Invalid param: could not find account".
+
+        This is a normal transient condition for a newly detected launch, so
+        the mint should remain in _pending_watch and be retried on the next
+        scan instead of producing a full traceback.
+        """
+        message = str(exc).lower()
+        return (
+            "could not find account" in message
+            or "account not found" in message
+            or "invalid param" in message
+            and "account" in message
+        )
+
     # ------------------------------------------------------------------
     # Pump.fun snapshot
     # ------------------------------------------------------------------
@@ -478,13 +500,27 @@ class ScannerService:
 
         except Exception as exc:
 
-            logger.exception(
-                "pumpfun_snapshot_unexpected_error",
-                extra={
-                    "mint": mint,
-                    "error": str(exc),
-                },
-            )
+            if self._is_missing_account_error(exc):
+                # Newly launched Pump.fun mints can become visible to the
+                # mint-authority watcher slightly before the mint/token
+                # account is readable through the RPC used by pumpfun.py.
+                # Keep the launch pending so the existing retry loop can
+                # process it once the account becomes available.
+                logger.warning(
+                    "pumpfun_snapshot_account_not_ready",
+                    extra={
+                        "mint": mint,
+                        "error": str(exc),
+                    },
+                )
+            else:
+                logger.exception(
+                    "pumpfun_snapshot_unexpected_error",
+                    extra={
+                        "mint": mint,
+                        "error": str(exc),
+                    },
+                )
 
             return None
 
