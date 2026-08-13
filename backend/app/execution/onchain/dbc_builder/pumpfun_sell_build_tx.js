@@ -41,6 +41,7 @@ const {
   PumpSdk,
   OnlinePumpSdk,
   getSellSolAmountFromTokenAmount,
+  bondingCurvePda,
 } = require("@pump-fun/pump-sdk");
 
 const {
@@ -918,21 +919,18 @@ async function main() {
   // Fetch all required state
   // -------------------------------------------------------------------------
 
-  const [
-    global,
-    feeConfig,
-    sellState,
-  ] = await Promise.all([
-    onlineSdk.fetchGlobal(),
-
-    onlineSdk.fetchFeeConfig(),
-
-    onlineSdk.fetchSellState(
-      mint,
-      user,
-      actualTokenProgram
-    ),
-  ]);
+const [
+  global,
+  feeConfig,
+  sellState,
+] = await Promise.all([
+  onlineSdk.fetchGlobal(),
+  onlineSdk.fetchFeeConfig(),
+  onlineSdk.fetchSellState(
+    mint,
+    user
+  ),
+]);
 
 
   if (
@@ -1223,14 +1221,17 @@ async function main() {
   // If missing, create it idempotently BEFORE Sell.
   // -------------------------------------------------------------------------
 
-  const bondingCurveAtaPreparation =
-    await prepareBondingCurveAta(
-      connection,
-      user,
-      bondingCurveAccountInfo.pubkey,
-      mint,
-      tokenProgram
-    );
+const bondingCurveAddress =
+  bondingCurvePda(mint);
+
+const bondingCurveAtaPreparation =
+  await prepareBondingCurveAta(
+    connection,
+    user,
+    bondingCurveAddress,
+    mint,
+    tokenProgram
+  );
 
 
   // -------------------------------------------------------------------------
@@ -1508,12 +1509,7 @@ async function main() {
         instructions.length,
 
       bonding_curve:
-        bondingCurveAccountInfo
-          .pubkey
-          ? bondingCurveAccountInfo
-              .pubkey
-              .toBase58()
-          : null,
+        bondingCurveAddress.toBase58(),
 
       associated_bonding_curve:
         bondingCurveAtaPreparation
