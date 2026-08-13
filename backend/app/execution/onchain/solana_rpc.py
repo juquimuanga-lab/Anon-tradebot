@@ -1089,6 +1089,32 @@ async def send_and_confirm(
                     error_text.lower()
                 )
 
+                # A validator/RPC returning AlreadyProcessed means this exact
+                # signed transaction has already been seen. This is not a
+                # transaction failure: it commonly happens when the bot polls
+                # status just before a rebroadcast races with the validator.
+                # Keep the same signature and continue confirmation instead of
+                # reporting a sell failure or rebuilding the transaction.
+                if (
+                    "alreadyprocessed" in lower_error
+                    or "already processed" in lower_error
+                ):
+                    send_count += 1
+                    last_send_time = now
+
+                    logger.info(
+                        "transaction_already_processed_waiting_confirmation",
+                        extra={
+                            "signature": signature,
+                            "attempt": send_count,
+                            "error": redact_text(
+                                error_text
+                            ),
+                        },
+                    )
+
+                    continue
+
                 deterministic_errors = (
                     "simulation failed",
                     "instruction error",
