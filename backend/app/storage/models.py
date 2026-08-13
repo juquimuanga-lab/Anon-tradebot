@@ -483,6 +483,16 @@ class BotState(Base):
         default=True,
     )
 
+    anoncoin_trading_enabled: Mapped[bool] = mapped_column(
+        Boolean,
+        default=True,
+    )
+
+    pumpfun_trading_enabled: Mapped[bool] = mapped_column(
+        Boolean,
+        default=True,
+    )
+
     paper_balance_sol: Mapped[float] = mapped_column(
         Float,
         default=10.0,
