@@ -1,18 +1,24 @@
 """Live Pump.fun execution adapter.
 
-Separate from the existing Meteora/Jupiter WalletExecutionAdapter.
+Separate from the existing Meteora/Jupiter WalletExecutionAdapter,
+except for one shared piece: once a Pump.fun token graduates off the
+bonding curve, this adapter routes through the same Jupiter client
+WalletExecutionAdapter already uses for migrated Anoncoin tokens.
+Jupiter doesn't care which platform a token launched on.
 
 BUY:
-    Pump.fun SDK -> unsigned transaction -> Python signs -> Helius RPC
+    Pre-migration: Pump.fun SDK -> unsigned transaction -> Python signs -> Helius RPC
 
 SELL:
-    Pump.fun SDK -> unsigned transaction -> Python signs -> Helius RPC
+    Pre-migration: Pump.fun SDK -> unsigned transaction -> Python signs -> Helius RPC
+    Post-migration: Jupiter -> unsigned transaction -> Python signs -> Helius RPC
 
 Security:
 - Private key never leaves Python.
 - Private key is never passed to Node.js.
 - Node.js only constructs unsigned transactions.
-- Pump.fun positions never fall through to Meteora/Jupiter.
+- Pump.fun positions never fall through to Meteora DBC (Anoncoin's
+  bonding curve program) - only to Jupiter, and only post-migration.
 """
 
 import logging
@@ -25,11 +31,17 @@ from app.execution.base import (
     OrderResult,
 )
 
+from app.execution.onchain.jupiter import (
+    JupiterClient,
+    JupiterError,
+)
+
 from app.execution.onchain.pumpfun import (
     PumpFunError,
     PumpFunTransactionBuildError,
     build_unsigned_buy_transaction,
     build_unsigned_sell_transaction,
+    get_pool_info,
 )
 
 from app.execution.onchain.solana_rpc import (
@@ -37,6 +49,7 @@ from app.execution.onchain.solana_rpc import (
     get_sol_balance,
     send_and_confirm,
     sign_legacy_transaction,
+    sign_versioned_transaction,
 )
 
 from app.scoring.rules import TokenSnapshot
@@ -156,6 +169,7 @@ class PumpFunExecutionAdapter(
         keypair: Keypair,
         rpc_url: str,
         default_slippage_bps: int,
+        jupiter_client: JupiterClient,
     ):
         self._keypair = keypair
 
@@ -167,6 +181,40 @@ class PumpFunExecutionAdapter(
 
         self._default_slippage_bps = int(
             default_slippage_bps
+        )
+
+        self._jupiter = jupiter_client
+
+    # ------------------------------------------------------------------
+    # Migration check
+    # ------------------------------------------------------------------
+
+    async def _is_migrated(
+        self,
+        token: TokenSnapshot,
+    ) -> bool:
+        """Authoritatively check whether this token has graduated.
+
+        Reads the bonding curve directly rather than trusting
+        token.is_migrated on the snapshot passed in, since that flag
+        isn't refreshed while a position sits open - a token can
+        graduate at any point while the bot is holding it, and only
+        the on-chain state at the moment of the trade can say whether
+        THIS particular buy/sell needs to go through the bonding
+        curve or through an AMM instead.
+        """
+
+        pool_info = (
+            await get_pool_info(
+                token.mint,
+                self._rpc_url,
+            )
+        )
+
+        return bool(
+            pool_info.get(
+                "is_migrated"
+            )
         )
 
     # ------------------------------------------------------------------
@@ -558,7 +606,103 @@ class PumpFunExecutionAdapter(
             try:
 
                 # ------------------------------------------------------
-                # Build a completely fresh SELL transaction.
+                # Route around the bonding curve once this token has
+                # graduated to an AMM.
+                #
+                # Checked fresh on every attempt rather than trusted
+                # from the position's cached snapshot, because the
+                # token can graduate at any point while the bot holds
+                # it and there's no way to know in advance which exit
+                # attempt will be the one that catches it. Building a
+                # bonding-curve sell against an already-graduated
+                # token fails on-chain with AccountNotInitialized:
+                # migration withdraws the bonding curve's token
+                # reserves, so the account the old instruction still
+                # expects to find funded no longer holds anything.
+                # ------------------------------------------------------
+
+                is_migrated = (
+                    await self._is_migrated(
+                        token
+                    )
+                )
+
+                if is_migrated:
+
+                    # --------------------------------------------------
+                    # Graduated: route through Jupiter, the same way
+                    # WalletExecutionAdapter already does for migrated
+                    # Anoncoin tokens. Jupiter is origin-agnostic - it
+                    # just needs a mint that's live on an AMM and
+                    # doesn't care whether that token started on
+                    # Pump.fun or anywhere else.
+                    # --------------------------------------------------
+
+                    built = (
+                        await self._jupiter.sell_quote_tx(
+                            token.mint,
+                            amount_tokens_raw,
+                            slippage_bps,
+                            self._pubkey,
+                        )
+                    )
+
+                    signed = (
+                        sign_versioned_transaction(
+                            built[
+                                "transaction_b64"
+                            ],
+                            self._keypair,
+                        )
+                    )
+
+                    signature = (
+                        await send_and_confirm(
+                            self._rpc_url,
+                            signed,
+                        )
+                    )
+
+                    logger.info(
+                        "pumpfun_sell_confirmed",
+                        extra={
+                            "mint": token.mint,
+                            "owner": self._pubkey,
+                            "execution_path": (
+                                "jupiter_amm_post_migration"
+                            ),
+                            "amount_tokens_requested": (
+                                amount_tokens_float
+                            ),
+                            "sell_pct": (
+                                sell_pct_float
+                            ),
+                            "amount_tokens_sold": (
+                                tokens_to_sell
+                            ),
+                            "amount_tokens_raw": (
+                                amount_tokens_raw
+                            ),
+                            "token_decimals": (
+                                decimals
+                            ),
+                            "attempt": attempt + 1,
+                            "tx_signature": signature,
+                        },
+                    )
+
+                    return OrderResult(
+                        success=True,
+                        status="filled",
+                        price_usd=(
+                            token.price_usd
+                        ),
+                        tx_signature=signature,
+                    )
+
+                # ------------------------------------------------------
+                # Not yet graduated: build a completely fresh
+                # bonding-curve SELL transaction.
                 # ------------------------------------------------------
 
                 built = (
@@ -622,6 +766,9 @@ class PumpFunExecutionAdapter(
                     extra={
                         "mint": token.mint,
                         "owner": self._pubkey,
+                        "execution_path": (
+                            "bonding_curve"
+                        ),
                         "amount_tokens_requested": (
                             amount_tokens_float
                         ),
@@ -680,6 +827,7 @@ class PumpFunExecutionAdapter(
                 PumpFunTransactionBuildError,
                 PumpFunError,
                 SolanaTxError,
+                JupiterError,
             ) as exc:
 
                 if (
