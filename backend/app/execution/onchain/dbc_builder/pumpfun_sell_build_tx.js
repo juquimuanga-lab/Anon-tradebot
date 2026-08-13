@@ -303,7 +303,6 @@ function requirePositiveInteger(
   return parsed;
 }
 
-
 // ---------------------------------------------------------------------------
 // Direct wallet token balance
 // ---------------------------------------------------------------------------
@@ -356,22 +355,21 @@ async function getWalletTokenBalance(
   return totalBalance;
 }
 
-
 // ---------------------------------------------------------------------------
 // Resolve the token program from the actual mint account
 // ---------------------------------------------------------------------------
 //
-// The mint account's owner is authoritative.
+// fetchSellState() defaults to classic TOKEN_PROGRAM_ID when no
+// tokenProgram is passed in, and pump.fun's current token creation path
+// (createV2) mints under TOKEN_2022_PROGRAM_ID. Relying on that default
+// derives the associated token account at the wrong address for any
+// Token-2022 mint - the account genuinely exists on-chain and holds the
+// tokens, it's just not at the address being checked - which surfaces as
+// "Associated token account not found" and the sell never gets built.
 //
-// Classic SPL Token:
-//
-//     Tokenkeg...
-//
-// Token-2022:
-//
-//     TokenzQd...
-//
-// We use the actual mint owner instead of assuming one program.
+// The mint account's owner is authoritative, so resolve the token
+// program directly from the mint before asking the SDK for sell state,
+// the same way the buy builder already does.
 // ---------------------------------------------------------------------------
 
 async function resolveActualTokenProgram(
@@ -416,24 +414,24 @@ async function resolveActualTokenProgram(
 
 
 // ---------------------------------------------------------------------------
-// Prepare Pump.fun bonding curve ATA
+// FIX: Prepare Pump.fun bonding curve ATA
 // ---------------------------------------------------------------------------
 //
 // Pump.fun's Sell instruction expects the bonding curve's associated token
 // account to already be initialized.
 //
-// If that ATA does not exist, the Sell instruction can fail:
+// If that ATA does not exist, the Sell instruction fails:
 //
 //     AccountNotInitialized
 //     Error Number: 3012
 //     account: associatedbondingcurve
 //
 // We therefore derive the ATA from the ACTUAL bonding curve PDA and mint,
-// check whether it exists, and create it idempotently before the Pump.fun
-// Sell instruction when necessary.
+// check whether it exists, and create it idempotently before the Sell
+// instruction when necessary.
 //
 // The bonding curve PDA is the owner of this ATA.
-// The user's wallet is only the payer for ATA creation.
+// The user's wallet is only the payer for the ATA creation.
 // ---------------------------------------------------------------------------
 
 async function prepareBondingCurveAta(
@@ -927,9 +925,7 @@ async function main() {
     sellState,
   ] = await Promise.all([
     onlineSdk.fetchGlobal(),
-
     onlineSdk.fetchFeeConfig(),
-
     onlineSdk.fetchSellState(
       mint,
       user
@@ -999,26 +995,6 @@ async function main() {
   ) {
     throw new Error(
       "pumpfun_bonding_curve_state_missing"
-    );
-  }
-
-
-  // -------------------------------------------------------------------------
-  // Bonding curve PDA
-  // -------------------------------------------------------------------------
-
-  const bondingCurveAddress =
-    bondingCurvePda(
-      mint
-    );
-
-  if (
-    !bondingCurveAddress ||
-    typeof bondingCurveAddress.toBase58 !==
-      "function"
-  ) {
-    throw new Error(
-      "pumpfun_bonding_curve_pda_invalid"
     );
   }
 
@@ -1193,17 +1169,6 @@ async function main() {
   // -------------------------------------------------------------------------
   // Build sell instructions
   // -------------------------------------------------------------------------
-  //
-  // IMPORTANT:
-  //
-  // feeConfig is intentionally NOT passed to sellInstructions().
-  // It is required for the SOL quote above, but the SDK's sell instruction
-  // builder consumes the fetched sellState/global/mint/user/amount/slippage
-  // fields.
-  //
-  // sellState is spread in full so the SDK receives the current tokenProgram
-  // returned by fetchSellState().
-  // -------------------------------------------------------------------------
 
   const sellInstructionParams = {
     ...sellState,
@@ -1240,8 +1205,8 @@ async function main() {
   // The Pump.fun on-chain Sell instruction expects the bonding curve's
   // associated token account to already exist.
   //
-  // If it doesn't exist, the transaction can reach the Pump.fun program and
-  // fail with:
+  // If it doesn't exist, the transaction reaches the Pump.fun program
+  // and fails with:
   //
   //     Error Code: 3012
   //     AccountNotInitialized
@@ -1250,11 +1215,16 @@ async function main() {
   // The ATA is derived from:
   //
   //     mint
-  //     bonding curve PDA
+  //     bondingCurve PDA
   //     actual token program
   //
   // If missing, create it idempotently BEFORE Sell.
   // -------------------------------------------------------------------------
+
+  const bondingCurveAddress =
+    bondingCurvePda(
+      mint
+    );
 
   const bondingCurveAtaPreparation =
     await prepareBondingCurveAta(
@@ -1283,15 +1253,73 @@ async function main() {
   // -------------------------------------------------------------------------
   // Build Pump.fun Sell instruction
   // -------------------------------------------------------------------------
+  //
+  // The high-level sellInstructions() helper performs ATA management/preflight.
+  // If the canonical user ATA is missing, it can reject the sell before the
+  // ATA creation/transfer instructions in our transaction get a chance to
+  // execute.
+  //
+  // In that case use getSellInstructionRaw(), which deliberately skips ATA
+  // management. The transaction then executes the setup instructions first:
+  //
+  //   1. Create canonical user ATA (if required)
+  //   2. Move tokens into canonical ATA (if required)
+  //   3. Create bonding-curve ATA (if required)
+  //   4. Execute Pump.fun Sell
+  //
+  // If the canonical ATA already exists, retain the normal high-level SDK
+  // builder.
+  // -------------------------------------------------------------------------
 
   let instructions;
+  let sellBuilderMode;
 
   try {
 
-    instructions =
-      await offlineSdk.sellInstructions(
-        sellInstructionParams
-      );
+    const canonicalAtaExists =
+      !sellAccountPreparation.ataCreated;
+
+    if (
+      canonicalAtaExists
+    ) {
+
+      if (
+        typeof offlineSdk.sellInstructions !==
+        "function"
+      ) {
+        throw new Error(
+          "pumpfun_sell_instructions_method_unavailable"
+        );
+      }
+
+      instructions =
+        await offlineSdk.sellInstructions(
+          sellInstructionParams
+        );
+
+      sellBuilderMode =
+        "high-level";
+
+    } else {
+
+      if (
+        typeof offlineSdk.getSellInstructionRaw !==
+        "function"
+      ) {
+        throw new Error(
+          "pumpfun_get_sell_instruction_raw_method_unavailable"
+        );
+      }
+
+      instructions = [
+        await offlineSdk.getSellInstructionRaw(
+          sellInstructionParams
+        ),
+      ];
+
+      sellBuilderMode =
+        "raw-canonical-ata-recovery";
+    }
 
   } catch (error) {
 
@@ -1320,34 +1348,18 @@ async function main() {
 
 
   // -------------------------------------------------------------------------
-  // SDK instruction sanity check
+  // Prepend required account setup instructions
   // -------------------------------------------------------------------------
-
-  const hasPumpProgramInstruction =
-    instructions.some(
-      (instruction) =>
-        instruction &&
-        instruction.programId &&
-        instruction.programId.toBase58() ===
-          "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P"
-    );
-
-  if (
-    !hasPumpProgramInstruction
-  ) {
-    throw new Error(
-      "pumpfun_sell_instructions_missing_pump_program_instruction"
-    );
-  }
-
-
-  // -------------------------------------------------------------------------
-  // Prepend required account setup
-  // -------------------------------------------------------------------------
+  //
+  // IMPORTANT:
   //
   // Bonding curve ATA creation MUST occur before Pump.fun Sell.
   //
   // Canonical user ATA creation/transfer must also occur before Sell.
+  //
+  // When the canonical ATA is missing, getSellInstructionRaw() is used above
+  // so the SDK does not reject the transaction before these setup
+  // instructions can execute.
   // -------------------------------------------------------------------------
 
   const setupInstructions = [
@@ -1357,25 +1369,6 @@ async function main() {
     ...sellAccountPreparation
       .setupInstructions,
   ];
-
-
-  if (
-    bondingCurveAtaPreparation.ataCreated
-  ) {
-    console.error(
-      "Pump.fun SELL: bonding-curve ATA was missing; " +
-      "added idempotent ATA creation before Sell."
-    );
-  }
-
-  if (
-    sellAccountPreparation.ataCreated
-  ) {
-    console.error(
-      "Pump.fun SELL: canonical user ATA was missing; " +
-      "added ATA creation/token transfer setup before Sell."
-    );
-  }
 
 
   if (
@@ -1580,8 +1573,7 @@ async function main() {
         instructions.length,
 
       bonding_curve:
-        bondingCurveAddress
-          .toBase58(),
+        bondingCurveAddress.toBase58(),
 
       associated_bonding_curve:
         bondingCurveAtaPreparation
@@ -1592,17 +1584,8 @@ async function main() {
         bondingCurveAtaPreparation
           .ataCreated,
 
-      user_associated_token_account:
-        sellAccountPreparation
-          .associatedTokenAddress
-          .toBase58(),
-
-      user_associated_token_account_created:
-        sellAccountPreparation
-          .ataCreated,
-
-      setup_instruction_count:
-        setupInstructions.length,
+      sell_builder_mode:
+        sellBuilderMode,
 
       action:
         "sell",
