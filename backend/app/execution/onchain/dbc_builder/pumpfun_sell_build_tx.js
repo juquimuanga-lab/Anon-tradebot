@@ -1670,7 +1670,3 @@ main().catch(
           ),
       }) + "\n"
     );
-
-    // The Python wrapper treats the JSON response as the authoritative
-    // result, so return exit code 0 with success=false.
-    process.exit(0);
