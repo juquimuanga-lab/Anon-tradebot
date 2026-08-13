@@ -5,16 +5,20 @@ Execution sources:
 
     Anoncoin/Meteora
         -> existing WalletExecutionAdapter
+           (Meteora DBC pre-migration, Jupiter post-migration)
 
     Pump.fun
         -> PumpFunExecutionAdapter
+           (bonding curve pre-migration, Jupiter post-migration)
 
 Paper mode:
     -> PaperExecutionAdapter
 
 The router keeps the two live execution paths completely separate.
 A Pump.fun token must never accidentally fall through into the
-Anoncoin/Meteora executor.
+Anoncoin/Meteora executor. Both adapters share the same Jupiter
+client for their post-migration leg, since Jupiter is origin-agnostic
+once a token is trading on an AMM.
 """
 
 import logging
@@ -88,7 +92,10 @@ class ExecutionRouter:
         Jupiter for migrated tokens.
 
     Pump.fun:
-        Dedicated Pump.fun bonding-curve executor.
+        Dedicated Pump.fun bonding-curve executor for pre-migration
+        tokens. Jupiter for migrated (graduated) tokens - the
+        adapter checks each trade's on-chain migration status
+        itself and routes accordingly.
 
     Paper:
         Paper execution regardless of launch source.
@@ -190,7 +197,8 @@ class ExecutionRouter:
                 Existing Meteora/Jupiter wallet execution.
 
             SOURCE_PUMPFUN
-                Dedicated Pump.fun bonding-curve execution.
+                Dedicated Pump.fun bonding-curve execution,
+                Jupiter after the token migrates.
 
             SOURCE_MOCK
                 Never allowed to execute live.
@@ -331,6 +339,9 @@ class ExecutionRouter:
                 ),
                 default_slippage_bps=(
                     settings.default_slippage_bps
+                ),
+                jupiter_client=(
+                    self._jupiter
                 ),
             )
 
