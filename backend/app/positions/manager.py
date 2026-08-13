@@ -938,6 +938,34 @@ class PositionManager:
                     return
 
         # --------------------------------------------------------------
+        # Global kill switch.
+        #
+        # /disable (trading_enabled=False) already told the scanner to
+        # stop placing new buys. This is the other half: it also pauses
+        # every automated exit (stop loss, take profit, trailing stop,
+        # time-based) for positions that are already open, so /disable
+        # actually stops the bot as its own confirmation text promises,
+        # instead of leaving position monitoring - and its notifications
+        # - running underneath.
+        #
+        # Wallet reconciliation above still ran either way: it only
+        # detects and records reality, it never places a trade, so a
+        # manual/external sale is still picked up correctly even while
+        # paused.
+        #
+        # Manual closes (/positions close <id>) are a separate code
+        # path and are never affected by this - an explicit admin
+        # action should always go through.
+        # --------------------------------------------------------------
+
+        bot_state = (
+            await repo.get_or_create_bot_state()
+        )
+
+        if not bot_state.trading_enabled:
+            return
+
+        # --------------------------------------------------------------
         # Token
         # --------------------------------------------------------------
 
