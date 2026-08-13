@@ -718,7 +718,15 @@ async def send_and_confirm(
     The transaction is considered successful only when:
         confirmationStatus == confirmed/finalized
         AND
-        err == None
+        signature-status err == None
+        AND
+        getTransaction returns the actual transaction
+        AND
+        transaction.meta exists
+        AND
+        transaction.meta.err == None
+
+    A signature/status response alone is never treated as a filled trade.
 
     The transaction is considered failed when:
         - it lands with an on-chain error, OR
@@ -798,6 +806,77 @@ async def send_and_confirm(
                 "finalized",
             ):
 
+                # -----------------------------------------------------------
+                # IMPORTANT:
+                #
+                # Do not treat signature status alone as a successful trade.
+                # Verify the actual on-chain transaction and its meta.err.
+                #
+                # This prevents the execution layer from reporting a false
+                # "filled" state when the status endpoint says confirmed but
+                # transaction details are not yet available/verified.
+                # -----------------------------------------------------------
+
+                transaction = await _get_transaction_details(
+                    rpc_url,
+                    signature,
+                )
+
+                if transaction is None:
+                    logger.warning(
+                        "transaction_confirmation_unverified",
+                        extra={
+                            "signature": signature,
+                            "confirmation_status": (
+                                confirmation_status
+                            ),
+                            "reason": (
+                                "getTransaction returned no "
+                                "transaction details"
+                            ),
+                        },
+                    )
+
+                    await asyncio.sleep(
+                        STATUS_POLL_INTERVAL_SECONDS
+                    )
+                    continue
+
+                meta = transaction.get("meta")
+
+                if meta is None:
+                    logger.warning(
+                        "transaction_confirmation_unverified",
+                        extra={
+                            "signature": signature,
+                            "confirmation_status": (
+                                confirmation_status
+                            ),
+                            "reason": (
+                                "transaction metadata is missing"
+                            ),
+                        },
+                    )
+
+                    await asyncio.sleep(
+                        STATUS_POLL_INTERVAL_SECONDS
+                    )
+                    continue
+
+                transaction_error = meta.get("err")
+
+                if transaction_error is not None:
+                    details = _format_transaction_error(
+                        status,
+                        transaction,
+                    )
+
+                    raise SolanaTxError(
+                        "transaction landed but failed on-chain:\n"
+                        f"{details}\n"
+                        f"{solscan_link}"
+                    )
+
                 logger.info(
                     "transaction_confirmed",
                     extra={
@@ -806,6 +885,7 @@ async def send_and_confirm(
                             confirmation_status
                         ),
                         "send_count": send_count,
+                        "transaction_verified": True,
                     },
                 )
 
@@ -867,7 +947,64 @@ async def send_and_confirm(
                     "confirmed",
                     "finalized",
                 ):
-                    return signature
+
+                    # Apply the same transaction-level verification at the
+                    # blockhash-expiry boundary. Never return success based
+                    # on signature status alone.
+                    final_transaction = (
+                        await _get_transaction_details(
+                            rpc_url,
+                            signature,
+                        )
+                    )
+
+                    if final_transaction is not None:
+                        final_meta = (
+                            final_transaction.get("meta")
+                        )
+
+                        if final_meta is not None:
+                            final_transaction_error = (
+                                final_meta.get("err")
+                            )
+
+                            if final_transaction_error is not None:
+                                details = (
+                                    _format_transaction_error(
+                                        final_status,
+                                        final_transaction,
+                                    )
+                                )
+
+                                raise SolanaTxError(
+                                    "transaction landed but "
+                                    "failed on-chain:\n"
+                                    f"{details}\n"
+                                    f"{solscan_link}"
+                                )
+
+                            logger.info(
+                                "transaction_confirmed",
+                                extra={
+                                    "signature": signature,
+                                    "confirmation_status": (
+                                        final_confirmation
+                                    ),
+                                    "send_count": send_count,
+                                    "transaction_verified": True,
+                                    "verified_at_expiry_boundary": True,
+                                },
+                            )
+
+                            return signature
+
+                    raise SolanaTxError(
+                        "transaction reached "
+                        f"{final_confirmation} status but its "
+                        "on-chain transaction details could not be "
+                        "verified before blockhash expiry. "
+                        f"{solscan_link}"
+                    )
 
             raise SolanaTxError(
                 "transaction blockhash expired before "
