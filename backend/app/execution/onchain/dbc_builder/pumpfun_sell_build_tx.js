@@ -411,6 +411,82 @@ async function resolveActualTokenProgram(
   );
 }
 
+
+// ---------------------------------------------------------------------------
+// FIX: Prepare Pump.fun bonding curve ATA
+// ---------------------------------------------------------------------------
+//
+// Pump.fun's Sell instruction expects the bonding curve's associated token
+// account to already be initialized.
+//
+// If that ATA does not exist, the Sell instruction fails:
+//
+//     AccountNotInitialized
+//     Error Number: 3012
+//     account: associatedbondingcurve
+//
+// We therefore derive the ATA from the ACTUAL bonding curve PDA and mint,
+// check whether it exists, and create it idempotently before the Sell
+// instruction when necessary.
+//
+// The bonding curve PDA is the owner of this ATA.
+// The user's wallet is only the payer for the ATA creation.
+// ---------------------------------------------------------------------------
+
+async function prepareBondingCurveAta(
+  connection,
+  payer,
+  bondingCurvePubkey,
+  mint,
+  tokenProgram
+) {
+  const associatedBondingCurve =
+    getAssociatedTokenAddressSync(
+      mint,
+      bondingCurvePubkey,
+      true,
+      tokenProgram,
+      ASSOCIATED_TOKEN_PROGRAM_ID
+    );
+
+  const accountInfo =
+    await connection.getAccountInfo(
+      associatedBondingCurve,
+      "processed"
+    );
+
+  if (accountInfo) {
+    return {
+      associatedBondingCurve,
+      setupInstructions: [],
+      ataCreated: false,
+    };
+  }
+
+  const createInstruction =
+    createAssociatedTokenAccountIdempotentInstruction(
+      payer,
+      associatedBondingCurve,
+      bondingCurvePubkey,
+      mint,
+      tokenProgram,
+      ASSOCIATED_TOKEN_PROGRAM_ID
+    );
+
+  return {
+    associatedBondingCurve,
+    setupInstructions: [
+      createInstruction,
+    ],
+    ataCreated: true,
+  };
+}
+
+
+// ---------------------------------------------------------------------------
+// Prepare canonical user token ATA
+// ---------------------------------------------------------------------------
+
 async function prepareCanonicalSellAccount(
   connection,
   user,
@@ -450,15 +526,21 @@ async function prepareCanonicalSellAccount(
     );
 
   let remaining =
-    new BN(amount.toString());
+    new BN(
+      amount.toString()
+    );
 
   const sourceAccounts = [];
 
-  for (const account of accounts.value) {
+  for (
+    const account of accounts.value
+  ) {
     const info =
       account?.account?.data?.parsed?.info;
 
-    const sourceOwner = info?.owner;
+    const sourceOwner =
+      info?.owner;
+
     const rawAmount =
       info?.tokenAmount?.amount;
 
@@ -485,7 +567,9 @@ async function prepareCanonicalSellAccount(
     }
 
     const balance =
-      new BN(String(rawAmount));
+      new BN(
+        String(rawAmount)
+      );
 
     if (
       balance.lte(
@@ -538,7 +622,9 @@ async function prepareCanonicalSellAccount(
   );
 
   let transferRemaining =
-    new BN(amount.toString());
+    new BN(
+      amount.toString()
+    );
 
   for (
     const sourceAccount of
@@ -598,6 +684,7 @@ async function prepareCanonicalSellAccount(
       ),
   };
 }
+
 
 // ---------------------------------------------------------------------------
 // Main
@@ -695,9 +782,6 @@ async function main() {
   // -------------------------------------------------------------------------
   // Raw token amount
   // -------------------------------------------------------------------------
-  //
-  // NEVER use JavaScript floating point for SPL token base units.
-  //
 
   let amount =
     new BN(
@@ -764,20 +848,6 @@ async function main() {
   // -------------------------------------------------------------------------
   // Online Pump SDK
   // -------------------------------------------------------------------------
-  //
-  // IMPORTANT:
-  //
-  // OnlinePumpSdk is used for RPC-backed state fetching.
-  //
-  // It provides:
-  //
-  //     fetchGlobal()
-  //     fetchFeeConfig()
-  //     fetchSellState()
-  //     getTokenBalance()
-  //
-  // The instruction builder itself remains PumpSdk-compatible.
-  //
 
   if (
     typeof OnlinePumpSdk !==
@@ -804,13 +874,7 @@ async function main() {
 
 
   // -------------------------------------------------------------------------
-  // Resolve the mint's real token program BEFORE fetching sell state.
-  //
-  // fetchSellState() below derives the associated token account using
-  // whatever tokenProgram it's given (defaulting silently to classic
-  // TOKEN_PROGRAM_ID if omitted). Passing the wrong one means it checks
-  // the wrong address and throws "Associated token account not found"
-  // even though the wallet holds the tokens under Token-2022.
+  // Resolve actual token program BEFORE fetching sell state.
   // -------------------------------------------------------------------------
 
   const actualTokenProgram =
@@ -829,10 +893,10 @@ async function main() {
   // -------------------------------------------------------------------------
 
   const requiredOnlineMethods = [
-  "fetchGlobal",
-  "fetchFeeConfig",
-  "fetchSellState",
-];
+    "fetchGlobal",
+    "fetchFeeConfig",
+    "fetchSellState",
+  ];
 
   for (
     const method of
@@ -853,9 +917,6 @@ async function main() {
   // -------------------------------------------------------------------------
   // Fetch all required state
   // -------------------------------------------------------------------------
-  //
-  // Do these in parallel to reduce latency.
-  //
 
   const [
     global,
@@ -943,11 +1004,6 @@ async function main() {
   // -------------------------------------------------------------------------
   // Bonding curve completion check
   // -------------------------------------------------------------------------
-  //
-  // A completed bonding curve has migrated to the AMM.
-  //
-  // Do NOT attempt to sell it through the bonding-curve instruction.
-  //
 
   if (
     bondingCurve.complete ===
@@ -964,11 +1020,11 @@ async function main() {
   // -------------------------------------------------------------------------
 
   const walletBalance =
-  await getWalletTokenBalance(
-    connection,
-    user,
-    mint
-  );
+    await getWalletTokenBalance(
+      connection,
+      user,
+      mint
+    );
 
 
   if (
@@ -1001,25 +1057,8 @@ async function main() {
 
 
   // -------------------------------------------------------------------------
-  // Never attempt to sell more than the wallet owns
+  // Never attempt to sell more than wallet owns
   // -------------------------------------------------------------------------
-  //
-  // The requested amount is computed upstream from the position size
-  // Python has tracked in its database, which starts as an ESTIMATE at
-  // buy time (SOL spent / quoted price) rather than the exact amount
-  // actually received. Pump.fun's bonding curve means the real fill is
-  // always slightly worse than the quote, so this estimate can end up a
-  // little higher than what the wallet truly holds.
-  //
-  // Previously this threw and aborted the sell outright, which left
-  // stop-loss exits stuck retrying the same oversized amount forever
-  // (and flooding Telegram with repeated "sell failed" alerts) instead
-  // of actually getting out of the position.
-  //
-  // Clamp down to the wallet's real, on-chain balance and sell that
-  // instead. This can only ever sell less than or equal to what was
-  // requested, never more, so it never risks selling tokens the wallet
-  // doesn't have.
 
   let amountClamped = false;
 
@@ -1028,25 +1067,17 @@ async function main() {
       walletBalanceBN
     )
   ) {
-    amount = walletBalanceBN;
-    amountClamped = true;
+    amount =
+      walletBalanceBN;
+
+    amountClamped =
+      true;
   }
 
 
   // -------------------------------------------------------------------------
   // Calculate expected SOL received
   // -------------------------------------------------------------------------
-  //
-  // Current Pump SDK requires:
-  //
-  //     global
-  //     feeConfig
-  //     mintSupply
-  //     bondingCurve
-  //     amount
-  //
-  // This keeps the quote aligned with current Pump.fun fee configuration.
-  //
 
   if (
     typeof getSellSolAmountFromTokenAmount !==
@@ -1140,12 +1171,6 @@ async function main() {
   // -------------------------------------------------------------------------
   // Build sell instructions
   // -------------------------------------------------------------------------
-  //
-  // Use the online state returned by fetchSellState.
-  //
-  // This is important because it contains the current token program and
-  // bonding curve account information.
-  //
 
   const sellInstructionParams = {
     ...sellState,
@@ -1172,46 +1197,79 @@ async function main() {
 
 
   const offlineSdk =
-  new PumpSdk();
+    new PumpSdk();
 
-const sellAccountPreparation =
-  await prepareCanonicalSellAccount(
-    connection,
-    user,
-    mint,
-    tokenProgram,
-    amount
-  );
 
-let instructions;
+  // -------------------------------------------------------------------------
+  // FIX: Prepare bonding curve ATA BEFORE Pump.fun Sell
+  // -------------------------------------------------------------------------
+  //
+  // The Pump.fun on-chain Sell instruction expects the bonding curve's
+  // associated token account to already exist.
+  //
+  // If it doesn't exist, the transaction reaches the Pump.fun program
+  // and fails with:
+  //
+  //     Error Code: 3012
+  //     AccountNotInitialized
+  //     account: associatedbondingcurve
+  //
+  // The ATA is derived from:
+  //
+  //     mint
+  //     bondingCurve PDA
+  //     actual token program
+  //
+  // If missing, create it idempotently BEFORE Sell.
+  // -------------------------------------------------------------------------
 
-try {
-  instructions =
-    await offlineSdk.sellInstructions(
-      sellInstructionParams
+  const bondingCurveAtaPreparation =
+    await prepareBondingCurveAta(
+      connection,
+      user,
+      bondingCurveAccountInfo.pubkey,
+      mint,
+      tokenProgram
     );
 
-} catch (error) {
-  throw new Error(
-    "pumpfun_sell_instructions_failed: " +
-    `${
-      error?.message ||
-      error
-    }`
-  );
-}
 
-if (
-  sellAccountPreparation
-    .setupInstructions.length >
-  0
-) {
-  instructions = [
-    ...sellAccountPreparation
-      .setupInstructions,
-    ...instructions,
-  ];
-}
+  // -------------------------------------------------------------------------
+  // Prepare canonical user ATA
+  // -------------------------------------------------------------------------
+
+  const sellAccountPreparation =
+    await prepareCanonicalSellAccount(
+      connection,
+      user,
+      mint,
+      tokenProgram,
+      amount
+    );
+
+
+  // -------------------------------------------------------------------------
+  // Build Pump.fun Sell instruction
+  // -------------------------------------------------------------------------
+
+  let instructions;
+
+  try {
+
+    instructions =
+      await offlineSdk.sellInstructions(
+        sellInstructionParams
+      );
+
+  } catch (error) {
+
+    throw new Error(
+      "pumpfun_sell_instructions_failed: " +
+      `${
+        error?.message ||
+        error
+      }`
+    );
+  }
 
 
   if (
@@ -1225,6 +1283,37 @@ if (
     throw new Error(
       "pumpfun_sell_instructions_empty"
     );
+  }
+
+
+  // -------------------------------------------------------------------------
+  // Prepend required account setup instructions
+  // -------------------------------------------------------------------------
+  //
+  // IMPORTANT:
+  //
+  // Bonding curve ATA creation MUST occur before Pump.fun Sell.
+  //
+  // Canonical user ATA creation/transfer must also occur before Sell.
+  // -------------------------------------------------------------------------
+
+  const setupInstructions = [
+    ...bondingCurveAtaPreparation
+      .setupInstructions,
+
+    ...sellAccountPreparation
+      .setupInstructions,
+  ];
+
+
+  if (
+    setupInstructions.length >
+    0
+  ) {
+    instructions = [
+      ...setupInstructions,
+      ...instructions,
+    ];
   }
 
 
@@ -1425,6 +1514,15 @@ if (
               .pubkey
               .toBase58()
           : null,
+
+      associated_bonding_curve:
+        bondingCurveAtaPreparation
+          .associatedBondingCurve
+          .toBase58(),
+
+      bonding_curve_ata_created:
+        bondingCurveAtaPreparation
+          .ataCreated,
 
       action:
         "sell",
