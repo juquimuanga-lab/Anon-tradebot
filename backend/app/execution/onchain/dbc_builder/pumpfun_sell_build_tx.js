@@ -29,11 +29,19 @@
  * Pump.fun bonding-curve sells only.
  * Graduated tokens must be routed through the AMM executor.
  *
- * V6:
- * - Uses the Pump SDK/IDL account layout directly.
- * - Does NOT manually append UserVolumeAccumulator as a remaining account.
- * - The current Pump SDK supplies UserVolumeAccumulator in the fixed sell
- *   account list; manually appending it creates an invalid cashback account.
+ * V7:
+ * - Keeps the complete V6 transaction-building architecture intact.
+ * - Uses the SDK's `cashback` flag from the actual bonding-curve state instead
+ *   of hard-coding `cashback: false`.
+ * - When the coin is cashback-enabled, the SDK receives `cashback: true`, so
+ *   it places the Pump UserVolumeAccumulator in the correct remaining-account
+ *   position before the trailing fee-recipient account.
+ * - Initializes the user's Pump UserVolumeAccumulator first when required.
+ * - Does NOT manually reorder or append the accumulator to the Sell instruction.
+ *
+ * This is intentionally a surgical V7 based on the full V6 file, rather than
+ * a shortened rewrite, so the Python JSON contract, ATA recovery, Token-2022
+ * handling, priority-fee handling, and error reporting remain unchanged.
  */
 
 const {
@@ -71,6 +79,12 @@ const bs58 = require("bs58");
 const PRIORITY_LEVEL = "High";
 
 const FALLBACK_PRIORITY_FEE_MICROLAMPORTS = 10_000;
+
+
+// Pump.fun main bonding-curve program.
+const PUMP_PROGRAM_ID = new PublicKey(
+  "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P"
+);
 
 
 // ---------------------------------------------------------------------------
@@ -1181,13 +1195,96 @@ async function main() {
 
     mayhemMode,
 
+    // IMPORTANT V7 FIX:
+    // Pump.fun sellInstructions() uses this flag to place the Pump
+    // UserVolumeAccumulator in the correct remaining-account position for
+    // cashback-enabled coins. V6 hard-coded this to false, which can leave the
+    // trailing fee-recipient account in the slot the on-chain program expects
+    // to contain the cashback accumulator, producing error 6073.
     cashback:
-      false,
+      Boolean(
+        bondingCurve.isCashbackCoin ??
+        bondingCurve.is_cashback_coin ??
+        false
+      ),
   };
 
 
   const offlineSdk =
     new PumpSdk();
+
+
+  // -------------------------------------------------------------------------
+  // V7 FIX: Prepare the Pump UserVolumeAccumulator when cashback is enabled
+  // -------------------------------------------------------------------------
+  //
+  // The Pump cashback account is:
+  //
+  //   PDA("user_volume_accumulator", user)
+  //
+  // under the Pump bonding-curve program.
+  //
+  // We do NOT manually append this PDA to the sell instruction. The SDK owns
+  // the account ordering when `cashback: true` is supplied.
+  // -------------------------------------------------------------------------
+
+  const cashbackEnabled =
+    Boolean(
+      bondingCurve.isCashbackCoin ??
+      bondingCurve.is_cashback_coin ??
+      false
+    );
+
+  let userVolumeAccumulator;
+  let userVolumeAccumulatorSetupInstructions = [];
+  let userVolumeAccumulatorCreated = false;
+
+  if (
+    cashbackEnabled
+  ) {
+    [
+      userVolumeAccumulator
+    ] =
+      PublicKey.findProgramAddressSync(
+        [
+          Buffer.from(
+            "user_volume_accumulator"
+          ),
+          user.toBuffer(),
+        ],
+        PUMP_PROGRAM_ID
+      );
+
+    const userVolumeAccumulatorInfo =
+      await connection.getAccountInfo(
+        userVolumeAccumulator,
+        "processed"
+      );
+
+    if (
+      !userVolumeAccumulatorInfo
+    ) {
+      if (
+        typeof offlineSdk.initUserVolumeAccumulator !==
+        "function"
+      ) {
+        throw new Error(
+          "pumpfun_init_user_volume_accumulator_method_unavailable"
+        );
+      }
+
+      userVolumeAccumulatorSetupInstructions.push(
+        await offlineSdk.initUserVolumeAccumulator({
+          payer:
+            user,
+          user,
+        })
+      );
+
+      userVolumeAccumulatorCreated =
+        true;
+    }
+  }
 
 
   // -------------------------------------------------------------------------
@@ -1308,6 +1405,8 @@ async function main() {
   // -------------------------------------------------------------------------
 
   const setupInstructions = [
+    ...userVolumeAccumulatorSetupInstructions,
+
     ...bondingCurveAtaPreparation
       .setupInstructions,
 
@@ -1527,6 +1626,17 @@ async function main() {
         bondingCurveAtaPreparation
           .ataCreated,
 
+      cashback_enabled:
+        cashbackEnabled,
+
+      user_volume_accumulator:
+        userVolumeAccumulator
+          ? userVolumeAccumulator.toBase58()
+          : null,
+
+      user_volume_accumulator_created:
+        userVolumeAccumulatorCreated,
+
       sell_builder_mode:
         sellBuilderMode,
 
@@ -1564,5 +1674,3 @@ main().catch(
     // The Python wrapper treats the JSON response as the authoritative
     // result, so return exit code 0 with success=false.
     process.exit(0);
-  }
-);
