@@ -28,6 +28,10 @@ def build_application() -> Application:
 
     application.add_handler(CommandHandler("enable", handlers_admin.enable_cmd))
     application.add_handler(CommandHandler("disable", handlers_admin.disable_cmd))
+    application.add_handler(CommandHandler("enableanoncoin", handlers_admin.enableanoncoin_cmd))
+    application.add_handler(CommandHandler("disableanoncoin", handlers_admin.disableanoncoin_cmd))
+    application.add_handler(CommandHandler("enablepumpfun", handlers_admin.enablepumpfun_cmd))
+    application.add_handler(CommandHandler("disablepumpfun", handlers_admin.disablepumpfun_cmd))
     application.add_handler(CommandHandler("paper", handlers_admin.paper_cmd))
     application.add_handler(CommandHandler("live", handlers_admin.live_cmd))
     application.add_handler(CommandHandler("disconnectwallet", handlers_wallet.disconnectwallet_cmd))
