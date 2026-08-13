@@ -26,6 +26,10 @@ import logging
 from datetime import datetime, timedelta, timezone
 
 from app.config.settings import settings
+from app.connectors.solana_tracker import (
+    SolanaTrackerClient,
+    SmartMoneySignal,
+)
 
 from app.connectors.anoncoin import (
     AnoncoinAPIError,
@@ -128,6 +132,11 @@ class ScannerService:
         self._anoncoin = anoncoin
         self._holders_client = holders_client
         self._execution_router = execution_router
+
+        # Phase 1 smart-money telemetry. This is intentionally read-only
+        # and is queried only after the existing qualification threshold
+        # is passed. It never gates the existing trade decision.
+        self._smart_money = SolanaTrackerClient()
 
         self._watermarks = (
             onchain_watcher.WatermarkStore()
@@ -663,6 +672,85 @@ class ScannerService:
             holder_count,
         )
 
+
+    # ------------------------------------------------------------------
+    # Phase 1 smart-money telemetry
+    # ------------------------------------------------------------------
+
+    async def _get_smart_money_signal(
+        self,
+        token,
+        first_seen: datetime | None = None,
+    ) -> SmartMoneySignal:
+        """Inspect tracked-wallet activity for an already-qualified token.
+
+        This is deliberately called AFTER hard filters and the qualification
+        score pass. A failure here returns an empty signal and never changes
+        the existing trading path.
+        """
+        if token.source != SOURCE_PUMPFUN:
+            return SmartMoneySignal(detected=False)
+
+        if not settings.smart_money_enabled:
+            return SmartMoneySignal(detected=False)
+
+        if not self._smart_money.enabled:
+            logger.info(
+                "smart_money_disabled_or_unconfigured",
+                extra={"mint": token.mint},
+            )
+            return SmartMoneySignal(detected=False)
+
+        observed_at = (
+            first_seen
+            or getattr(token, "created_on", None)
+            or datetime.now(timezone.utc)
+        )
+
+        try:
+            signal = await self._smart_money.find_smart_money(
+                token.mint,
+                first_seen_timestamp=observed_at.timestamp(),
+            )
+        except Exception as exc:
+            logger.exception(
+                "smart_money_check_failed",
+                extra={
+                    "mint": token.mint,
+                    "error": str(exc),
+                },
+            )
+            return SmartMoneySignal(detected=False)
+
+        if signal.detected:
+            logger.info(
+                "smart_money_signal_detected",
+                extra={
+                    "mint": token.mint,
+                    "score": signal.score,
+                    "wallet_count": signal.wallet_count,
+                    "wallets": [
+                        trade.wallet
+                        for trade in signal.trades[:5]
+                    ],
+                    "buys_usd": [
+                        trade.amount_usd
+                        for trade in signal.trades[:5]
+                    ],
+                    "latencies_seconds": [
+                        trade.seconds_after_seen
+                        for trade in signal.trades[:5]
+                    ],
+                },
+            )
+        else:
+            logger.info(
+                "smart_money_no_signal",
+                extra={"mint": token.mint},
+            )
+
+        return signal
+
     # ------------------------------------------------------------------
     # Trade
     # ------------------------------------------------------------------
@@ -1100,6 +1188,22 @@ class ScannerService:
             },
         )
 
+        # --------------------------------------------------------------
+        # Phase 1 Smart Money
+        #
+        # IMPORTANT:
+        # - Existing qualification has already passed.
+        # - Smart money is telemetry only in Phase 1.
+        # - It does NOT gate or alter the BUY decision.
+        # - It is only queried for Pump.fun.
+        # --------------------------------------------------------------
+        smart_money_signal = (
+            await self._get_smart_money_signal(
+                token,
+                first_seen=token.created_on,
+            )
+        )
+
         await self._notifier.new_qualified_token(
             rule.created_by,
             (
@@ -1109,6 +1213,28 @@ class ScannerService:
             token.mint,
             score_result.score,
             token.source,
+        )
+
+        # Keep the existing Telegram notifier call untouched until its
+        # implementation is provided. Smart-money data is available in
+        # structured logs for Phase 1 and can be rendered by notifier.py /
+        # telegram_app.py without risking the working trade path.
+        logger.info(
+            "qualified_token_smart_money_summary",
+            extra={
+                "mint": token.mint,
+                "rule_id": rule.id,
+                "rule_score": score_result.score,
+                "smart_money_detected": (
+                    smart_money_signal.detected
+                ),
+                "smart_money_score": (
+                    smart_money_signal.score
+                ),
+                "smart_money_wallet_count": (
+                    smart_money_signal.wallet_count
+                ),
+            },
         )
 
         return await self._maybe_trade(
