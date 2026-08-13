@@ -28,6 +28,11 @@
  *
  * Pump.fun bonding-curve sells only.
  * Graduated tokens must be routed through the AMM executor.
+ *
+ * V5:
+ * - Explicitly handles Pump UserVolumeAccumulator.
+ * - Initializes the accumulator when missing.
+ * - Adds the accumulator as the first writable remaining account.
  */
 
 const {
@@ -42,6 +47,7 @@ const {
   OnlinePumpSdk,
   getSellSolAmountFromTokenAmount,
   bondingCurvePda,
+  userVolumeAccumulatorPda,
 } = require("@pump-fun/pump-sdk");
 
 const {
@@ -56,176 +62,92 @@ const {
 const BN = require("bn.js");
 const bs58 = require("bs58");
 
-
-// ---------------------------------------------------------------------------
-// Configuration
-// ---------------------------------------------------------------------------
-
 const PRIORITY_LEVEL = "High";
-
 const FALLBACK_PRIORITY_FEE_MICROLAMPORTS = 10_000;
 
+function slippageBpsToPercent(slippageBps) {
+  const bps = Number(slippageBps);
 
-// ---------------------------------------------------------------------------
-// Slippage
-// ---------------------------------------------------------------------------
-//
-// Python supplies basis points.
-//
-//     100 bps = 1%
-//     300 bps = 3%
-//     500 bps = 5%
-//
-// Pump SDK expects percentage:
-//
-//     1 = 1%
-//     3 = 3%
-//     5 = 5%
-//
-
-function slippageBpsToPercent(
-  slippageBps
-) {
-  const bps = Number(
-    slippageBps
-  );
-
-  if (
-    !Number.isFinite(bps) ||
-    bps < 0
-  ) {
+  if (!Number.isFinite(bps) || bps < 0) {
     return 3;
   }
 
   return bps / 100;
 }
 
-
-// ---------------------------------------------------------------------------
-// stdin
-// ---------------------------------------------------------------------------
-
 function readStdin() {
-  return new Promise(
-    (resolve, reject) => {
-      let data = "";
+  return new Promise((resolve, reject) => {
+    let data = "";
 
-      process.stdin.on(
-        "data",
-        (chunk) => {
-          data += chunk;
-        }
-      );
-
-      process.stdin.on(
-        "end",
-        () => {
-          resolve(data);
-        }
-      );
-
-      process.stdin.on(
-        "error",
-        reject
-      );
-    }
-  );
-}
-
-
-// ---------------------------------------------------------------------------
-// Helius priority fee estimation
-// ---------------------------------------------------------------------------
-
-async function getPriorityFeeEstimate(
-  connection,
-  transaction
-) {
-  const serialized =
-    transaction.serialize({
-      requireAllSignatures:
-        false,
-
-      verifySignatures:
-        false,
+    process.stdin.on("data", (chunk) => {
+      data += chunk;
     });
 
-  const serializedBase58 =
-    bs58.encode(
-      serialized
-    );
+    process.stdin.on("end", () => {
+      resolve(data);
+    });
 
-  const response =
-    await fetch(
-      connection.rpcEndpoint,
-      {
-        method: "POST",
+    process.stdin.on("error", reject);
+  });
+}
 
-        headers: {
-          "Content-Type":
-            "application/json",
+async function getPriorityFeeEstimate(connection, transaction) {
+  const serialized = transaction.serialize({
+    requireAllSignatures: false,
+    verifySignatures: false,
+  });
+
+  const serializedBase58 = bs58.encode(serialized);
+
+  const response = await fetch(connection.rpcEndpoint, {
+    method: "POST",
+
+    headers: {
+      "Content-Type": "application/json",
+    },
+
+    body: JSON.stringify({
+      jsonrpc: "2.0",
+
+      id: "anon-tradebot-pumpfun-sell-priority-fee",
+
+      method: "getPriorityFeeEstimate",
+
+      params: [
+        {
+          transaction: serializedBase58,
+
+          options: {
+            priorityLevel: PRIORITY_LEVEL,
+            recommended: true,
+          },
         },
+      ],
+    }),
+  });
 
-        body: JSON.stringify({
-          jsonrpc: "2.0",
-
-          id:
-            "anon-tradebot-pumpfun-sell-priority-fee",
-
-          method:
-            "getPriorityFeeEstimate",
-
-          params: [
-            {
-              transaction:
-                serializedBase58,
-
-              options: {
-                priorityLevel:
-                  PRIORITY_LEVEL,
-
-                recommended:
-                  true,
-              },
-            },
-          ],
-        }),
-      }
-    );
-
-  if (
-    !response.ok
-  ) {
+  if (!response.ok) {
     throw new Error(
       `Helius priority fee request failed with HTTP ${response.status}`
     );
   }
 
-  const body =
-    await response.json();
+  const body = await response.json();
 
-  if (
-    body.error
-  ) {
+  if (body.error) {
     throw new Error(
       "Helius priority fee RPC error: " +
-      JSON.stringify(
-        body.error
-      )
+      JSON.stringify(body.error)
     );
   }
 
   const estimate =
-    body?.result
-      ?.priorityFeeEstimate;
+    body?.result?.priorityFeeEstimate;
 
   if (
-    estimate ===
-      undefined ||
+    estimate === undefined ||
     estimate === null ||
-    !Number.isFinite(
-      Number(estimate)
-    ) ||
+    !Number.isFinite(Number(estimate)) ||
     Number(estimate) < 0
   ) {
     throw new Error(
@@ -234,65 +156,35 @@ async function getPriorityFeeEstimate(
     );
   }
 
-  return Math.ceil(
-    Number(estimate)
-  );
+  return Math.ceil(Number(estimate));
 }
 
-
-// ---------------------------------------------------------------------------
-// Compute Budget detection
-// ---------------------------------------------------------------------------
-
-function hasComputeUnitPriceInstruction(
-  transaction
-) {
-  return transaction.instructions.some(
-    (instruction) => {
-
-      if (
-        !instruction.programId.equals(
-          ComputeBudgetProgram.programId
-        )
-      ) {
-        return false;
-      }
-
-      if (
-        !instruction.data ||
-        instruction.data.length === 0
-      ) {
-        return false;
-      }
-
-      // Compute Budget:
-      //
-      // 2 = SetComputeUnitLimit
-      // 3 = SetComputeUnitPrice
-
-      return (
-        instruction.data[0] === 3
-      );
+function hasComputeUnitPriceInstruction(transaction) {
+  return transaction.instructions.some((instruction) => {
+    if (
+      !instruction.programId.equals(
+        ComputeBudgetProgram.programId
+      )
+    ) {
+      return false;
     }
-  );
+
+    if (
+      !instruction.data ||
+      instruction.data.length === 0
+    ) {
+      return false;
+    }
+
+    return instruction.data[0] === 3;
+  });
 }
 
-
-// ---------------------------------------------------------------------------
-// Positive integer validation
-// ---------------------------------------------------------------------------
-
-function requirePositiveInteger(
-  value,
-  field
-) {
-  const parsed =
-    Number(value);
+function requirePositiveInteger(value, field) {
+  const parsed = Number(value);
 
   if (
-    !Number.isSafeInteger(
-      parsed
-    ) ||
+    !Number.isSafeInteger(parsed) ||
     parsed <= 0
   ) {
     throw new Error(
@@ -302,17 +194,6 @@ function requirePositiveInteger(
 
   return parsed;
 }
-
-
-// ---------------------------------------------------------------------------
-// Direct wallet token balance
-// ---------------------------------------------------------------------------
-//
-// The installed Pump.fun SDK does not reliably expose getTokenBalance().
-// Read the wallet's parsed token accounts directly from Solana RPC.
-//
-// This supports normal SPL Token and Token-2022 accounts.
-// ---------------------------------------------------------------------------
 
 async function getWalletTokenBalance(
   connection,
@@ -328,12 +209,9 @@ async function getWalletTokenBalance(
       "processed"
     );
 
-  let totalBalance =
-    new BN(0);
+  let totalBalance = new BN(0);
 
-  for (
-    const account of response.value
-  ) {
+  for (const account of response.value) {
     const tokenAmount =
       account?.account?.data?.parsed
         ?.info?.tokenAmount?.amount;
@@ -345,31 +223,13 @@ async function getWalletTokenBalance(
       continue;
     }
 
-    totalBalance =
-      totalBalance.add(
-        new BN(
-          String(tokenAmount)
-        )
-      );
+    totalBalance = totalBalance.add(
+      new BN(String(tokenAmount))
+    );
   }
 
   return totalBalance;
 }
-
-
-// ---------------------------------------------------------------------------
-// Resolve the token program from the actual mint account
-// ---------------------------------------------------------------------------
-//
-// fetchSellState() defaults to classic TOKEN_PROGRAM_ID when no
-// tokenProgram is passed in, and pump.fun's current token creation path
-// (createV2) mints under TOKEN_2022_PROGRAM_ID. Relying on that default
-// derives the associated token account at the wrong address for any
-// Token-2022 mint.
-//
-// The mint account's owner is authoritative, so resolve the token program
-// directly from the mint before asking the SDK for sell state.
-// ---------------------------------------------------------------------------
 
 async function resolveActualTokenProgram(
   connection,
@@ -387,21 +247,16 @@ async function resolveActualTokenProgram(
     );
   }
 
-  const owner =
-    mintAccount.owner;
+  const owner = mintAccount.owner;
 
   if (
-    owner.equals(
-      TOKEN_PROGRAM_ID
-    )
+    owner.equals(TOKEN_PROGRAM_ID)
   ) {
     return TOKEN_PROGRAM_ID;
   }
 
   if (
-    owner.equals(
-      TOKEN_2022_PROGRAM_ID
-    )
+    owner.equals(TOKEN_2022_PROGRAM_ID)
   ) {
     return TOKEN_2022_PROGRAM_ID;
   }
@@ -413,21 +268,150 @@ async function resolveActualTokenProgram(
 
 
 // ---------------------------------------------------------------------------
-// FIX: Prepare Pump.fun bonding curve ATA
+// V5 FIX: Pump user volume accumulator
 // ---------------------------------------------------------------------------
-//
-// Pump.fun's Sell instruction expects the bonding curve's associated token
-// account to already be initialized.
-//
-// If that ATA does not exist, the Sell instruction fails:
-//
-//     AccountNotInitialized
-//     Error Number: 3012
-//     account: associatedbondingcurve
-//
-// We therefore derive the ATA from the ACTUAL bonding curve PDA and mint,
-// check whether it exists, and create it idempotently before the Sell
-// instruction when necessary.
+
+const PUMP_PROGRAM_ID =
+  new PublicKey(
+    "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P"
+  );
+
+function resolveUserVolumeAccumulatorPda(user) {
+  if (
+    typeof userVolumeAccumulatorPda ===
+    "function"
+  ) {
+    return userVolumeAccumulatorPda(user);
+  }
+
+  const [pda] =
+    PublicKey.findProgramAddressSync(
+      [
+        Buffer.from(
+          "user_volume_accumulator"
+        ),
+        user.toBuffer(),
+      ],
+      PUMP_PROGRAM_ID
+    );
+
+  return pda;
+}
+
+async function prepareUserVolumeAccumulator(
+  connection,
+  user,
+  payer,
+  offlineSdk
+) {
+  const accumulator =
+    resolveUserVolumeAccumulatorPda(user);
+
+  const accountInfo =
+    await connection.getAccountInfo(
+      accumulator,
+      "processed"
+    );
+
+  if (accountInfo) {
+    return {
+      accumulator,
+      setupInstructions: [],
+      initialized: false,
+    };
+  }
+
+  if (
+    !offlineSdk ||
+    typeof offlineSdk.initUserVolumeAccumulator !==
+      "function"
+  ) {
+    throw new Error(
+      "pumpfun_init_user_volume_accumulator_method_unavailable"
+    );
+  }
+
+  const initInstruction =
+    await offlineSdk.initUserVolumeAccumulator({
+      payer,
+      user,
+    });
+
+  return {
+    accumulator,
+    setupInstructions: [
+      initInstruction,
+    ],
+    initialized: true,
+  };
+}
+
+function ensureUserVolumeAccumulatorRemainingAccount(
+  instructions,
+  accumulator
+) {
+  if (
+    !instructions ||
+    !Array.isArray(instructions) ||
+    instructions.length === 0
+  ) {
+    throw new Error(
+      "pumpfun_sell_instructions_empty"
+    );
+  }
+
+  const sellInstruction =
+    instructions[
+      instructions.length - 1
+    ];
+
+  if (
+    !sellInstruction ||
+    !Array.isArray(
+      sellInstruction.keys
+    )
+  ) {
+    throw new Error(
+      "pumpfun_sell_instruction_keys_missing"
+    );
+  }
+
+  const existingIndex =
+    sellInstruction.keys.findIndex(
+      (key) =>
+        key &&
+        key.pubkey &&
+        key.pubkey.equals(
+          accumulator
+        )
+    );
+
+  if (existingIndex >= 0) {
+    const [existing] =
+      sellInstruction.keys.splice(
+        existingIndex,
+        1
+      );
+
+    existing.isWritable = true;
+
+    sellInstruction.keys.push(
+      existing
+    );
+
+    return;
+  }
+
+  sellInstruction.keys.push({
+    pubkey: accumulator,
+    isSigner: false,
+    isWritable: true,
+  });
+}
+
+
+// ---------------------------------------------------------------------------
+// Pump.fun bonding curve ATA
 // ---------------------------------------------------------------------------
 
 async function prepareBondingCurveAta(
@@ -481,7 +465,7 @@ async function prepareBondingCurveAta(
 
 
 // ---------------------------------------------------------------------------
-// Prepare canonical user token ATA
+// Canonical user token ATA
 // ---------------------------------------------------------------------------
 
 async function prepareCanonicalSellAccount(
@@ -523,9 +507,7 @@ async function prepareCanonicalSellAccount(
     );
 
   let remaining =
-    new BN(
-      amount.toString()
-    );
+    new BN(amount.toString());
 
   const sourceAccounts = [];
 
@@ -533,7 +515,8 @@ async function prepareCanonicalSellAccount(
     const account of accounts.value
   ) {
     const info =
-      account?.account?.data?.parsed?.info;
+      account?.account?.data?.parsed
+        ?.info;
 
     const sourceOwner =
       info?.owner;
@@ -564,14 +547,10 @@ async function prepareCanonicalSellAccount(
     }
 
     const balance =
-      new BN(
-        String(rawAmount)
-      );
+      new BN(String(rawAmount));
 
     if (
-      balance.lte(
-        new BN(0)
-      )
+      balance.lte(new BN(0))
     ) {
       continue;
     }
@@ -582,23 +561,17 @@ async function prepareCanonicalSellAccount(
     });
 
     if (
-      balance.gte(
-        remaining
-      )
+      balance.gte(remaining)
     ) {
       break;
     }
 
     remaining =
-      remaining.sub(
-        balance
-      );
+      remaining.sub(balance);
   }
 
   if (
-    remaining.gt(
-      new BN(0)
-    )
+    remaining.gt(new BN(0))
   ) {
     throw new Error(
       "pumpfun_canonical_ata_missing_and_source_token_account_insufficient"
@@ -619,9 +592,7 @@ async function prepareCanonicalSellAccount(
   );
 
   let transferRemaining =
-    new BN(
-      amount.toString()
-    );
+    new BN(amount.toString());
 
   for (
     const sourceAccount of
@@ -676,9 +647,7 @@ async function prepareCanonicalSellAccount(
     setupInstructions,
     ataCreated: true,
     tokensMovedToAta:
-      new BN(
-        amount.toString()
-      ),
+      new BN(amount.toString()),
   };
 }
 
@@ -1153,8 +1122,6 @@ async function main() {
   const sellInstructionParams = {
     ...sellState,
 
-    // Always force the token program resolved from the mint.
-    // This prevents the SDK from deriving/checking the wrong ATA.
     tokenProgram,
 
     global,
@@ -1183,7 +1150,20 @@ async function main() {
 
 
   // -------------------------------------------------------------------------
-  // FIX: Prepare bonding curve ATA BEFORE Pump.fun Sell
+  // V5 FIX: Prepare Pump user volume accumulator
+  // -------------------------------------------------------------------------
+
+  const userVolumeAccumulatorPreparation =
+    await prepareUserVolumeAccumulator(
+      connection,
+      user,
+      user,
+      offlineSdk
+    );
+
+
+  // -------------------------------------------------------------------------
+  // Prepare bonding curve ATA
   // -------------------------------------------------------------------------
 
   const bondingCurveAddress =
@@ -1296,10 +1276,24 @@ async function main() {
 
 
   // -------------------------------------------------------------------------
+  // V5 FIX: Explicitly attach Pump UserVolumeAccumulator
+  // -------------------------------------------------------------------------
+
+  ensureUserVolumeAccumulatorRemainingAccount(
+    instructions,
+    userVolumeAccumulatorPreparation
+      .accumulator
+  );
+
+
+  // -------------------------------------------------------------------------
   // Prepend required account setup instructions
   // -------------------------------------------------------------------------
 
   const setupInstructions = [
+    ...userVolumeAccumulatorPreparation
+      .setupInstructions,
+
     ...bondingCurveAtaPreparation
       .setupInstructions,
 
@@ -1377,8 +1371,7 @@ async function main() {
         feeError
       }`
     );
-  }
-
+}
 
   // -------------------------------------------------------------------------
   // Add priority fee if not already present
@@ -1518,6 +1511,18 @@ async function main() {
       bonding_curve_ata_created:
         bondingCurveAtaPreparation
           .ataCreated,
+
+      user_volume_accumulator:
+        userVolumeAccumulatorPreparation
+          .accumulator
+          .toBase58(),
+
+      user_volume_accumulator_initialized:
+        userVolumeAccumulatorPreparation
+          .initialized,
+
+      user_volume_accumulator_attached:
+        true,
 
       sell_builder_mode:
         sellBuilderMode,
