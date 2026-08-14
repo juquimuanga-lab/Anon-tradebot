@@ -357,6 +357,7 @@ async def _get_transaction_details(
                 signature,
                 {
                     "commitment": RPC_COMMITMENT,
+                    "encoding": "jsonParsed",
                     "maxSupportedTransactionVersion": 0,
                 },
             ],
@@ -364,6 +365,189 @@ async def _get_transaction_details(
 
     except SolanaTxError:
         return None
+
+
+async def get_transaction_details(
+    rpc_url: str,
+    signature: str,
+) -> Optional[dict]:
+    """Return confirmed transaction details for post-trade reconciliation.
+
+    This is a thin public wrapper around the existing diagnostic RPC call.
+    It intentionally does not change send/confirm behavior.
+    """
+    return await _get_transaction_details(
+        rpc_url,
+        signature,
+    )
+
+
+def extract_wallet_trade_execution(
+    transaction: Optional[dict],
+    owner_pubkey: str,
+    token_mint: str,
+) -> Optional[dict]:
+    """Extract actual wallet SOL/token deltas from a confirmed transaction.
+
+    Returns:
+        {
+            "sol_spent_lamports": int,
+            "token_received_raw": int,
+            "token_decimals": int,
+            "fee_lamports": int,
+            "sol_spent_excluding_fee_lamports": int,
+        }
+
+    The token amount comes from pre/post token balances and the SOL amount
+    comes from the owner's pre/post lamport balance, less the transaction fee.
+    This is used only for confirmed trade reconciliation; it never affects
+    transaction construction or signing.
+    """
+    if not transaction:
+        return None
+
+    meta = transaction.get("meta") or {}
+    message = (
+        (transaction.get("transaction") or {}).get("message")
+        or {}
+    )
+
+    pre_balances = meta.get("preBalances") or []
+    post_balances = meta.get("postBalances") or []
+    account_keys = message.get("accountKeys") or []
+
+    owner_index = None
+    owner = str(owner_pubkey)
+
+    for index, key in enumerate(account_keys):
+        if isinstance(key, dict):
+            key_value = (
+                key.get("pubkey")
+                or key.get("address")
+                or key.get("key")
+            )
+        else:
+            key_value = key
+
+        if str(key_value) == owner:
+            owner_index = index
+            break
+
+    if owner_index is None:
+        return None
+
+    if owner_index >= len(pre_balances) or owner_index >= len(post_balances):
+        return None
+
+    wallet_delta_lamports = (
+        int(pre_balances[owner_index])
+        - int(post_balances[owner_index])
+    )
+
+    fee_lamports = int(meta.get("fee") or 0)
+
+    # Prefer the actual System Program transfer initiated by the wallet.
+    # This avoids counting ATA/account rent as part of the token purchase.
+    # Pump.fun's bonding-curve BUY ultimately moves SOL from the buyer
+    # through a parsed SystemProgram transfer.
+    transfer_lamports = 0
+
+    def _scan_instructions(instructions):
+        nonlocal transfer_lamports
+
+        for instruction in instructions or []:
+            parsed = instruction.get("parsed")
+            if not isinstance(parsed, dict):
+                continue
+
+            if parsed.get("type") != "transfer":
+                continue
+
+            info = parsed.get("info") or {}
+            source = str(info.get("source") or "")
+            lamports = info.get("lamports")
+
+            if source == owner and lamports is not None:
+                try:
+                    transfer_lamports += int(lamports)
+                except (TypeError, ValueError):
+                    pass
+
+    message_instructions = (
+        message.get("instructions") or []
+    )
+    _scan_instructions(message_instructions)
+
+    for inner_group in meta.get("innerInstructions") or []:
+        _scan_instructions(
+            inner_group.get("instructions") or []
+        )
+
+    # For Pump.fun, the parsed transfer is the preferred cost basis.
+    # If an RPC omits parsed inner instructions, fall back to wallet
+    # balance delta minus network fee.
+    if transfer_lamports > 0:
+        sol_spent_excluding_fee = transfer_lamports
+    else:
+        sol_spent_excluding_fee = (
+            wallet_delta_lamports - fee_lamports
+        )
+
+    if sol_spent_excluding_fee <= 0:
+        return None
+
+    pre_tokens = {}
+    post_tokens = {}
+
+    for item in meta.get("preTokenBalances") or []:
+        if str(item.get("mint")) != str(token_mint):
+            continue
+        if item.get("owner") and str(item.get("owner")) != owner:
+            continue
+
+        amount_info = item.get("uiTokenAmount") or {}
+        raw = amount_info.get("amount")
+        if raw is not None:
+            pre_tokens[str(item.get("accountIndex"))] = (
+                int(raw),
+                int(amount_info.get("decimals") or 0),
+            )
+
+    for item in meta.get("postTokenBalances") or []:
+        if str(item.get("mint")) != str(token_mint):
+            continue
+        if item.get("owner") and str(item.get("owner")) != owner:
+            continue
+
+        amount_info = item.get("uiTokenAmount") or {}
+        raw = amount_info.get("amount")
+        if raw is not None:
+            post_tokens[str(item.get("accountIndex"))] = (
+                int(raw),
+                int(amount_info.get("decimals") or 0),
+            )
+
+    indexes = set(pre_tokens) | set(post_tokens)
+    token_delta_raw = 0
+    decimals = 0
+
+    for index in indexes:
+        pre_raw, pre_decimals = pre_tokens.get(index, (0, 0))
+        post_raw, post_decimals = post_tokens.get(index, (0, 0))
+        token_delta_raw += post_raw - pre_raw
+        decimals = post_decimals or pre_decimals or decimals
+
+    if token_delta_raw <= 0:
+        return None
+
+    return {
+        "sol_spent_lamports": wallet_delta_lamports,
+        "sol_transfer_lamports": transfer_lamports,
+        "fee_lamports": fee_lamports,
+        "sol_spent_excluding_fee_lamports": sol_spent_excluding_fee,
+        "token_received_raw": token_delta_raw,
+        "token_decimals": decimals,
+    }
 
 
 def _format_transaction_error(
