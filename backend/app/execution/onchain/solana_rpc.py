@@ -84,7 +84,16 @@ async def _rpc_request(
     method: str,
     params: list[Any],
 ) -> Any:
-    """Execute a Solana JSON-RPC request with optional Alchemy failover."""
+    """Execute a Solana JSON-RPC request with controlled Alchemy failover.
+
+    IMPORTANT:
+    - Helius remains the primary RPC.
+    - Alchemy is used only for genuine provider/transport failures.
+    - Deterministic JSON-RPC errors (especially sendTransaction simulation
+      errors) are NOT retried through Alchemy because the same signed
+      transaction would normally fail there too and the original error is
+      more useful to the execution layer.
+    """
 
     urls = [rpc_url]
     fallback = getattr(settings, "alchemy_solana_rpc_url", None)
@@ -92,6 +101,11 @@ async def _rpc_request(
         urls.append(fallback)
 
     last_error = None
+
+    # Errors that mean the primary provider itself is unavailable or throttled.
+    # These are the only cases where switching providers is useful.
+    retryable_http_statuses = {408, 425, 429, 500, 502, 503, 504}
+    retryable_rpc_codes = {-32005, -32004, -32001}
 
     for index, url in enumerate(urls):
         payload = {
@@ -110,31 +124,163 @@ async def _rpc_request(
                     json=payload,
                     headers={"Content-Type": "application/json"},
                 )
-                response.raise_for_status()
+
+                status_code = response.status_code
+                body_text = response.text[:2000]
+
+                logger.info(
+                    "solana_rpc_response",
+                    extra={
+                        "method": method,
+                        "provider": "primary" if index == 0 else "alchemy",
+                        "http_status": status_code,
+                    },
+                )
+
+                if status_code >= 400:
+                    # Preserve the actual HTTP response for diagnosis.
+                    exc = httpx.HTTPStatusError(
+                        f"HTTP {status_code}: {body_text}",
+                        request=response.request,
+                        response=response,
+                    )
+                    raise exc
+
                 body = response.json()
 
             if "error" in body:
+                rpc_error = body["error"] or {}
+                rpc_code = rpc_error.get("code")
+                rpc_message = rpc_error.get("message")
+
+                logger.warning(
+                    "solana_rpc_jsonrpc_error",
+                    extra={
+                        "method": method,
+                        "provider": "primary" if index == 0 else "alchemy",
+                        "rpc_code": rpc_code,
+                        "rpc_message": redact_text(str(rpc_message)),
+                        "rpc_error": redact_text(str(rpc_error)),
+                    },
+                )
+
+                # Deterministic transaction errors must reach send_and_confirm
+                # so the caller can see the real Pump.fun/preflight failure.
+                if rpc_code not in retryable_rpc_codes:
+                    raise SolanaTxError(
+                        redact_text(
+                            f"RPC {method} error: {rpc_error}"
+                        )
+                    )
+
                 raise SolanaTxError(
                     redact_text(
-                        f"RPC {method} error: {body['error']}"
+                        f"retryable RPC {method} error: {rpc_error}"
                     )
                 )
 
             return body.get("result")
 
-        except Exception as exc:
+        except SolanaTxError as exc:
             last_error = exc
 
-            if index < len(urls) - 1:
+            # Only provider-unavailable JSON-RPC codes are eligible for
+            # failover. Simulation, slippage, invalid params, blockhash and
+            # account errors remain on the primary path and are surfaced.
+            lower = str(exc).lower()
+            retryable = "retryable rpc" in lower
+
+            if index < len(urls) - 1 and retryable:
                 logger.warning(
-                    "solana_rpc_primary_failed_using_alchemy",
+                    "solana_rpc_primary_retrying_with_alchemy",
                     extra={
                         "method": method,
                         "error": redact_text(str(exc)),
+                        "fallback": "alchemy",
                     },
                 )
                 continue
 
+            raise SolanaTxError(
+                redact_text(
+                    f"RPC request failed ({method}): {exc}"
+                )
+            ) from exc
+
+        except httpx.HTTPStatusError as exc:
+            last_error = exc
+            status_code = exc.response.status_code
+            retryable = status_code in retryable_http_statuses
+
+            logger.warning(
+                "solana_rpc_http_error",
+                extra={
+                    "method": method,
+                    "provider": "primary" if index == 0 else "alchemy",
+                    "http_status": status_code,
+                    "retryable": retryable,
+                    "error": redact_text(str(exc)),
+                },
+            )
+
+            if index < len(urls) - 1 and retryable:
+                logger.warning(
+                    "solana_rpc_primary_retrying_with_alchemy",
+                    extra={
+                        "method": method,
+                        "http_status": status_code,
+                        "fallback": "alchemy",
+                    },
+                )
+                continue
+
+            raise SolanaTxError(
+                redact_text(
+                    f"RPC request failed ({method}): HTTP {status_code}: {exc}"
+                )
+            ) from exc
+
+        except (httpx.TimeoutException, httpx.NetworkError) as exc:
+            last_error = exc
+
+            logger.warning(
+                "solana_rpc_transport_error",
+                extra={
+                    "method": method,
+                    "provider": "primary" if index == 0 else "alchemy",
+                    "error_type": type(exc).__name__,
+                    "error": redact_text(str(exc)),
+                },
+            )
+
+            if index < len(urls) - 1:
+                logger.warning(
+                    "solana_rpc_primary_retrying_with_alchemy",
+                    extra={
+                        "method": method,
+                        "reason": type(exc).__name__,
+                        "fallback": "alchemy",
+                    },
+                )
+                continue
+
+            raise SolanaTxError(
+                redact_text(
+                    f"RPC request failed ({method}): {exc}"
+                )
+            ) from exc
+
+        except Exception as exc:
+            last_error = exc
+            logger.warning(
+                "solana_rpc_unexpected_error",
+                extra={
+                    "method": method,
+                    "provider": "primary" if index == 0 else "alchemy",
+                    "error_type": type(exc).__name__,
+                    "error": redact_text(str(exc)),
+                },
+            )
             raise SolanaTxError(
                 redact_text(
                     f"RPC request failed ({method}): {exc}"
