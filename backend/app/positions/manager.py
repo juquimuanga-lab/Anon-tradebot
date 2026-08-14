@@ -33,11 +33,16 @@ from app.connectors.anoncoin import AnoncoinClient
 from app.execution.base import OrderResult
 from app.execution.onchain.solana_rpc import (
     SolanaTxError,
+    extract_wallet_sell_execution,
     get_token_balance,
+    get_transaction_details,
 )
 from app.execution.price_source import (
     get_current_price_usd,
     get_current_volume_usd,
+)
+from app.scanners.price_feed import (
+    get_sol_usd_price,
 )
 from app.execution.router import ExecutionRouter
 from app.scoring.rules import RuleParams, TokenSnapshot
@@ -502,8 +507,176 @@ class PositionManager:
         )
 
     # ------------------------------------------------------------------
-    # Sell execution
+    # Sell execution reconciliation
     # ------------------------------------------------------------------
+
+    async def _actual_sell_execution(
+        self,
+        position,
+        token,
+        result,
+        trigger_price_usd: float,
+    ) -> dict | None:
+        """Reconcile a confirmed live SELL against its on-chain transaction.
+
+        The trigger price is the price used by the position manager to decide
+        that an exit condition was met. The transaction price is calculated
+        independently from confirmed token/SOL balance deltas so we can see
+        whether execution slippage or price impact caused a materially worse
+        fill.
+        """
+        if (
+            position.mode != "live"
+            or not result.tx_signature
+        ):
+            return None
+
+        wallet_pubkey = await self._get_wallet_pubkey(
+            position
+        )
+
+        if not wallet_pubkey:
+            return None
+
+        transaction = await get_transaction_details(
+            settings.solana_rpc_url,
+            result.tx_signature,
+        )
+
+        execution = extract_wallet_sell_execution(
+            transaction,
+            wallet_pubkey,
+            token.mint,
+        )
+
+        if not execution:
+            logger.warning(
+                "sell_execution_reconciliation_unavailable",
+                extra={
+                    "mint": token.mint,
+                    "position_id": position.id,
+                    "tx_signature": result.tx_signature,
+                    "trigger_price_usd": trigger_price_usd,
+                },
+            )
+            return None
+
+        sold_tokens = (
+            execution["token_sold_raw"]
+            / (
+                10 ** int(
+                    execution["token_decimals"]
+                    or 0
+                )
+            )
+        )
+
+        sol_received = (
+            execution["sol_received_lamports"]
+            / 1_000_000_000
+        )
+
+        sol_usd = 0.0
+
+        try:
+            sol_usd = float(
+                await get_sol_usd_price(
+                    settings.jupiter_price_url
+                )
+            )
+        except Exception as exc:
+            logger.warning(
+                "sell_execution_sol_price_unavailable",
+                extra={
+                    "mint": token.mint,
+                    "position_id": position.id,
+                    "tx_signature": result.tx_signature,
+                    "error": str(exc),
+                },
+            )
+
+        actual_execution_price_usd = None
+
+        if (
+            sold_tokens > 0
+            and sol_received > 0
+            and sol_usd > 0
+        ):
+            actual_execution_price_usd = (
+                sol_received
+                * sol_usd
+                / sold_tokens
+            )
+
+        trigger_vs_execution_pct = None
+
+        if (
+            actual_execution_price_usd is not None
+            and trigger_price_usd > 0
+        ):
+            trigger_vs_execution_pct = (
+                (
+                    actual_execution_price_usd
+                    - trigger_price_usd
+                )
+                / trigger_price_usd
+                * 100.0
+            )
+
+        logger.info(
+            "sell_execution_reconciled",
+            extra={
+                "mint": token.mint,
+                "position_id": position.id,
+                "tx_signature": result.tx_signature,
+                "trigger_price_usd": trigger_price_usd,
+                "actual_execution_price_usd": (
+                    actual_execution_price_usd
+                ),
+                "trigger_vs_execution_pct": (
+                    trigger_vs_execution_pct
+                ),
+                "sol_received": sol_received,
+                "wallet_net_sol_change": (
+                    execution[
+                        "wallet_net_sol_change_lamports"
+                    ]
+                    / 1_000_000_000
+                ),
+                "fee_sol": (
+                    execution["fee_lamports"]
+                    / 1_000_000_000
+                ),
+                "tokens_sold": sold_tokens,
+                "token_decimals": (
+                    execution["token_decimals"]
+                ),
+                "sol_usd": sol_usd,
+            },
+        )
+
+        return {
+            "actual_execution_price_usd": (
+                actual_execution_price_usd
+            ),
+            "sol_received": sol_received,
+            "wallet_net_sol_change": (
+                execution[
+                    "wallet_net_sol_change_lamports"
+                ]
+                / 1_000_000_000
+            ),
+            "fee_sol": (
+                execution["fee_lamports"]
+                / 1_000_000_000
+            ),
+            "tokens_sold": sold_tokens,
+            "token_decimals": (
+                execution["token_decimals"]
+            ),
+            "trigger_price_usd": trigger_price_usd,
+            "sol_usd": sol_usd,
+        }
 
     async def _close_position(
         self,
@@ -670,14 +843,44 @@ class PositionManager:
                 )
 
             # ----------------------------------------------------------
+            # Reconcile the confirmed LIVE sell against the blockchain.
+            #
+            # current_price is the price that triggered the exit. It is NOT
+            # assumed to be the price the transaction actually achieved.
+            # ----------------------------------------------------------
+
+            actual_execution = None
+
+            if result.success:
+                actual_execution = (
+                    await self._actual_sell_execution(
+                        position,
+                        token,
+                        result,
+                        current_price,
+                    )
+                )
+
+            # ----------------------------------------------------------
             # Determine exit price.
             # ----------------------------------------------------------
 
             exit_price = (
-                result.price_usd
-                if result.success
-                and result.price_usd
-                else current_price
+                actual_execution[
+                    "actual_execution_price_usd"
+                ]
+                if (
+                    actual_execution
+                    and actual_execution.get(
+                        "actual_execution_price_usd"
+                    )
+                )
+                else (
+                    result.price_usd
+                    if result.success
+                    and result.price_usd
+                    else current_price
+                )
             )
 
             # ----------------------------------------------------------
@@ -704,10 +907,36 @@ class PositionManager:
                 )
             )
 
-            proceeds = (
-                invested_portion
-                + pnl_amount
-            )
+            # For a confirmed live sell, use actual SOL proceeds for
+            # settlement/PnL whenever transaction reconciliation succeeded.
+            if actual_execution:
+                actual_proceeds_usd = (
+                    actual_execution["sol_received"]
+                    * (
+                        actual_execution["sol_usd"]
+                        if actual_execution["sol_usd"] > 0
+                        else 0.0
+                    )
+                )
+
+                if actual_proceeds_usd > 0:
+                    pnl_amount = (
+                        actual_proceeds_usd
+                        - invested_portion
+                    )
+                    proceeds = (
+                        actual_proceeds_usd
+                    )
+                else:
+                    proceeds = (
+                        invested_portion
+                        + pnl_amount
+                    )
+            else:
+                proceeds = (
+                    invested_portion
+                    + pnl_amount
+                )
 
             # ----------------------------------------------------------
             # Record order attempt.
@@ -1245,6 +1474,24 @@ class PositionManager:
                     "pnl_pct": pnl_pct,
                     "stop_loss_pct": (
                         rule.stop_loss_pct
+                    ),
+                    "trigger_price_usd": current_price,
+                    "expected_stop_price_usd": (
+                        position.entry_price_usd
+                        * (
+                            1.0
+                            - (
+                                abs(
+                                    float(
+                                        rule.stop_loss_pct
+                                    )
+                                )
+                                / 100.0
+                            )
+                        )
+                    ),
+                    "entry_price_usd": (
+                        position.entry_price_usd
                     ),
                 },
             )
