@@ -114,12 +114,13 @@ PUMPFUN_CREATE_EVENT_DISCRIMINATOR = bytes(
 PUMPFUN_STREAM_RECONNECT_SECONDS = 2.0
 PUMPFUN_STREAM_MAX_BACKOFF_SECONDS = 30.0
 PUMPFUN_FALLBACK_POLL_SECONDS = 120.0
+PUMPFUN_DEGRADED_POLL_SECONDS = 5.0
+ALCHEMY_HEALTHCHECK_TIMEOUT_SECONDS = 8.0
 PUMPFUN_FALLBACK_SIGNATURE_LIMIT = 10
 PUMPFUN_EVENT_QUEUE_MAXSIZE = 500
 
 # One stream task per watched mint-authority address.
 _pumpfun_streams: dict[str, dict] = {}
-_pumpfun_ws_health: dict[str, dict] = {}
 
 
 # ---------------------------------------------------------------------------
@@ -1585,6 +1586,105 @@ def _extract_pumpfun_event_from_logs(
     return None
 
 
+
+async def _alchemy_http_health_check() -> bool:
+    """Verify the configured Alchemy Solana HTTP endpoint independently."""
+    rpc_url = getattr(settings, "alchemy_solana_rpc_url", None)
+    if not rpc_url:
+        logger.error("alchemy_http_health_failed", extra={"error": "missing_alchemy_solana_rpc_url"})
+        return False
+
+    try:
+        response = await _direct_rpc_request(
+            rpc_url,
+            "getSlot",
+            [{"commitment": "confirmed"}],
+        )
+        if "error" in response:
+            raise RuntimeError(str(response["error"]))
+        slot = response.get("result")
+        if slot is None:
+            raise RuntimeError(f"getSlot returned no result: {response!r}")
+        logger.info(
+            "alchemy_http_health_ok",
+            extra={"slot": slot, "rpc_url": _safe_rpc_url(rpc_url)},
+        )
+        return True
+    except Exception as exc:
+        logger.error(
+            "alchemy_http_health_failed",
+            extra={
+                "rpc_url": _safe_rpc_url(rpc_url),
+                "error": f"{type(exc).__name__}: {exc}",
+            },
+        )
+        return False
+
+
+async def _alchemy_ws_health_check() -> bool:
+    """Verify Alchemy WSS independently with the minimal slotSubscribe call."""
+    ws_url = getattr(settings, "alchemy_solana_ws_url", None)
+    if not ws_url:
+        logger.error("alchemy_ws_health_failed", extra={"error": "missing_alchemy_solana_ws_url"})
+        return False
+
+    try:
+        async with websockets.connect(
+            ws_url,
+            open_timeout=ALCHEMY_HEALTHCHECK_TIMEOUT_SECONDS,
+            ping_interval=20,
+            ping_timeout=10,
+            close_timeout=3,
+            max_size=1024 * 1024,
+        ) as ws:
+            await ws.send(json.dumps({
+                "jsonrpc": "2.0",
+                "id": 9001,
+                "method": "slotSubscribe",
+            }))
+
+            raw = await asyncio.wait_for(
+                ws.recv(),
+                timeout=ALCHEMY_HEALTHCHECK_TIMEOUT_SECONDS,
+            )
+            response = json.loads(raw)
+
+            if "error" in response:
+                raise RuntimeError(str(response["error"]))
+            if "result" not in response:
+                raise RuntimeError(f"slotSubscribe returned no result: {response!r}")
+
+            logger.info(
+                "alchemy_ws_health_ok",
+                extra={
+                    "subscription_id": response.get("result"),
+                    "ws_url": _safe_rpc_url(ws_url),
+                },
+            )
+            return True
+
+    except ConnectionClosed as exc:
+        logger.error(
+            "alchemy_ws_health_failed",
+            extra={
+                "ws_url": _safe_rpc_url(ws_url),
+                "close_code": exc.code,
+                "close_reason": exc.reason,
+                "error": f"ConnectionClosed code={exc.code} reason={exc.reason!r}",
+            },
+        )
+        return False
+    except Exception as exc:
+        logger.error(
+            "alchemy_ws_health_failed",
+            extra={
+                "ws_url": _safe_rpc_url(ws_url),
+                "error": f"{type(exc).__name__}: {exc}",
+            },
+        )
+        return False
+
+
 async def _pumpfun_stream_worker(
     rpc_url: str,
     mint_authority: str,
@@ -1594,10 +1694,8 @@ async def _pumpfun_stream_worker(
     """Continuously stream Pump.fun CreateEvents with RPC failover."""
 
     backoff = PUMPFUN_STREAM_RECONNECT_SECONDS
-    health = _pumpfun_ws_health.setdefault(
-        mint_authority,
-        {"provider": None, "failed": False, "last_error": None},
-    )
+    alchemy_ws_health_checked = False
+    alchemy_ws_healthy = False
 
     while not stop_event.is_set():
         connected = False
@@ -1615,6 +1713,16 @@ async def _pumpfun_stream_worker(
                 continue
 
             try:
+                if transport == "alchemy" and not alchemy_ws_health_checked:
+                    alchemy_ws_health_checked = True
+                    alchemy_ws_healthy = await _alchemy_ws_health_check()
+                    if not alchemy_ws_healthy:
+                        logger.warning(
+                            "pumpfun_stream_alchemy_health_failed_using_recovery_poll",
+                            extra={"mint_authority": mint_authority},
+                        )
+                        continue
+
                 logger.info(
                     "pumpfun_stream_connect_attempt",
                     extra={
@@ -1692,7 +1800,6 @@ async def _pumpfun_stream_worker(
                     )
 
                     connected = True
-                    health.update({"provider": transport, "failed": False, "last_error": None})
                     backoff = PUMPFUN_STREAM_RECONNECT_SECONDS
 
                     while not stop_event.is_set():
@@ -1763,14 +1870,13 @@ async def _pumpfun_stream_worker(
                         "retry_seconds": backoff,
                     },
                 )
-                health.update({"provider": transport, "failed": True, "last_error": f"ConnectionClosed code={exc.code} reason={exc.reason!r}"})
-                health.update({"provider": transport, "failed": True, "last_error": f"{type(exc).__name__}: {exc}"})
                 if transport == "primary" and getattr(settings, "alchemy_solana_ws_url", None):
                     logger.warning(
                         "pumpfun_stream_fallback_to_alchemy",
                         extra={"mint_authority": mint_authority},
                     )
                 elif transport == "alchemy":
+                    alchemy_ws_healthy = False
                     logger.warning(
                         "pumpfun_stream_alchemy_failed_using_recovery_poll",
                         extra={"mint_authority": mint_authority},
@@ -1792,6 +1898,7 @@ async def _pumpfun_stream_worker(
                         extra={"mint_authority": mint_authority},
                     )
                 elif transport == "alchemy":
+                    alchemy_ws_healthy = False
                     logger.warning(
                         "pumpfun_stream_alchemy_failed_using_recovery_poll",
                         extra={"mint_authority": mint_authority},
@@ -1914,27 +2021,20 @@ async def poll_new_pumpfun_mints(
     stream_down = bool(
         stream_task is not None and stream_task.done()
     )
-    ws_health = _pumpfun_ws_health.get(mint_authority) or {}
-    ws_degraded = bool(ws_health.get("failed"))
+    poll_interval = (
+        PUMPFUN_DEGRADED_POLL_SECONDS
+        if stream_down
+        else PUMPFUN_FALLBACK_POLL_SECONDS
+    )
     fallback_due = (
-        ws_degraded
-        or loop_time - float(state.get("last_fallback", 0.0))
-        >= PUMPFUN_FALLBACK_POLL_SECONDS
+        loop_time - float(state.get("last_fallback", 0.0))
+        >= poll_interval
     )
 
     if not stream_down and not fallback_due:
         return discovered
 
     state["last_fallback"] = loop_time
-    if ws_degraded:
-        logger.warning(
-            "pumpfun_recovery_poll_active",
-            extra={
-                "mint_authority": mint_authority,
-                "ws_provider": ws_health.get("provider"),
-                "ws_error": ws_health.get("last_error"),
-            },
-        )
     watermark_key = f"pumpfun:{mint_authority}"
     until = watermarks.get(watermark_key)
 
@@ -1995,6 +2095,8 @@ async def poll_new_pumpfun_mints(
 
     # If solana-py failed on both, try the direct JSON-RPC implementation on
     # both endpoints as a final recovery path.
+    if normalized is None and getattr(settings, "alchemy_solana_rpc_url", None):
+        await _alchemy_http_health_check()
     if normalized is None:
         direct_items = None
         direct_rpc = rpc_url
@@ -2061,7 +2163,7 @@ async def poll_new_pumpfun_mints(
                     if normalized
                     else None
                 ),
-                "mode": "recovery_polling" if ws_degraded else "streaming",
+                "mode": "streaming",
                 "rpc_transport": active_transport,
             },
         )
