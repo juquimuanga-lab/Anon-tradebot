@@ -48,6 +48,11 @@ from app.execution.onchain import (
     pumpfun,
 )
 
+from app.execution.onchain.solana_rpc import (
+    extract_wallet_trade_execution,
+    get_transaction_details,
+)
+
 from app.execution.onchain.meteora_dbc import (
     DbcBuildError,
 )
@@ -1019,37 +1024,146 @@ class ScannerService:
 
         if result.success:
 
+            # --------------------------------------------------------------
+            # LIVE FILL RECONCILIATION
+            #
+            # Do not use token.price_usd as the Pump.fun entry price.
+            # That value was observed before the transaction landed and can
+            # differ materially from the actual execution.
+            #
+            # The confirmed transaction is authoritative: derive the actual
+            # SOL spent (excluding the network fee) and actual token amount
+            # received from pre/post balances.
+            # --------------------------------------------------------------
             fill_price = (
                 result.price_usd
                 or token.price_usd
             )
 
-            # Convert SOL -> USD -> tokens.
-            # fill_price is USD/token, so amount_sol / fill_price is incorrect.
-            sol_price = (
-                await price_feed.get_sol_usd_price(
-                    settings.jupiter_price_url
-                )
-            )
+            amount_tokens = None
+            actual_amount_sol = amount_sol
 
-            if sol_price <= 0:
-                logger.warning(
-                    "invalid_sol_price_for_position",
-                    extra={
-                        "mint": token.mint,
-                        "sol_price": sol_price,
-                    },
-                )
-                return False
+            if (
+                token.source == SOURCE_PUMPFUN
+                and result.tx_signature
+            ):
+                try:
+                    confirmed_tx = (
+                        await get_transaction_details(
+                            getattr(
+                                adapter,
+                                "_rpc_url",
+                                getattr(
+                                    settings,
+                                    "solana_rpc_url",
+                                    "",
+                                ),
+                            ),
+                            result.tx_signature,
+                        )
+                    )
 
-            amount_tokens = (
-                amount_sol
-                * sol_price
-                / max(
-                    fill_price,
-                    1e-12,
+                    execution = (
+                        extract_wallet_trade_execution(
+                            confirmed_tx,
+                            str(
+                                getattr(
+                                    adapter,
+                                    "_pubkey",
+                                    getattr(
+                                        settings,
+                                        "wallet_public_key",
+                                        "",
+                                    ),
+                                )
+                            ),
+                            token.mint,
+                        )
+                    )
+
+                    if execution:
+                        actual_amount_sol = (
+                            execution[
+                                "sol_spent_excluding_fee_lamports"
+                            ]
+                            / 1_000_000_000
+                        )
+
+                        amount_tokens = (
+                            execution[
+                                "token_received_raw"
+                            ]
+                            / (
+                                10
+                                ** execution[
+                                    "token_decimals"
+                                ]
+                            )
+                        )
+
+                        sol_price = (
+                            await price_feed.get_sol_usd_price(
+                                settings.jupiter_price_url
+                            )
+                        )
+
+                        if sol_price > 0 and amount_tokens > 0:
+                            fill_price = (
+                                actual_amount_sol
+                                * sol_price
+                                / amount_tokens
+                            )
+
+                        logger.info(
+                            "pumpfun_buy_actual_fill_reconciled",
+                            extra={
+                                "mint": token.mint,
+                                "tx_signature": result.tx_signature,
+                                "requested_amount_sol": amount_sol,
+                                "actual_amount_sol": actual_amount_sol,
+                                "actual_amount_tokens": amount_tokens,
+                                "actual_fill_price_usd": fill_price,
+                                "network_fee_lamports": execution["fee_lamports"],
+                            },
+                        )
+
+                except Exception as exc:
+                    logger.warning(
+                        "pumpfun_buy_fill_reconciliation_failed",
+                        extra={
+                            "mint": token.mint,
+                            "tx_signature": result.tx_signature,
+                            "error": str(exc),
+                        },
+                    )
+
+            # Fallback for non-Pump.fun paths or if reconciliation was not
+            # available. Existing behavior remains unchanged for those paths.
+            if amount_tokens is None:
+                sol_price = (
+                    await price_feed.get_sol_usd_price(
+                        settings.jupiter_price_url
+                    )
                 )
-            )
+
+                if sol_price <= 0:
+                    logger.warning(
+                        "invalid_sol_price_for_position",
+                        extra={
+                            "mint": token.mint,
+                            "sol_price": sol_price,
+                        },
+                    )
+                    return False
+
+                amount_tokens = (
+                    amount_sol
+                    * sol_price
+                    / max(
+                        fill_price,
+                        1e-12,
+                    )
+                )
 
             await repo.create_position(
                 token.mint,
@@ -1057,7 +1171,7 @@ class ScannerService:
                 state.mode,
                 fill_price,
                 amount_tokens,
-                amount_sol,
+                actual_amount_sol,
                 owner_user_id=(
                     rule_row.created_by
                 ),
