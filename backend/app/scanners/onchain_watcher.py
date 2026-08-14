@@ -119,6 +119,7 @@ PUMPFUN_EVENT_QUEUE_MAXSIZE = 500
 
 # One stream task per watched mint-authority address.
 _pumpfun_streams: dict[str, dict] = {}
+_pumpfun_ws_health: dict[str, dict] = {}
 
 
 # ---------------------------------------------------------------------------
@@ -1593,6 +1594,10 @@ async def _pumpfun_stream_worker(
     """Continuously stream Pump.fun CreateEvents with RPC failover."""
 
     backoff = PUMPFUN_STREAM_RECONNECT_SECONDS
+    health = _pumpfun_ws_health.setdefault(
+        mint_authority,
+        {"provider": None, "failed": False, "last_error": None},
+    )
 
     while not stop_event.is_set():
         connected = False
@@ -1687,6 +1692,7 @@ async def _pumpfun_stream_worker(
                     )
 
                     connected = True
+                    health.update({"provider": transport, "failed": False, "last_error": None})
                     backoff = PUMPFUN_STREAM_RECONNECT_SECONDS
 
                     while not stop_event.is_set():
@@ -1757,6 +1763,8 @@ async def _pumpfun_stream_worker(
                         "retry_seconds": backoff,
                     },
                 )
+                health.update({"provider": transport, "failed": True, "last_error": f"ConnectionClosed code={exc.code} reason={exc.reason!r}"})
+                health.update({"provider": transport, "failed": True, "last_error": f"{type(exc).__name__}: {exc}"})
                 if transport == "primary" and getattr(settings, "alchemy_solana_ws_url", None):
                     logger.warning(
                         "pumpfun_stream_fallback_to_alchemy",
@@ -1906,8 +1914,11 @@ async def poll_new_pumpfun_mints(
     stream_down = bool(
         stream_task is not None and stream_task.done()
     )
+    ws_health = _pumpfun_ws_health.get(mint_authority) or {}
+    ws_degraded = bool(ws_health.get("failed"))
     fallback_due = (
-        loop_time - float(state.get("last_fallback", 0.0))
+        ws_degraded
+        or loop_time - float(state.get("last_fallback", 0.0))
         >= PUMPFUN_FALLBACK_POLL_SECONDS
     )
 
@@ -1915,6 +1926,15 @@ async def poll_new_pumpfun_mints(
         return discovered
 
     state["last_fallback"] = loop_time
+    if ws_degraded:
+        logger.warning(
+            "pumpfun_recovery_poll_active",
+            extra={
+                "mint_authority": mint_authority,
+                "ws_provider": ws_health.get("provider"),
+                "ws_error": ws_health.get("last_error"),
+            },
+        )
     watermark_key = f"pumpfun:{mint_authority}"
     until = watermarks.get(watermark_key)
 
@@ -2041,7 +2061,7 @@ async def poll_new_pumpfun_mints(
                     if normalized
                     else None
                 ),
-                "mode": "streaming",
+                "mode": "recovery_polling" if ws_degraded else "streaming",
                 "rpc_transport": active_transport,
             },
         )
