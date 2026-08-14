@@ -315,7 +315,7 @@ class ScannerService:
 
             metrics.tokens_scanned += 1
 
-            logger.info(
+            logger.debug(
                 "pumpfun_new_mint_detected",
                 extra={
                     "mint": mint,
