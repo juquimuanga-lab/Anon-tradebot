@@ -66,6 +66,13 @@ class Settings(BaseSettings):
     )
 
     helius_api_key: Optional[str] = None
+    # Optional Alchemy Solana RPC fallback. Keep the API key in the
+    # deployment environment; never hardcode it in source.
+    alchemy_api_key: Optional[str] = Field(
+        default=None,
+        validation_alias="ALCHEMY_API_KEY",
+    )
+
 
     # ------------------------------------------------------------------
     # Anoncoin creator watchlist
@@ -256,6 +263,28 @@ class Settings(BaseSettings):
                 )
 
         return self
+
+    # ------------------------------------------------------------------
+    # Alchemy Solana RPC
+    # ------------------------------------------------------------------
+
+    @property
+    def alchemy_solana_rpc_url(self) -> Optional[str]:
+        if not self.alchemy_api_key:
+            return None
+        return (
+            "https://solana-mainnet.g.alchemy.com/v2/"
+            f"{self.alchemy_api_key}"
+        )
+
+    @property
+    def alchemy_solana_ws_url(self) -> Optional[str]:
+        if not self.alchemy_api_key:
+            return None
+        return (
+            "wss://solana-mainnet.g.alchemy.com/v2/"
+            f"{self.alchemy_api_key}"
+        )
 
     # ------------------------------------------------------------------
     # Telegram admin IDs
