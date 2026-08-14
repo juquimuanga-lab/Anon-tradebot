@@ -52,6 +52,12 @@ STATUS_POLL_INTERVAL_SECONDS = 0.25
 # Minimum time between rebroadcasts.
 RESEND_INTERVAL_SECONDS = 0.50
 
+# After an AlreadyProcessed response, stop rebroadcasting and enter a
+# confirmation-only grace period. The validator has already seen this exact
+# signed transaction, so immediately resending it adds noise and can race the
+# confirmation check.
+ALREADY_PROCESSED_CONFIRMATION_GRACE_SECONDS = 5.0
+
 # Timeout for an individual JSON-RPC request.
 RPC_REQUEST_TIMEOUT_SECONDS = 8.0
 
@@ -703,19 +709,6 @@ async def _send_transaction(
 # Send + confirm
 # ---------------------------------------------------------------------------
 
-def _transaction_confirmation_summary(transaction: dict) -> dict:
-    """Return a compact, log-safe summary of a verified transaction."""
-    meta = transaction.get("meta") or {}
-    return {
-        "slot": transaction.get("slot"),
-        "block_time": transaction.get("blockTime"),
-        "fee_lamports": meta.get("fee"),
-        "compute_units_consumed": meta.get("computeUnitsConsumed"),
-        "meta_err": meta.get("err"),
-        "transaction_version": transaction.get("version"),
-    }
-
-
 async def send_and_confirm(
     rpc_url: str,
     signed_tx_bytes: bytes,
@@ -755,15 +748,12 @@ async def send_and_confirm(
         signed_tx_bytes
     )
 
-    delivery_started_at = time.monotonic()
-    first_submission_at = None
-
     solscan_link = (
         f"https://solscan.io/tx/{signature}"
     )
 
     logger.info(
-        f"transaction_delivery_started signature={signature}",
+        "transaction_delivery_started",
         extra={
             "signature": signature,
             "last_valid_block_height": (
@@ -774,6 +764,7 @@ async def send_and_confirm(
 
     last_send_time = 0.0
     send_count = 0
+    already_processed_wait_until = 0.0
 
     while True:
 
@@ -893,36 +884,15 @@ async def send_and_confirm(
                         f"{solscan_link}"
                     )
 
-                summary = _transaction_confirmation_summary(
-                    transaction
-                )
-                elapsed_ms = int(
-                    (time.monotonic() - delivery_started_at) * 1000
-                )
-                first_submit_elapsed_ms = (
-                    int((first_submission_at - delivery_started_at) * 1000)
-                    if first_submission_at is not None
-                    else None
-                )
-
                 logger.info(
-                    f"transaction_confirmed signature={signature} "
-                    f"status={confirmation_status} "
-                    f"slot={summary.get('slot')} "
-                    f"fee_lamports={summary.get('fee_lamports')} "
-                    f"compute_units={summary.get('compute_units_consumed')} "
-                    f"send_count={send_count} "
-                    f"elapsed_ms={elapsed_ms} "
-                    f"verified=true solscan={solscan_link}",
+                    "transaction_confirmed",
                     extra={
                         "signature": signature,
-                        "confirmation_status": confirmation_status,
+                        "confirmation_status": (
+                            confirmation_status
+                        ),
                         "send_count": send_count,
                         "transaction_verified": True,
-                        "confirmation_summary": summary,
-                        "elapsed_ms": elapsed_ms,
-                        "first_submit_elapsed_ms": first_submit_elapsed_ms,
-                        "solscan_link": solscan_link,
                     },
                 )
 
@@ -1020,32 +990,16 @@ async def send_and_confirm(
                                     f"{solscan_link}"
                                 )
 
-                            summary = _transaction_confirmation_summary(
-                                final_transaction
-                            )
-                            elapsed_ms = int(
-                                (time.monotonic() - delivery_started_at) * 1000
-                            )
-
                             logger.info(
-                                f"transaction_confirmed signature={signature} "
-                                f"status={final_confirmation} "
-                                f"slot={summary.get('slot')} "
-                                f"fee_lamports={summary.get('fee_lamports')} "
-                                f"compute_units={summary.get('compute_units_consumed')} "
-                                f"send_count={send_count} "
-                                f"elapsed_ms={elapsed_ms} "
-                                f"verified=true expiry_boundary=true "
-                                f"solscan={solscan_link}",
+                                "transaction_confirmed",
                                 extra={
                                     "signature": signature,
-                                    "confirmation_status": final_confirmation,
+                                    "confirmation_status": (
+                                        final_confirmation
+                                    ),
                                     "send_count": send_count,
                                     "transaction_verified": True,
                                     "verified_at_expiry_boundary": True,
-                                    "confirmation_summary": summary,
-                                    "elapsed_ms": elapsed_ms,
-                                    "solscan_link": solscan_link,
                                 },
                             )
 
@@ -1075,11 +1029,22 @@ async def send_and_confirm(
 
         now = time.monotonic()
 
+        # Once an RPC has told us that this exact signed transaction was
+        # already processed, do not immediately call sendTransaction again.
+        # Poll the same signature until it is observable/verified or the
+        # grace period expires.
+        confirmation_only = (
+            now < already_processed_wait_until
+        )
+
         should_send = (
-            send_count == 0
-            or (
-                now - last_send_time
-                >= RESEND_INTERVAL_SECONDS
+            not confirmation_only
+            and (
+                send_count == 0
+                or (
+                    now - last_send_time
+                    >= RESEND_INTERVAL_SECONDS
+                )
             )
         )
 
@@ -1109,27 +1074,17 @@ async def send_and_confirm(
                         },
                     )
 
-                if first_submission_at is None:
-                    first_submission_at = time.monotonic()
-
                 logger.info(
-                    f"transaction_submitted signature={signature} "
-                    f"rpc_signature={returned_signature} "
-                    f"signature_match={returned_signature == signature} "
-                    f"attempt={send_count} "
-                    f"block_height={current_height} "
-                    f"last_valid_block_height={last_valid_block_height} "
-                    f"elapsed_ms={int((time.monotonic() - delivery_started_at) * 1000)} "
-                    f"solscan={solscan_link}",
+                    "transaction_submitted",
                     extra={
                         "signature": signature,
-                        "rpc_returned_signature": returned_signature,
-                        "signature_match": returned_signature == signature,
                         "attempt": send_count,
-                        "current_block_height": current_height,
-                        "last_valid_block_height": last_valid_block_height,
-                        "elapsed_ms": int((time.monotonic() - delivery_started_at) * 1000),
-                        "solscan_link": solscan_link,
+                        "current_block_height": (
+                            current_height
+                        ),
+                        "last_valid_block_height": (
+                            last_valid_block_height
+                        ),
                     },
                 )
 
@@ -1138,7 +1093,7 @@ async def send_and_confirm(
                 error_text = str(exc)
 
                 logger.warning(
-                    f"transaction_submission_error signature={signature}",
+                    "transaction_submission_error",
                     extra={
                         "signature": signature,
                         "attempt": send_count + 1,
@@ -1162,18 +1117,27 @@ async def send_and_confirm(
                     "alreadyprocessed" in lower_error
                     or "already processed" in lower_error
                 ):
-                    send_count += 1
+                    # Do not count this as a new send. The RPC has already
+                    # seen the transaction, so the correct action is to keep
+                    # polling the SAME signature.
+                    already_processed_wait_until = (
+                        time.monotonic()
+                        + ALREADY_PROCESSED_CONFIRMATION_GRACE_SECONDS
+                    )
                     last_send_time = now
 
                     logger.info(
-                        f"transaction_already_processed_waiting_confirmation signature={signature} "
-                        f"attempt={send_count}",
+                        "transaction_already_processed_waiting_confirmation",
                         extra={
                             "signature": signature,
-                            "attempt": send_count,
+                            "attempt": send_count + 1,
+                            "confirmation_grace_seconds": (
+                                ALREADY_PROCESSED_CONFIRMATION_GRACE_SECONDS
+                            ),
                             "error": redact_text(
                                 error_text
                             ),
+                            "solscan": solscan_link,
                         },
                     )
 
