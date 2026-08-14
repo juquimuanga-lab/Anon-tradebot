@@ -1625,7 +1625,7 @@ async def _alchemy_ws_health_check() -> bool:
     """Verify Alchemy WSS independently with the minimal slotSubscribe call."""
     ws_url = getattr(settings, "alchemy_solana_ws_url", None)
     if not ws_url:
-        logger.error("alchemy_ws_health_failed", extra={"error": "missing_alchemy_solana_ws_url"})
+        logger.error("alchemy_ws_health_failed error=missing_alchemy_solana_ws_url")
         return False
 
     try:
@@ -1655,32 +1655,22 @@ async def _alchemy_ws_health_check() -> bool:
                 raise RuntimeError(f"slotSubscribe returned no result: {response!r}")
 
             logger.info(
-                "alchemy_ws_health_ok",
-                extra={
-                    "subscription_id": response.get("result"),
-                    "ws_url": _safe_rpc_url(ws_url),
-                },
+                f"alchemy_ws_health_ok subscription_id={response.get('result')} "
+                f"ws_url={_safe_rpc_url(ws_url)}"
             )
             return True
 
     except ConnectionClosed as exc:
         logger.error(
-            "alchemy_ws_health_failed",
-            extra={
-                "ws_url": _safe_rpc_url(ws_url),
-                "close_code": exc.code,
-                "close_reason": exc.reason,
-                "error": f"ConnectionClosed code={exc.code} reason={exc.reason!r}",
-            },
+            f"alchemy_ws_health_failed ws_url={_safe_rpc_url(ws_url)} "
+            f"close_code={exc.code} close_reason={exc.reason!r} "
+            f"error=ConnectionClosed"
         )
         return False
     except Exception as exc:
         logger.error(
-            "alchemy_ws_health_failed",
-            extra={
-                "ws_url": _safe_rpc_url(ws_url),
-                "error": f"{type(exc).__name__}: {exc}",
-            },
+            f"alchemy_ws_health_failed ws_url={_safe_rpc_url(ws_url)} "
+            f"error_type={type(exc).__name__} error={exc!r}"
         )
         return False
 
@@ -1724,12 +1714,8 @@ async def _pumpfun_stream_worker(
                         continue
 
                 logger.info(
-                    "pumpfun_stream_connect_attempt",
-                    extra={
-                        "mint_authority": mint_authority,
-                        "transport": transport,
-                        "ws_url": _safe_rpc_url(ws_url),
-                    },
+                    f"pumpfun_stream_connect_attempt transport={transport} "
+                    f"mint_authority={mint_authority} ws_url={_safe_rpc_url(ws_url)}"
                 )
                 async with websockets.connect(
                     ws_url,
@@ -1783,20 +1769,14 @@ async def _pumpfun_stream_worker(
                         )
 
                     logger.info(
-                        "pumpfun_stream_subscription_confirmed",
-                        extra={
-                            "mint_authority": mint_authority,
-                            "transport": transport,
-                            "subscription_id": subscription_response.get("result"),
-                        },
+                        f"pumpfun_stream_subscription_confirmed transport={transport} "
+                        f"mint_authority={mint_authority} "
+                        f"subscription_id={subscription_response.get('result')}"
                     )
 
                     logger.info(
-                        "pumpfun_stream_connected",
-                        extra={
-                            "mint_authority": mint_authority,
-                            "transport": transport,
-                        },
+                        f"pumpfun_stream_connected transport={transport} "
+                        f"mint_authority={mint_authority}"
                     )
 
                     connected = True
@@ -1858,50 +1838,34 @@ async def _pumpfun_stream_worker(
                 raise
             except ConnectionClosed as exc:
                 logger.warning(
-                    "pumpfun_stream_disconnected",
-                    extra={
-                        "mint_authority": mint_authority,
-                        "transport": transport,
-                        "error": (
-                            f"ConnectionClosed code={exc.code} reason={exc.reason!r}"
-                        ),
-                        "close_code": exc.code,
-                        "close_reason": exc.reason,
-                        "retry_seconds": backoff,
-                    },
+                    f"pumpfun_stream_disconnected transport={transport} "
+                    f"mint_authority={mint_authority} close_code={exc.code} "
+                    f"close_reason={exc.reason!r} retry_seconds={backoff}"
                 )
                 if transport == "primary" and getattr(settings, "alchemy_solana_ws_url", None):
                     logger.warning(
-                        "pumpfun_stream_fallback_to_alchemy",
-                        extra={"mint_authority": mint_authority},
+                        f"pumpfun_stream_fallback_to_alchemy mint_authority={mint_authority}",
                     )
                 elif transport == "alchemy":
                     alchemy_ws_healthy = False
                     logger.warning(
-                        "pumpfun_stream_alchemy_failed_using_recovery_poll",
-                        extra={"mint_authority": mint_authority},
+                        f"pumpfun_stream_alchemy_failed_using_recovery_poll mint_authority={mint_authority}",
                     )
                 continue
             except Exception as exc:
                 logger.warning(
-                    "pumpfun_stream_disconnected",
-                    extra={
-                        "mint_authority": mint_authority,
-                        "transport": transport,
-                        "error": f"{type(exc).__name__}: {exc}",
-                        "retry_seconds": backoff,
-                    },
+                    f"pumpfun_stream_disconnected transport={transport} "
+                    f"mint_authority={mint_authority} error_type={type(exc).__name__} "
+                    f"error={exc!r} retry_seconds={backoff}"
                 )
                 if transport == "primary" and getattr(settings, "alchemy_solana_ws_url", None):
                     logger.warning(
-                        "pumpfun_stream_fallback_to_alchemy",
-                        extra={"mint_authority": mint_authority},
+                        f"pumpfun_stream_fallback_to_alchemy mint_authority={mint_authority}",
                     )
                 elif transport == "alchemy":
                     alchemy_ws_healthy = False
                     logger.warning(
-                        "pumpfun_stream_alchemy_failed_using_recovery_poll",
-                        extra={"mint_authority": mint_authority},
+                        f"pumpfun_stream_alchemy_failed_using_recovery_poll mint_authority={mint_authority}",
                     )
                 continue
 
