@@ -553,7 +553,9 @@ async def poll_new_mints(
         except Exception as exc:
             last_exc = exc
             logger.warning(
-                "get_signatures_failed",
+                "get_signatures_failed "
+                f"transport={transport} error_type={type(exc).__name__} "
+                f"error={exc!r} rpc={_safe_rpc_url(candidate_url)} wallet={wallet}",
                 extra={
                     "transport": transport,
                     "error": f"{type(exc).__name__}: {exc}",
@@ -1621,58 +1623,30 @@ async def _alchemy_http_health_check() -> bool:
         return False
 
 
+logger.info("alchemy_fallback_policy_http_only reason=solana_pubsub_method_not_found")
+
 async def _alchemy_ws_health_check() -> bool:
-    """Verify Alchemy WSS independently with the minimal slotSubscribe call."""
+    """
+    Alchemy WSS diagnostic.
+
+    The current Alchemy application endpoint is returning JSON-RPC
+    -32601 "Method not found" for Solana PubSub methods. Fail closed so the
+    watcher does not enter a reconnect storm. Alchemy HTTP remains the
+    fallback transport.
+    """
     ws_url = getattr(settings, "alchemy_solana_ws_url", None)
     if not ws_url:
-        logger.error("alchemy_ws_health_failed error=missing_alchemy_solana_ws_url")
-        return False
-
-    try:
-        async with websockets.connect(
-            ws_url,
-            open_timeout=ALCHEMY_HEALTHCHECK_TIMEOUT_SECONDS,
-            ping_interval=20,
-            ping_timeout=10,
-            close_timeout=3,
-            max_size=1024 * 1024,
-        ) as ws:
-            await ws.send(json.dumps({
-                "jsonrpc": "2.0",
-                "id": 9001,
-                "method": "slotSubscribe",
-            }))
-
-            raw = await asyncio.wait_for(
-                ws.recv(),
-                timeout=ALCHEMY_HEALTHCHECK_TIMEOUT_SECONDS,
-            )
-            response = json.loads(raw)
-
-            if "error" in response:
-                raise RuntimeError(str(response["error"]))
-            if "result" not in response:
-                raise RuntimeError(f"slotSubscribe returned no result: {response!r}")
-
-            logger.info(
-                f"alchemy_ws_health_ok subscription_id={response.get('result')} "
-                f"ws_url={_safe_rpc_url(ws_url)}"
-            )
-            return True
-
-    except ConnectionClosed as exc:
-        logger.error(
-            f"alchemy_ws_health_failed ws_url={_safe_rpc_url(ws_url)} "
-            f"close_code={exc.code} close_reason={exc.reason!r} "
-            f"error=ConnectionClosed"
+        logger.warning(
+            "alchemy_ws_unavailable reason=missing_alchemy_solana_ws_url"
         )
         return False
-    except Exception as exc:
-        logger.error(
-            f"alchemy_ws_health_failed ws_url={_safe_rpc_url(ws_url)} "
-            f"error_type={type(exc).__name__} error={exc!r}"
-        )
-        return False
+
+    logger.warning(
+        "alchemy_ws_disabled_for_fallback "
+        f"reason=solana_pubsub_method_not_found "
+        f"ws_url={_safe_rpc_url(ws_url)}"
+    )
+    return False
 
 
 async def _pumpfun_stream_worker(
@@ -1681,42 +1655,36 @@ async def _pumpfun_stream_worker(
     queue: asyncio.Queue,
     stop_event: asyncio.Event,
 ) -> None:
-    """Continuously stream Pump.fun CreateEvents with RPC failover."""
+    """
+    Pump.fun real-time stream.
 
+    Transport policy:
+      - Helius WSS = preferred real-time stream.
+      - Alchemy = HTTP recovery only.
+
+    This intentionally does not reconnect to Alchemy WSS because the deployed
+    Alchemy endpoint returned -32601 "Method not found" for Solana PubSub
+    methods. The HTTP recovery path remains responsible for Alchemy-backed
+    discovery.
+    """
     backoff = PUMPFUN_STREAM_RECONNECT_SECONDS
-    alchemy_ws_health_checked = False
-    alchemy_ws_healthy = False
 
     while not stop_event.is_set():
-        connected = False
+        ws_url = _rpc_http_to_ws_url(rpc_url)
 
-        for candidate_url, transport in _rpc_candidates(rpc_url):
-            if stop_event.is_set():
-                return
-
-            ws_url = (
-                getattr(settings, "alchemy_solana_ws_url", None)
-                if transport == "alchemy"
-                else _rpc_http_to_ws_url(candidate_url)
+        if not ws_url:
+            logger.warning(
+                "pumpfun_stream_unavailable "
+                f"reason=missing_primary_ws_url mint_authority={mint_authority}"
             )
-            if not ws_url:
-                continue
-
+        else:
             try:
-                if transport == "alchemy" and not alchemy_ws_health_checked:
-                    alchemy_ws_health_checked = True
-                    alchemy_ws_healthy = await _alchemy_ws_health_check()
-                    if not alchemy_ws_healthy:
-                        logger.warning(
-                            "pumpfun_stream_alchemy_health_failed_using_recovery_poll",
-                            extra={"mint_authority": mint_authority},
-                        )
-                        continue
-
                 logger.info(
-                    f"pumpfun_stream_connect_attempt transport={transport} "
-                    f"mint_authority={mint_authority} ws_url={_safe_rpc_url(ws_url)}"
+                    "pumpfun_stream_connect_attempt "
+                    f"transport=primary mint_authority={mint_authority} "
+                    f"ws_url={_safe_rpc_url(ws_url)}"
                 )
+
                 async with websockets.connect(
                     ws_url,
                     open_timeout=15,
@@ -1731,9 +1699,6 @@ async def _pumpfun_stream_worker(
                         "method": "logsSubscribe",
                         "params": [
                             {"mentions": [mint_authority]},
-                            # confirmed is supported by both Helius and
-                            # Alchemy and avoids provider-specific edge cases
-                            # around processed subscriptions.
                             {"commitment": "confirmed"},
                         ],
                     }
@@ -1741,8 +1706,7 @@ async def _pumpfun_stream_worker(
                     await ws.send(json.dumps(request))
                     try:
                         subscription_raw = await asyncio.wait_for(
-                            ws.recv(),
-                            timeout=15,
+                            ws.recv(), timeout=15
                         )
                     except asyncio.TimeoutError as exc:
                         raise RuntimeError(
@@ -1758,69 +1722,50 @@ async def _pumpfun_stream_worker(
 
                     if "error" in subscription_response:
                         raise RuntimeError(
-                            f"Pump.fun logsSubscribe failed on {transport}: "
+                            "Pump.fun logsSubscribe failed on primary: "
                             f"{subscription_response['error']}"
                         )
 
                     if "result" not in subscription_response:
                         raise RuntimeError(
-                            f"Pump.fun logsSubscribe returned no subscription id on {transport}: "
-                            f"{subscription_response!r}"
+                            "Pump.fun logsSubscribe returned no subscription id "
+                            f"on primary: {subscription_response!r}"
                         )
 
                     logger.info(
-                        f"pumpfun_stream_subscription_confirmed transport={transport} "
-                        f"mint_authority={mint_authority} "
+                        "pumpfun_stream_subscription_confirmed "
+                        f"transport=primary mint_authority={mint_authority} "
                         f"subscription_id={subscription_response.get('result')}"
                     )
-
                     logger.info(
-                        f"pumpfun_stream_connected transport={transport} "
-                        f"mint_authority={mint_authority}"
+                        "pumpfun_stream_connected "
+                        f"transport=primary mint_authority={mint_authority}"
                     )
 
-                    connected = True
                     backoff = PUMPFUN_STREAM_RECONNECT_SECONDS
 
                     while not stop_event.is_set():
+                        raw = await ws.recv()
                         try:
-                            raw = await asyncio.wait_for(
-                                ws.recv(),
-                                timeout=60,
-                            )
-                        except asyncio.TimeoutError:
-                            # Force a liveness check. websockets normally
-                            # handles ping/pong, but an explicit ping gives
-                            # us a deterministic reconnect when a provider
-                            # silently drops an idle stream.
-                            pong = await ws.ping()
-                            await asyncio.wait_for(pong, timeout=10)
+                            message = json.loads(raw)
+                        except Exception:
                             continue
-
-                        message = json.loads(raw)
 
                         params = message.get("params") or {}
-                        result = params.get("result") or {}
-                        value = result.get("value") or {}
-
-                        if value.get("err") is not None:
-                            continue
-
+                        value = params.get("result", {}).get("value", {})
                         logs = value.get("logs") or []
                         signature = value.get("signature")
 
-                        if not signature:
+                        if not signature or not logs:
                             continue
 
-                        launch = _extract_pumpfun_event_from_logs(logs)
-                        if not launch:
+                        launch = _parse_pumpfun_logs(
+                            signature=signature,
+                            logs=logs,
+                            mint_authority=mint_authority,
+                        )
+                        if launch is None:
                             continue
-
-                        launch["tx_signature"] = signature
-                        launch["block_time"] = None
-                        launch["watched_wallet"] = mint_authority
-                        launch["discovery"] = "websocket_create_event"
-                        launch["rpc_transport"] = transport
 
                         try:
                             queue.put_nowait(launch)
@@ -1838,103 +1783,36 @@ async def _pumpfun_stream_worker(
                 raise
             except ConnectionClosed as exc:
                 logger.warning(
-                    f"pumpfun_stream_disconnected transport={transport} "
-                    f"mint_authority={mint_authority} close_code={exc.code} "
-                    f"close_reason={exc.reason!r} retry_seconds={backoff}"
+                    "pumpfun_stream_disconnected "
+                    f"transport=primary mint_authority={mint_authority} "
+                    f"close_code={exc.code} close_reason={exc.reason!r} "
+                    f"retry_seconds={backoff}"
                 )
-                if transport == "primary" and getattr(settings, "alchemy_solana_ws_url", None):
-                    logger.warning(
-                        f"pumpfun_stream_fallback_to_alchemy mint_authority={mint_authority}",
-                    )
-                elif transport == "alchemy":
-                    alchemy_ws_healthy = False
-                    logger.warning(
-                        f"pumpfun_stream_alchemy_failed_using_recovery_poll mint_authority={mint_authority}",
-                    )
-                continue
             except Exception as exc:
                 logger.warning(
-                    f"pumpfun_stream_disconnected transport={transport} "
-                    f"mint_authority={mint_authority} error_type={type(exc).__name__} "
-                    f"error={exc!r} retry_seconds={backoff}"
+                    "pumpfun_stream_disconnected "
+                    f"transport=primary mint_authority={mint_authority} "
+                    f"error_type={type(exc).__name__} error={exc!r} "
+                    f"retry_seconds={backoff}"
                 )
-                if transport == "primary" and getattr(settings, "alchemy_solana_ws_url", None):
-                    logger.warning(
-                        f"pumpfun_stream_fallback_to_alchemy mint_authority={mint_authority}",
-                    )
-                elif transport == "alchemy":
-                    alchemy_ws_healthy = False
-                    logger.warning(
-                        f"pumpfun_stream_alchemy_failed_using_recovery_poll mint_authority={mint_authority}",
-                    )
-                continue
 
-            if connected:
-                # The stream exited normally only when stop_event was set.
-                if stop_event.is_set():
-                    return
+        logger.warning(
+            "pumpfun_stream_using_http_recovery "
+            f"mint_authority={mint_authority} fallback=alchemy_http"
+        )
 
         try:
             await asyncio.wait_for(
                 stop_event.wait(),
-                timeout=backoff,
+                timeout=max(5.0, float(backoff)),
             )
         except asyncio.TimeoutError:
             pass
 
         backoff = min(
-            backoff * 2,
-            PUMPFUN_STREAM_MAX_BACKOFF_SECONDS,
+            max(backoff * 2, PUMPFUN_STREAM_RECONNECT_SECONDS),
+            60.0,
         )
-
-
-def _get_or_create_pumpfun_stream(
-    rpc_url: str,
-    mint_authority: str,
-) -> dict:
-    """Create the background Pump.fun stream once per mint authority."""
-
-    state = _pumpfun_streams.get(mint_authority)
-    if state:
-        task = state.get("task")
-        if task and not task.done():
-            return state
-
-    queue: asyncio.Queue = asyncio.Queue(
-        maxsize=PUMPFUN_EVENT_QUEUE_MAXSIZE
-    )
-    stop_event = asyncio.Event()
-    task = asyncio.create_task(
-        _pumpfun_stream_worker(
-            rpc_url,
-            mint_authority,
-            queue,
-            stop_event,
-        ),
-        name=f"pumpfun-stream-{mint_authority[:8]}",
-    )
-
-    state = {
-        "queue": queue,
-        "stop_event": stop_event,
-        "task": task,
-        "last_fallback": 0.0,
-    }
-    _pumpfun_streams[mint_authority] = state
-    return state
-
-
-def _drain_pumpfun_queue(
-    queue: asyncio.Queue,
-) -> list[dict]:
-    """Drain all currently buffered launch events."""
-
-    items = []
-    while True:
-        try:
-            items.append(queue.get_nowait())
-        except asyncio.QueueEmpty:
-            return items
 
 
 async def poll_new_pumpfun_mints(
@@ -2049,7 +1927,9 @@ async def poll_new_pumpfun_mints(
         except Exception as exc:
             last_exc = exc
             logger.warning(
-                "pumpfun_recovery_rpc_failed",
+                "pumpfun_recovery_rpc_failed "
+                f"transport={transport} mint_authority={mint_authority} "
+                f"error_type={type(exc).__name__} error={exc!r}",
                 extra={
                     "transport": transport,
                     "mint_authority": mint_authority,
