@@ -29,6 +29,7 @@ from solders.transaction import Transaction as LegacyTransaction
 from solders.transaction import VersionedTransaction
 
 from app.security.redact import redact_text
+from app.config.settings import settings
 
 
 logger = logging.getLogger(
@@ -83,47 +84,66 @@ async def _rpc_request(
     method: str,
     params: list[Any],
 ) -> Any:
-    """Execute a raw Solana JSON-RPC request."""
+    """Execute a Solana JSON-RPC request with optional Alchemy failover."""
 
-    payload = {
-        "jsonrpc": "2.0",
-        "id": int(time.time() * 1000),
-        "method": method,
-        "params": params,
-    }
+    urls = [rpc_url]
+    fallback = getattr(settings, "alchemy_solana_rpc_url", None)
+    if fallback and fallback != rpc_url:
+        urls.append(fallback)
 
-    try:
-        async with httpx.AsyncClient(
-            timeout=RPC_REQUEST_TIMEOUT_SECONDS
-        ) as client:
+    last_error = None
 
-            response = await client.post(
-                rpc_url,
-                json=payload,
-                headers={
-                    "Content-Type": "application/json",
-                },
-            )
+    for index, url in enumerate(urls):
+        payload = {
+            "jsonrpc": "2.0",
+            "id": int(time.time() * 1000),
+            "method": method,
+            "params": params,
+        }
 
-            response.raise_for_status()
+        try:
+            async with httpx.AsyncClient(
+                timeout=RPC_REQUEST_TIMEOUT_SECONDS
+            ) as client:
+                response = await client.post(
+                    url,
+                    json=payload,
+                    headers={"Content-Type": "application/json"},
+                )
+                response.raise_for_status()
+                body = response.json()
 
-            body = response.json()
+            if "error" in body:
+                raise SolanaTxError(
+                    redact_text(
+                        f"RPC {method} error: {body['error']}"
+                    )
+                )
 
-    except Exception as exc:
-        raise SolanaTxError(
-            redact_text(
-                f"RPC request failed ({method}): {exc}"
-            )
-        ) from exc
+            return body.get("result")
 
-    if "error" in body:
-        raise SolanaTxError(
-            redact_text(
-                f"RPC {method} error: {body['error']}"
-            )
-        )
+        except Exception as exc:
+            last_error = exc
 
-    return body.get("result")
+            if index < len(urls) - 1:
+                logger.warning(
+                    "solana_rpc_primary_failed_using_alchemy",
+                    extra={
+                        "method": method,
+                        "error": redact_text(str(exc)),
+                    },
+                )
+                continue
+
+            raise SolanaTxError(
+                redact_text(
+                    f"RPC request failed ({method}): {exc}"
+                )
+            ) from exc
+
+    raise SolanaTxError(
+        redact_text(f"RPC request failed ({method}): {last_error}")
+    )
 
 
 # ---------------------------------------------------------------------------
