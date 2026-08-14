@@ -23,6 +23,7 @@ import struct
 from collections import deque
 from typing import Optional
 from urllib.parse import urlsplit, urlunsplit
+from app.config.settings import settings
 
 import httpx
 import websockets
@@ -278,6 +279,39 @@ async def _direct_rpc_request(
     )
 
 
+async def _direct_rpc_request_with_fallback(
+    rpc_url: str,
+    method: str,
+    params: list,
+) -> dict:
+    """Direct JSON-RPC request with optional Alchemy failover."""
+
+    try:
+        return await _direct_rpc_request(
+            rpc_url,
+            method,
+            params,
+        )
+    except Exception as primary_exc:
+        fallback = getattr(settings, "alchemy_solana_rpc_url", None)
+        if not fallback or fallback == rpc_url:
+            raise
+
+        logger.warning(
+            "onchain_rpc_fallback_to_alchemy",
+            extra={
+                "method": method,
+                "error": str(primary_exc),
+            },
+        )
+        return await _direct_rpc_request(
+            fallback,
+            method,
+            params,
+        )
+
+
+
 async def _get_signatures_direct(
     rpc_url: str,
     address: str,
@@ -300,7 +334,7 @@ async def _get_signatures_direct(
             "until"
         ] = until
 
-    body = await _direct_rpc_request(
+    body = await _direct_rpc_request_with_fallback(
         rpc_url,
         "getSignaturesForAddress",
         params,
@@ -338,7 +372,7 @@ async def _get_transaction_direct(
         },
     ]
 
-    body = await _direct_rpc_request(
+    body = await _direct_rpc_request_with_fallback(
         rpc_url,
         "getTransaction",
         params,
