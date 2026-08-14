@@ -1652,6 +1652,7 @@ async def _pumpfun_stream_worker(
     mint_authority: str,
     queue: asyncio.Queue,
     stop_event: asyncio.Event,
+    state: dict,
 ) -> None:
     """
     Pump.fun real-time stream.
@@ -1660,6 +1661,19 @@ async def _pumpfun_stream_worker(
     only by the existing HTTP recovery path because the deployed Alchemy
     Solana WSS endpoint returned JSON-RPC -32601 "Method not found" for
     slotSubscribe/logsSubscribe.
+
+    Writes state["connected"] on every transition so poll_new_pumpfun_mints
+    can tell a genuinely live stream apart from one that's stuck retrying.
+    This worker's own while-loop swallows every connection error and keeps
+    looping rather than returning, by design - so the asyncio task itself
+    never reports done() while stuck in reconnect/backoff, even though no
+    data is flowing. state["connected"] is the signal that actually tracks
+    that: poll_new_pumpfun_mints was reading task.done() to decide whether
+    to fall back to the fast HTTP recovery poll, which meant a stream stuck
+    endlessly retrying (exactly what repeated 429s produce) never tripped
+    it and got stuck on the slow 120s catch-up cadence instead of the 5s
+    degraded one - a real gap during the exact outage window it exists to
+    cover.
     """
 
     backoff = PUMPFUN_STREAM_RECONNECT_SECONDS
@@ -1668,6 +1682,8 @@ async def _pumpfun_stream_worker(
         ws_url = _rpc_http_to_ws_url(rpc_url)
 
         if not ws_url:
+            state["connected"] = False
+
             logger.warning(
                 f"pumpfun_stream_unavailable "
                 f"reason=missing_primary_ws_url mint_authority={mint_authority}"
@@ -1740,6 +1756,8 @@ async def _pumpfun_stream_worker(
                         f"mint_authority={mint_authority}"
                     )
 
+                    state["connected"] = True
+
                     backoff = PUMPFUN_STREAM_RECONNECT_SECONDS
 
                     while not stop_event.is_set():
@@ -1798,6 +1816,8 @@ async def _pumpfun_stream_worker(
                 raise
 
             except ConnectionClosed as exc:
+                state["connected"] = False
+
                 logger.warning(
                     f"pumpfun_stream_disconnected transport=primary "
                     f"mint_authority={mint_authority} "
@@ -1810,6 +1830,8 @@ async def _pumpfun_stream_worker(
                 )
 
             except Exception as exc:
+                state["connected"] = False
+
                 logger.warning(
                     f"pumpfun_stream_disconnected transport=primary "
                     f"mint_authority={mint_authority} "
@@ -1851,22 +1873,27 @@ def _get_or_create_pumpfun_stream(
         maxsize=PUMPFUN_EVENT_QUEUE_MAXSIZE
     )
     stop_event = asyncio.Event()
+
+    state = {
+        "queue": queue,
+        "stop_event": stop_event,
+        "task": None,
+        "last_fallback": 0.0,
+        "connected": False,
+    }
+
     task = asyncio.create_task(
         _pumpfun_stream_worker(
             rpc_url,
             mint_authority,
             queue,
             stop_event,
+            state,
         ),
         name=f"pumpfun-stream-{mint_authority[:8]}",
     )
 
-    state = {
-        "queue": queue,
-        "stop_event": stop_event,
-        "task": task,
-        "last_fallback": 0.0,
-    }
+    state["task"] = task
     _pumpfun_streams[mint_authority] = state
     return state
 
@@ -1930,7 +1957,14 @@ async def poll_new_pumpfun_mints(
     loop_time = asyncio.get_running_loop().time()
     stream_task = state.get("task")
     stream_down = bool(
-        stream_task is not None and stream_task.done()
+        (
+            stream_task is not None
+            and stream_task.done()
+        )
+        or not state.get(
+            "connected",
+            False,
+        )
     )
     poll_interval = (
         PUMPFUN_DEGRADED_POLL_SECONDS
