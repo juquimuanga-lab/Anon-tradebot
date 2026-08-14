@@ -550,6 +550,205 @@ def extract_wallet_trade_execution(
     }
 
 
+
+
+def extract_wallet_sell_execution(
+    transaction: Optional[dict],
+    owner_pubkey: str,
+    token_mint: str,
+) -> Optional[dict]:
+    """Extract the actual wallet-side result of a confirmed token SELL.
+
+    For a SELL we expect the wallet's token balance to decrease and its SOL
+    balance to increase. The helper reports gross SOL output, net wallet SOL
+    change, network fee, and the exact token delta from transaction metadata.
+    It is diagnostic/settlement data only and never constructs transactions.
+    """
+    if not transaction:
+        return None
+
+    meta = transaction.get("meta") or {}
+    message = (
+        (transaction.get("transaction") or {}).get("message")
+        or {}
+    )
+
+    pre_balances = meta.get("preBalances") or []
+    post_balances = meta.get("postBalances") or []
+    account_keys = message.get("accountKeys") or []
+
+    owner = str(owner_pubkey)
+    owner_index = None
+
+    for index, key in enumerate(account_keys):
+        if isinstance(key, dict):
+            key_value = (
+                key.get("pubkey")
+                or key.get("address")
+                or key.get("key")
+            )
+        else:
+            key_value = key
+
+        if str(key_value) == owner:
+            owner_index = index
+            break
+
+    if owner_index is None:
+        return None
+
+    if (
+        owner_index >= len(pre_balances)
+        or owner_index >= len(post_balances)
+    ):
+        return None
+
+    wallet_net_change_lamports = (
+        int(post_balances[owner_index])
+        - int(pre_balances[owner_index])
+    )
+    fee_lamports = int(meta.get("fee") or 0)
+
+    # Prefer an actual parsed System Program transfer into the wallet.
+    # This is the cleanest gross SOL output for the Pump.fun bonding curve.
+    inbound_transfer_lamports = 0
+
+    def _scan_instructions(instructions):
+        nonlocal inbound_transfer_lamports
+
+        for instruction in instructions or []:
+            parsed = instruction.get("parsed")
+            if not isinstance(parsed, dict):
+                continue
+
+            if parsed.get("type") != "transfer":
+                continue
+
+            info = parsed.get("info") or {}
+            destination = str(
+                info.get("destination") or ""
+            )
+            lamports = info.get("lamports")
+
+            if (
+                destination == owner
+                and lamports is not None
+            ):
+                try:
+                    inbound_transfer_lamports += int(
+                        lamports
+                    )
+                except (TypeError, ValueError):
+                    pass
+
+    _scan_instructions(
+        message.get("instructions") or []
+    )
+
+    for inner_group in meta.get("innerInstructions") or []:
+        _scan_instructions(
+            inner_group.get("instructions") or []
+        )
+
+    # Fallback: for a normal fee-payer SELL, post-pre is gross proceeds
+    # minus the transaction fee.
+    if inbound_transfer_lamports > 0:
+        sol_received_lamports = (
+            inbound_transfer_lamports
+        )
+    else:
+        sol_received_lamports = max(
+            0,
+            wallet_net_change_lamports
+            + fee_lamports,
+        )
+
+    if sol_received_lamports <= 0:
+        return None
+
+    pre_tokens = {}
+    post_tokens = {}
+
+    for item in meta.get("preTokenBalances") or []:
+        if str(item.get("mint")) != str(token_mint):
+            continue
+
+        if (
+            item.get("owner")
+            and str(item.get("owner")) != owner
+        ):
+            continue
+
+        amount_info = item.get("uiTokenAmount") or {}
+        raw = amount_info.get("amount")
+
+        if raw is not None:
+            pre_tokens[str(item.get("accountIndex"))] = (
+                int(raw),
+                int(amount_info.get("decimals") or 0),
+            )
+
+    for item in meta.get("postTokenBalances") or []:
+        if str(item.get("mint")) != str(token_mint):
+            continue
+
+        if (
+            item.get("owner")
+            and str(item.get("owner")) != owner
+        ):
+            continue
+
+        amount_info = item.get("uiTokenAmount") or {}
+        raw = amount_info.get("amount")
+
+        if raw is not None:
+            post_tokens[str(item.get("accountIndex"))] = (
+                int(raw),
+                int(amount_info.get("decimals") or 0),
+            )
+
+    indexes = set(pre_tokens) | set(post_tokens)
+    token_delta_raw = 0
+    decimals = 0
+
+    for index in indexes:
+        pre_raw, pre_decimals = pre_tokens.get(
+            index,
+            (0, 0),
+        )
+        post_raw, post_decimals = post_tokens.get(
+            index,
+            (0, 0),
+        )
+
+        token_delta_raw += (
+            pre_raw - post_raw
+        )
+        decimals = (
+            post_decimals
+            or pre_decimals
+            or decimals
+        )
+
+    if token_delta_raw <= 0:
+        return None
+
+    return {
+        "sol_received_lamports": (
+            sol_received_lamports
+        ),
+        "wallet_net_sol_change_lamports": (
+            wallet_net_change_lamports
+        ),
+        "inbound_transfer_lamports": (
+            inbound_transfer_lamports
+        ),
+        "fee_lamports": fee_lamports,
+        "token_sold_raw": token_delta_raw,
+        "token_decimals": decimals,
+    }
+
+
 def _format_transaction_error(
     status: Optional[dict],
     transaction: Optional[dict],
