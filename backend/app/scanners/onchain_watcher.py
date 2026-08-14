@@ -31,6 +31,8 @@ from solana.rpc.async_api import AsyncClient
 from solders.pubkey import Pubkey
 from solders.signature import Signature
 
+from app.config.settings import settings
+
 
 logger = logging.getLogger(
     "app.scanners.onchain_watcher"
@@ -132,6 +134,20 @@ RPC_RETRY_DELAY_SECONDS = 0.35
 # ---------------------------------------------------------------------------
 # RPC helpers
 # ---------------------------------------------------------------------------
+
+def _rpc_candidates(rpc_url: str) -> list[tuple[str, str]]:
+    """Return primary RPC followed by the configured Alchemy fallback."""
+
+    candidates: list[tuple[str, str]] = [(rpc_url, "primary")]
+    fallback = getattr(
+        settings,
+        "alchemy_solana_rpc_url",
+        None,
+    )
+    if fallback and fallback != rpc_url:
+        candidates.append((fallback, "alchemy"))
+    return candidates
+
 
 def _safe_rpc_url(
     rpc_url: str,
@@ -497,164 +513,180 @@ async def poll_new_mints(
     watermarks: WatermarkStore,
     limit: int = 20,
 ) -> list[dict]:
-    """Poll an Anoncoin creator address for newly-created tokens."""
+    """Poll an Anoncoin creator address with Helius -> Alchemy failover."""
 
-    async with AsyncClient(
-        rpc_url
-    ) as client:
+    pubkey = Pubkey.from_string(wallet)
+    until = watermarks.get(wallet)
 
-        pubkey = Pubkey.from_string(
-            wallet
-        )
+    resp = None
+    active_rpc = rpc_url
+    active_transport = "primary"
+    last_exc = None
 
-        until = watermarks.get(
-            wallet
-        )
-
+    # Normal library path. Try Helius first, then Alchemy.
+    for candidate_url, transport in _rpc_candidates(rpc_url):
         try:
-
-            resp = (
-                await client.get_signatures_for_address(
+            async with AsyncClient(candidate_url) as client:
+                resp = await client.get_signatures_for_address(
                     pubkey,
                     limit=limit,
                     until=(
-                        Signature.from_string(
-                            until
-                        )
+                        Signature.from_string(until)
                         if until
                         else None
                     ),
                 )
-            )
-
-        except Exception as exc:
-
-            logger.warning(
-                "get_signatures_failed: "
-                "solana client error: "
-                f"{type(exc).__name__}: "
-                f"{exc} | "
-                f"rpc={_safe_rpc_url(rpc_url)} | "
-                f"wallet={wallet}"
-            )
-
-            # Try direct RPC as a fallback.
-            try:
-
-                direct_items = (
-                    await _get_signatures_direct(
-                        rpc_url,
-                        wallet,
-                        limit,
-                        until,
-                    )
-                )
-
-            except Exception as direct_exc:
-
+            active_rpc = candidate_url
+            active_transport = transport
+            if transport == "alchemy":
                 logger.warning(
-                    "get_signatures_failed: "
-                    "direct rpc fallback also failed: "
-                    f"{type(direct_exc).__name__}: "
-                    f"{direct_exc} | "
-                    f"rpc={_safe_rpc_url(rpc_url)} | "
-                    f"wallet={wallet}"
+                    "onchain_rpc_fallback_to_alchemy",
+                    extra={
+                        "method": "getSignaturesForAddress",
+                        "wallet": wallet,
+                    },
                 )
-
-                return []
-
-            return await _process_direct_anoncoin_signatures(
-                rpc_url,
-                wallet,
-                watermarks,
-                direct_items,
+            break
+        except Exception as exc:
+            last_exc = exc
+            logger.warning(
+                "get_signatures_failed",
+                extra={
+                    "transport": transport,
+                    "error": f"{type(exc).__name__}: {exc}",
+                    "rpc": _safe_rpc_url(candidate_url),
+                    "wallet": wallet,
+                },
             )
 
-        sig_infos = resp.value
+    # Direct JSON-RPC recovery if the solana-py path failed on both endpoints.
+    if resp is None:
+        direct_items = None
+        direct_rpc = rpc_url
+        last_direct_exc = None
+        for candidate_url, transport in _rpc_candidates(rpc_url):
+            try:
+                direct_items = await _get_signatures_direct(
+                    candidate_url,
+                    wallet,
+                    limit,
+                    until,
+                )
+                direct_rpc = candidate_url
+                if transport == "alchemy":
+                    logger.warning(
+                        "onchain_rpc_fallback_to_alchemy",
+                        extra={
+                            "method": "getSignaturesForAddress_direct",
+                            "wallet": wallet,
+                        },
+                    )
+                break
+            except Exception as exc:
+                last_direct_exc = exc
 
-        if not sig_infos:
-
+        if direct_items is None:
+            logger.warning(
+                "get_signatures_failed",
+                extra={
+                    "error": (
+                        f"all RPCs failed; last={type(last_exc).__name__}: {last_exc}; "
+                        f"direct={type(last_direct_exc).__name__}: {last_direct_exc}"
+                    ),
+                    "wallet": wallet,
+                },
+            )
             return []
 
-        watermarks.set(
+        return await _process_direct_anoncoin_signatures(
+            direct_rpc,
             wallet,
-            str(
-                sig_infos[0].signature
-            ),
+            watermarks,
+            direct_items,
         )
 
-        if not watermarks.is_initialized(
-            wallet
-        ):
+    sig_infos = resp.value
 
-            watermarks.mark_initialized(
-                wallet
+    if not sig_infos:
+        return []
+
+    watermarks.set(
+        wallet,
+        str(sig_infos[0].signature),
+    )
+
+    if not watermarks.is_initialized(wallet):
+        watermarks.mark_initialized(wallet)
+        return []
+
+    discovered = []
+
+    for sig_info in reversed(sig_infos):
+        if sig_info.err is not None:
+            continue
+
+        tx_value = None
+
+        # Use the same active endpoint that successfully returned signatures.
+        try:
+            async with AsyncClient(active_rpc) as client:
+                tx_resp = await client.get_transaction(
+                    sig_info.signature,
+                    encoding="jsonParsed",
+                    max_supported_transaction_version=0,
+                )
+            tx_value = tx_resp.value
+        except Exception as exc:
+            logger.warning(
+                "get_transaction_failed",
+                extra={
+                    "transport": active_transport,
+                    "error": f"{type(exc).__name__}: {exc}",
+                    "signature": str(sig_info.signature),
+                },
             )
 
-            return []
+            # If the active endpoint was primary, retry the transaction on Alchemy.
+            if active_transport == "primary":
+                fallback = getattr(settings, "alchemy_solana_rpc_url", None)
+                if fallback and fallback != active_rpc:
+                    try:
+                        async with AsyncClient(fallback) as fallback_client:
+                            tx_resp = await fallback_client.get_transaction(
+                                sig_info.signature,
+                                encoding="jsonParsed",
+                                max_supported_transaction_version=0,
+                            )
+                        tx_value = tx_resp.value
+                        logger.warning(
+                            "onchain_rpc_fallback_to_alchemy",
+                            extra={
+                                "method": "getTransaction",
+                                "signature": str(sig_info.signature),
+                            },
+                        )
+                    except Exception:
+                        continue
 
-        discovered = []
+        if not tx_value:
+            continue
 
-        for sig_info in reversed(
-            sig_infos
-        ):
-
-            if sig_info.err is not None:
-
-                continue
-
-            try:
-
-                tx_resp = (
-                    await client.get_transaction(
-                        sig_info.signature,
-                        encoding="jsonParsed",
-                        max_supported_transaction_version=0,
-                    )
-                )
-
-            except Exception as exc:
-
-                logger.warning(
-                    "get_transaction_failed: "
-                    f"{type(exc).__name__}: "
-                    f"{exc} | "
-                    f"signature={sig_info.signature}"
-                )
-
-                continue
-
-            if not tx_resp.value:
-
-                continue
-
-            mint = extract_new_mint(
-                tx_resp.value
+        mint = extract_new_mint(tx_value)
+        if mint:
+            discovered.append(
+                {
+                    "mint": mint,
+                    "tx_signature": str(sig_info.signature),
+                    "block_time": sig_info.block_time,
+                    "watched_wallet": wallet,
+                    "source": "anoncoin_onchain",
+                    "rpc_transport": active_transport,
+                }
             )
 
-            if mint:
+        await asyncio.sleep(0.15)
 
-                discovered.append(
-                    {
-                        "mint": mint,
-                        "tx_signature": str(
-                            sig_info.signature
-                        ),
-                        "block_time": (
-                            sig_info.block_time
-                        ),
-                        "watched_wallet": wallet,
-                        "source": (
-                            "anoncoin_onchain"
-                        ),
-                    }
-                )
-
-            await asyncio.sleep(
-                0.15
-            )
-
-        return discovered
+    return discovered
 
 
 def _extract_new_mint_from_raw_tx(
@@ -1557,113 +1589,138 @@ async def _pumpfun_stream_worker(
     queue: asyncio.Queue,
     stop_event: asyncio.Event,
 ) -> None:
-    """Continuously stream Pump.fun CreateEvents over standard Solana WSS."""
+    """Continuously stream Pump.fun CreateEvents with RPC failover."""
 
-    ws_url = _rpc_http_to_ws_url(rpc_url)
     backoff = PUMPFUN_STREAM_RECONNECT_SECONDS
 
     while not stop_event.is_set():
-        try:
-            async with websockets.connect(
-                ws_url,
-                ping_interval=20,
-                ping_timeout=20,
-                close_timeout=5,
-                max_size=4 * 1024 * 1024,
-            ) as ws:
-                request = {
-                    "jsonrpc": "2.0",
-                    "id": 1,
-                    "method": "logsSubscribe",
-                    "params": [
-                        {"mentions": [mint_authority]},
-                        {"commitment": "processed"},
-                    ],
-                }
+        connected = False
 
-                await ws.send(json.dumps(request))
-                subscription_response = json.loads(await ws.recv())
+        for candidate_url, transport in _rpc_candidates(rpc_url):
+            if stop_event.is_set():
+                return
 
-                if "error" in subscription_response:
-                    raise RuntimeError(
-                        f"Pump.fun logsSubscribe failed: {subscription_response['error']}"
+            ws_url = (
+                getattr(settings, "alchemy_solana_ws_url", None)
+                if transport == "alchemy"
+                else _rpc_http_to_ws_url(candidate_url)
+            )
+            if not ws_url:
+                continue
+
+            try:
+                async with websockets.connect(
+                    ws_url,
+                    ping_interval=20,
+                    ping_timeout=20,
+                    close_timeout=5,
+                    max_size=4 * 1024 * 1024,
+                ) as ws:
+                    request = {
+                        "jsonrpc": "2.0",
+                        "id": 1,
+                        "method": "logsSubscribe",
+                        "params": [
+                            {"mentions": [mint_authority]},
+                            {"commitment": "processed"},
+                        ],
+                    }
+
+                    await ws.send(json.dumps(request))
+                    subscription_response = json.loads(await ws.recv())
+
+                    if "error" in subscription_response:
+                        raise RuntimeError(
+                            f"Pump.fun logsSubscribe failed: {subscription_response['error']}"
+                        )
+
+                    logger.info(
+                        "pumpfun_stream_connected",
+                        extra={
+                            "mint_authority": mint_authority,
+                            "transport": transport,
+                        },
                     )
 
-                logger.info(
-                    "pumpfun_stream_connected",
-                    extra={
-                        "mint_authority": mint_authority,
-                    },
-                )
+                    connected = True
+                    backoff = PUMPFUN_STREAM_RECONNECT_SECONDS
 
-                backoff = PUMPFUN_STREAM_RECONNECT_SECONDS
+                    while not stop_event.is_set():
+                        raw = await ws.recv()
+                        message = json.loads(raw)
 
-                while not stop_event.is_set():
-                    raw = await ws.recv()
-                    message = json.loads(raw)
+                        params = message.get("params") or {}
+                        result = params.get("result") or {}
+                        value = result.get("value") or {}
 
-                    params = message.get("params") or {}
-                    result = params.get("result") or {}
-                    value = result.get("value") or {}
+                        if value.get("err") is not None:
+                            continue
 
-                    if value.get("err") is not None:
-                        continue
+                        logs = value.get("logs") or []
+                        signature = value.get("signature")
 
-                    logs = value.get("logs") or []
-                    signature = value.get("signature")
+                        if not signature:
+                            continue
 
-                    if not signature:
-                        continue
+                        launch = _extract_pumpfun_event_from_logs(logs)
+                        if not launch:
+                            continue
 
-                    launch = _extract_pumpfun_event_from_logs(logs)
-                    if not launch:
-                        continue
+                        launch["tx_signature"] = signature
+                        launch["block_time"] = None
+                        launch["watched_wallet"] = mint_authority
+                        launch["discovery"] = "websocket_create_event"
+                        launch["rpc_transport"] = transport
 
-                    launch["tx_signature"] = signature
-                    launch["block_time"] = None
-                    launch["watched_wallet"] = mint_authority
-                    launch["discovery"] = "websocket_create_event"
-
-                    try:
-                        queue.put_nowait(launch)
-                    except asyncio.QueueFull:
-                        # Never let a launch burst block the stream forever.
-                        # Keep the newest signal because the scanner is more
-                        # interested in current launches than stale backlog.
-                        try:
-                            queue.get_nowait()
-                        except asyncio.QueueEmpty:
-                            pass
                         try:
                             queue.put_nowait(launch)
                         except asyncio.QueueFull:
-                            pass
+                            try:
+                                queue.get_nowait()
+                            except asyncio.QueueEmpty:
+                                pass
+                            try:
+                                queue.put_nowait(launch)
+                            except asyncio.QueueFull:
+                                pass
 
-        except asyncio.CancelledError:
-            raise
-
-        except Exception as exc:
-            logger.warning(
-                "pumpfun_stream_disconnected",
-                extra={
-                    "mint_authority": mint_authority,
-                    "error": f"{type(exc).__name__}: {exc}",
-                    "retry_seconds": backoff,
-                },
-            )
-
-            try:
-                await asyncio.wait_for(
-                    stop_event.wait(),
-                    timeout=backoff,
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                logger.warning(
+                    "pumpfun_stream_disconnected",
+                    extra={
+                        "mint_authority": mint_authority,
+                        "transport": transport,
+                        "error": f"{type(exc).__name__}: {exc}",
+                        "retry_seconds": backoff,
+                    },
                 )
-            except asyncio.TimeoutError:
-                pass
+                # Try Alchemy immediately after a primary Helius failure.
+                if transport == "primary" and getattr(settings, "alchemy_solana_ws_url", None):
+                    logger.warning(
+                        "pumpfun_stream_fallback_to_alchemy",
+                        extra={"mint_authority": mint_authority},
+                    )
+                continue
 
-            backoff = min(
-                backoff * 2,
-                PUMPFUN_STREAM_MAX_BACKOFF_SECONDS,
+            if connected:
+                # The stream exited normally only when stop_event was set.
+                if stop_event.is_set():
+                    return
+
+        try:
+            await asyncio.wait_for(
+                stop_event.wait(),
+                timeout=backoff,
             )
+        except asyncio.TimeoutError:
+            pass
+
+        backoff = min(
+            backoff * 2,
+            PUMPFUN_STREAM_MAX_BACKOFF_SECONDS,
+        )
 
 
 def _get_or_create_pumpfun_stream(
@@ -1721,20 +1778,7 @@ async def poll_new_pumpfun_mints(
     watermarks: WatermarkStore,
     limit: int = 20,
 ) -> list[dict]:
-    """Return newly-created Pump.fun tokens with minimal RPC credit usage.
-
-    Primary path:
-        Standard Solana logsSubscribe -> Pump.fun CreateEvent -> mint
-
-    This avoids the old N+1 pattern of:
-        getSignaturesForAddress + getTransaction for every signature.
-
-    Recovery path:
-        A low-frequency signature poll is used only when the stream has
-        disconnected or every PUMPFUN_FALLBACK_POLL_SECONDS. The fallback
-        preserves the old parser and is therefore able to recover missed
-        events without making transaction calls during normal streaming.
-    """
+    """Discover Pump.fun launches using WSS with HTTP recovery failover."""
 
     state = _get_or_create_pumpfun_stream(
         rpc_url,
@@ -1744,58 +1788,38 @@ async def poll_new_pumpfun_mints(
     discovered = []
     seen_signatures = set()
 
-    # ------------------------------------------------------------------
     # Fast path: drain CreateEvents already received by the WSS listener.
-    # ------------------------------------------------------------------
-
     for launch in _drain_pumpfun_queue(state["queue"]):
         signature = launch.get("tx_signature")
         mint = launch.get("mint")
 
-        if not signature or not mint:
-            continue
-
-        if signature in seen_signatures:
+        if not signature or not mint or signature in seen_signatures:
             continue
 
         seen_signatures.add(signature)
-        watermarks.set(
-            f"pumpfun:{mint_authority}",
-            signature,
-        )
+        watermark_key = f"pumpfun:{mint_authority}"
+        watermarks.set(watermark_key, signature)
 
-        if not watermarks.is_initialized(
-            f"pumpfun:{mint_authority}"
-        ):
-            watermarks.mark_initialized(
-                f"pumpfun:{mint_authority}"
-            )
+        if not watermarks.is_initialized(watermark_key):
+            watermarks.mark_initialized(watermark_key)
 
         discovered.append(launch)
-
-        logger.debug("pumpfun_launch_detected",
+        logger.debug(
+            "pumpfun_launch_detected",
             extra={
                 "mint": launch.get("mint"),
                 "creator": launch.get("creator"),
                 "tx_signature": signature,
                 "discovery": launch.get("discovery"),
+                "rpc_transport": launch.get("rpc_transport"),
             },
         )
-
-    # ------------------------------------------------------------------
-    # Low-frequency recovery path.
-    # ------------------------------------------------------------------
-    # Only run it when enough time has elapsed. Normal operation therefore
-    # uses WSS and does not call getTransaction for every launch.
-    # ------------------------------------------------------------------
 
     loop_time = asyncio.get_running_loop().time()
     stream_task = state.get("task")
     stream_down = bool(
-        stream_task is not None
-        and stream_task.done()
+        stream_task is not None and stream_task.done()
     )
-
     fallback_due = (
         loop_time - float(state.get("last_fallback", 0.0))
         >= PUMPFUN_FALLBACK_POLL_SECONDS
@@ -1805,26 +1829,42 @@ async def poll_new_pumpfun_mints(
         return discovered
 
     state["last_fallback"] = loop_time
-
     watermark_key = f"pumpfun:{mint_authority}"
     until = watermarks.get(watermark_key)
 
-    try:
-        authority_pubkey = Pubkey.from_string(mint_authority)
+    # HTTP recovery: Helius -> Alchemy.
+    normalized = None
+    active_rpc = rpc_url
+    active_transport = "primary"
+    last_exc = None
 
-        async with AsyncClient(rpc_url) as client:
-            resp = await client.get_signatures_for_address(
-                authority_pubkey,
-                limit=min(
-                    int(limit),
-                    PUMPFUN_FALLBACK_SIGNATURE_LIMIT,
-                ),
-                until=(
-                    Signature.from_string(until)
-                    if until
-                    else None
-                ),
-            )
+    for candidate_url, transport in _rpc_candidates(rpc_url):
+        try:
+            authority_pubkey = Pubkey.from_string(mint_authority)
+            async with AsyncClient(candidate_url) as client:
+                resp = await client.get_signatures_for_address(
+                    authority_pubkey,
+                    limit=min(
+                        int(limit),
+                        PUMPFUN_FALLBACK_SIGNATURE_LIMIT,
+                    ),
+                    until=(
+                        Signature.from_string(until)
+                        if until
+                        else None
+                    ),
+                )
+
+            active_rpc = candidate_url
+            active_transport = transport
+            if transport == "alchemy":
+                logger.warning(
+                    "onchain_rpc_fallback_to_alchemy",
+                    extra={
+                        "method": "pumpfun_getSignaturesForAddress",
+                        "mint_authority": mint_authority,
+                    },
+                )
 
             normalized = [
                 {
@@ -1834,110 +1874,199 @@ async def poll_new_pumpfun_mints(
                 }
                 for item in resp.value
             ]
+            break
 
-            # On a fresh stream start, initialize from the newest signature
-            # only if the stream has not already supplied events. This keeps
-            # startup from replaying historical launches.
-            if not watermarks.is_initialized(watermark_key):
-                if normalized:
-                    watermarks.set(
-                        watermark_key,
-                        normalized[0]["signature"],
-                    )
-                watermarks.mark_initialized(
-                    watermark_key
+        except Exception as exc:
+            last_exc = exc
+            logger.warning(
+                "pumpfun_recovery_rpc_failed",
+                extra={
+                    "transport": transport,
+                    "mint_authority": mint_authority,
+                    "error": f"{type(exc).__name__}: {exc}",
+                },
+            )
+
+    # If solana-py failed on both, try the direct JSON-RPC implementation on
+    # both endpoints as a final recovery path.
+    if normalized is None:
+        direct_items = None
+        direct_rpc = rpc_url
+        direct_transport = "primary"
+        last_direct_exc = None
+
+        for candidate_url, transport in _rpc_candidates(rpc_url):
+            try:
+                direct_items = await _get_signatures_direct(
+                    candidate_url,
+                    mint_authority,
+                    min(
+                        int(limit),
+                        PUMPFUN_FALLBACK_SIGNATURE_LIMIT,
+                    ),
+                    until,
                 )
-                logger.info(
-                    "pumpfun_watermark_initialized",
-                    extra={
-                        "mint_authority": mint_authority,
-                        "signature": (
-                            normalized[0]["signature"]
-                            if normalized
-                            else None
-                        ),
-                        "mode": "streaming",
-                    },
-                )
-                return discovered
-
-            # Process only signatures newer than the watermark. The stream
-            # should normally make this list empty; this is strictly recovery.
-            for sig_info in reversed(normalized):
-                signature = sig_info.get("signature")
-                if not signature:
-                    continue
-                if signature in seen_signatures:
-                    continue
-                if sig_info.get("err") is not None:
-                    continue
-
-                tx_value = None
-                try:
-                    tx_resp = await client.get_transaction(
-                        Signature.from_string(signature),
-                        encoding="jsonParsed",
-                        max_supported_transaction_version=0,
-                    )
-                    tx_value = tx_resp.value
-                except Exception as exc:
+                direct_rpc = candidate_url
+                direct_transport = transport
+                if transport == "alchemy":
                     logger.warning(
-                        "pumpfun_recovery_get_transaction_failed",
+                        "onchain_rpc_fallback_to_alchemy",
                         extra={
-                            "signature": signature,
-                            "error": str(exc),
+                            "method": "pumpfun_getSignaturesForAddress_direct",
+                            "mint_authority": mint_authority,
                         },
                     )
-                    try:
-                        tx_value = await _get_transaction_direct(
-                            rpc_url,
-                            signature,
-                        )
-                    except Exception:
-                        continue
+                break
+            except Exception as exc:
+                last_direct_exc = exc
 
-                if not tx_value:
-                    continue
+        if direct_items is None:
+            logger.warning(
+                "pumpfun_recovery_poll_failed",
+                extra={
+                    "mint_authority": mint_authority,
+                    "error": (
+                        f"all RPCs failed; primary={type(last_exc).__name__}: {last_exc}; "
+                        f"direct={type(last_direct_exc).__name__}: {last_direct_exc}"
+                    ),
+                },
+            )
+            return discovered
 
-                try:
-                    launch = extract_pumpfun_create(tx_value)
-                except Exception:
-                    logger.debug(
-                        "pumpfun_recovery_parse_failed",
-                        exc_info=True,
-                    )
-                    continue
+        normalized = direct_items
+        active_rpc = direct_rpc
+        active_transport = direct_transport
 
-                if not launch:
-                    continue
-
-                launch["tx_signature"] = signature
-                launch["block_time"] = sig_info.get("block_time")
-                launch["watched_wallet"] = mint_authority
-                launch["discovery"] = "rpc_recovery"
-
-                discovered.append(launch)
-                seen_signatures.add(signature)
-                watermarks.set(
-                    watermark_key,
-                    signature,
-                )
-
-                logger.debug("pumpfun_launch_detected",
-                    extra={
-                        "mint": launch.get("mint"),
-                        "creator": launch.get("creator"),
-                        "tx_signature": signature,
-                        "discovery": "rpc_recovery",
-                    },
-                )
-
-    except Exception as exc:
-        logger.warning(
-            "pumpfun_recovery_poll_failed",
+    # On a fresh stream start, initialize from the newest signature without
+    # replaying historical launches.
+    if not watermarks.is_initialized(watermark_key):
+        if normalized:
+            watermarks.set(
+                watermark_key,
+                normalized[0]["signature"],
+            )
+        watermarks.mark_initialized(watermark_key)
+        logger.info(
+            "pumpfun_watermark_initialized",
             extra={
                 "mint_authority": mint_authority,
-                "error": f"{type(exc).__name__}: {exc}",
+                "signature": (
+                    normalized[0]["signature"]
+                    if normalized
+                    else None
+                ),
+                "mode": "streaming",
+                "rpc_transport": active_transport,
+            },
+        )
+        return discovered
+
+    # Recovery only processes signatures newer than the watermark.
+    for sig_info in reversed(normalized):
+        signature = sig_info.get("signature")
+        if not signature or signature in seen_signatures:
+            continue
+        if sig_info.get("err") is not None:
+            continue
+
+        tx_value = None
+
+        # First use the endpoint that supplied the signatures.
+        try:
+            async with AsyncClient(active_rpc) as client:
+                tx_resp = await client.get_transaction(
+                    Signature.from_string(signature),
+                    encoding="jsonParsed",
+                    max_supported_transaction_version=0,
+                )
+            tx_value = tx_resp.value
+        except Exception as exc:
+            logger.warning(
+                "pumpfun_recovery_get_transaction_failed",
+                extra={
+                    "signature": signature,
+                    "transport": active_transport,
+                    "error": f"{type(exc).__name__}: {exc}",
+                },
+            )
+
+            # If the active endpoint was Helius, retry getTransaction on Alchemy.
+            if active_transport == "primary":
+                fallback = getattr(settings, "alchemy_solana_rpc_url", None)
+                if fallback and fallback != active_rpc:
+                    try:
+                        async with AsyncClient(fallback) as fallback_client:
+                            tx_resp = await fallback_client.get_transaction(
+                                Signature.from_string(signature),
+                                encoding="jsonParsed",
+                                max_supported_transaction_version=0,
+                            )
+                        tx_value = tx_resp.value
+                        active_transport = "alchemy"
+                        active_rpc = fallback
+                        logger.warning(
+                            "onchain_rpc_fallback_to_alchemy",
+                            extra={
+                                "method": "pumpfun_getTransaction",
+                                "signature": signature,
+                            },
+                        )
+                    except Exception as fallback_exc:
+                        try:
+                            tx_value = await _get_transaction_direct(
+                                fallback,
+                                signature,
+                            )
+                            active_transport = "alchemy"
+                            active_rpc = fallback
+                        except Exception:
+                            logger.debug(
+                                "pumpfun_recovery_get_transaction_alchemy_failed",
+                                extra={"error": str(fallback_exc)},
+                            )
+                            continue
+            else:
+                try:
+                    tx_value = await _get_transaction_direct(
+                        active_rpc,
+                        signature,
+                    )
+                except Exception:
+                    continue
+
+        if not tx_value:
+            continue
+
+        try:
+            launch = extract_pumpfun_create(tx_value)
+        except Exception:
+            logger.debug(
+                "pumpfun_recovery_parse_failed",
+                exc_info=True,
+            )
+            continue
+
+        if not launch:
+            continue
+
+        launch["tx_signature"] = signature
+        launch["block_time"] = sig_info.get("block_time")
+        launch["watched_wallet"] = mint_authority
+        launch["discovery"] = "rpc_recovery"
+        launch["rpc_transport"] = active_transport
+
+        discovered.append(launch)
+        seen_signatures.add(signature)
+        watermarks.set(watermark_key, signature)
+
+        logger.debug(
+            "pumpfun_launch_detected",
+            extra={
+                "mint": launch.get("mint"),
+                "creator": launch.get("creator"),
+                "tx_signature": signature,
+                "discovery": "rpc_recovery",
+                "rpc_transport": active_transport,
             },
         )
 
@@ -1947,8 +2076,8 @@ async def poll_new_pumpfun_mints(
             extra={
                 "count": len(discovered),
                 "mode": "streaming",
+                "rpc_transport": active_transport,
             },
         )
 
     return discovered
-
