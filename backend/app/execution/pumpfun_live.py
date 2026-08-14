@@ -136,6 +136,51 @@ def _is_bonding_curve_graduated_error(
     )
 
 
+def _is_too_little_sol_received_error(
+    exc: Exception,
+) -> bool:
+    """Return True when Pump.fun rejected a SELL because minimum SOL output
+    was not achievable at execution time.
+    """
+
+    text = str(exc).lower()
+    normalized = (
+        text
+        .replace(" ", "")
+        .replace("_", "")
+        .replace("-", "")
+    )
+
+    markers = (
+        "toolittlesolreceived",
+        "toolittlesol",
+        "errorcode6003",
+        "6003",
+    )
+
+    return any(
+        marker in normalized
+        for marker in markers
+    )
+
+
+def _sell_slippage_for_attempt(
+    base_bps: int,
+    attempt: int,
+) -> int:
+    """Bounded slippage schedule used only for explicit 6003 retries."""
+
+    base = max(0, int(base_bps))
+
+    if attempt <= 0:
+        return base
+
+    if attempt == 1:
+        return min(max(base, 1) * 5 // 2, 1000)
+
+    return min(max(base, 1) * 10 // 3, 1500)
+
+
 def _token_amount_to_raw(
     amount_tokens: float,
     decimals: int,
@@ -849,6 +894,9 @@ class PumpFunExecutionAdapter(
                             built.get(
                                 "expected_sol_lamports"
                             )
+                        ), 
+                        "slippage_bps": (
+                            slippage_bps
                         ),
                     },
                 )
@@ -868,6 +916,35 @@ class PumpFunExecutionAdapter(
                 SolanaTxError,
                 JupiterError,
             ) as exc:
+
+                # Pump.fun 6003 (TooLittleSolReceived) means the
+                # curve moved after the quote and the minimum SOL output was
+                # not met. Rebuild fresh with boundedly wider tolerance.
+                # This is an explicit rejection, so retrying cannot double-
+                # sell an unknown/possibly successful transaction.
+                if (
+                    attempt < max_attempts - 1
+                    and _is_too_little_sol_received_error(exc)
+                ):
+                    next_slippage_bps = _sell_slippage_for_attempt(
+                        base_slippage_bps,
+                        attempt + 1,
+                    )
+
+                    logger.warning(
+                        "pumpfun_sell_too_little_sol_retrying",
+                        extra={
+                            "mint": token.mint,
+                            "attempt": attempt + 1,
+                            "current_slippage_bps": slippage_bps,
+                            "next_slippage_bps": next_slippage_bps,
+                            "amount_tokens_sold": tokens_to_sell,
+                            "amount_tokens_raw": amount_tokens_raw,
+                            "error": str(exc),
+                        },
+                    )
+
+                    continue
 
                 if (
                     not force_jupiter
@@ -1566,7 +1643,7 @@ class PumpFunExecutionAdapter(
                 ),
             )
 
-        slippage_bps = (
+        base_slippage_bps = (
             self._default_slippage_bps
         )
 
@@ -1577,6 +1654,11 @@ class PumpFunExecutionAdapter(
         for attempt in range(
             max_attempts
         ):
+            # Widen only after an explicit Pump.fun 6003 rejection.
+            slippage_bps = _sell_slippage_for_attempt(
+                base_slippage_bps,
+                attempt,
+            )
 
             try:
 
