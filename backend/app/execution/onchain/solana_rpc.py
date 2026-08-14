@@ -849,6 +849,31 @@ async def send_and_confirm(
                     )
                     continue
 
+                # Verify that getTransaction is actually returning the SAME
+                # signed transaction we are tracking. A confirmation response
+                # without this check is not sufficient for trade reconciliation.
+                returned_signatures = (
+                    (transaction.get("transaction") or {}).get("signatures")
+                    or []
+                )
+                if not returned_signatures or str(returned_signatures[0]) != signature:
+                    logger.warning(
+                        "transaction_confirmation_unverified",
+                        extra={
+                            "signature": signature,
+                            "confirmation_status": confirmation_status,
+                            "reason": "returned transaction signature mismatch",
+                            "returned_signature": (
+                                str(returned_signatures[0])
+                                if returned_signatures
+                                else None
+                            ),
+                            "solscan": solscan_link,
+                        },
+                    )
+                    await asyncio.sleep(STATUS_POLL_INTERVAL_SECONDS)
+                    continue
+
                 meta = transaction.get("meta")
 
                 if meta is None:
@@ -884,15 +909,31 @@ async def send_and_confirm(
                         f"{solscan_link}"
                     )
 
+                slot = transaction.get("slot")
+                fee_lamports = meta.get("fee")
+                compute_units = meta.get("computeUnitsConsumed")
+
                 logger.info(
-                    "transaction_confirmed",
+                    (
+                        "transaction_confirmed "
+                        f"signature={signature} "
+                        f"status={confirmation_status} "
+                        f"slot={slot} "
+                        f"fee_lamports={fee_lamports} "
+                        f"compute_units={compute_units} "
+                        f"send_count={send_count} "
+                        f"verified=true "
+                        f"solscan={solscan_link}"
+                    ),
                     extra={
                         "signature": signature,
-                        "confirmation_status": (
-                            confirmation_status
-                        ),
+                        "confirmation_status": confirmation_status,
                         "send_count": send_count,
                         "transaction_verified": True,
+                        "slot": slot,
+                        "fee_lamports": fee_lamports,
+                        "compute_units": compute_units,
+                        "solscan": solscan_link,
                     },
                 )
 
@@ -1075,7 +1116,14 @@ async def send_and_confirm(
                     )
 
                 logger.info(
-                    "transaction_submitted",
+                    (
+                        "transaction_submitted "
+                        f"signature={signature} "
+                        f"attempt={send_count} "
+                        f"block_height={current_height} "
+                        f"last_valid_block_height={last_valid_block_height} "
+                        f"solscan={solscan_link}"
+                    ),
                     extra={
                         "signature": signature,
                         "attempt": send_count,
@@ -1127,7 +1175,12 @@ async def send_and_confirm(
                     last_send_time = now
 
                     logger.info(
-                        "transaction_already_processed_waiting_confirmation",
+                        (
+                            "transaction_already_processed_waiting_confirmation "
+                            f"signature={signature} "
+                            f"grace_seconds={ALREADY_PROCESSED_CONFIRMATION_GRACE_SECONDS} "
+                            f"solscan={solscan_link}"
+                        ),
                         extra={
                             "signature": signature,
                             "attempt": send_count + 1,
