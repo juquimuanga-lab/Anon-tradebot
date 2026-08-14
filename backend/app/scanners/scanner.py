@@ -147,6 +147,17 @@ class ScannerService:
             dict,
         ] = {}
 
+        # Prevent repeated snapshot RPC calls/warnings for a mint while its
+        # newly-created Pump.fun accounts are still propagating.
+        self._snapshot_retry: dict[
+            str,
+            dict,
+        ] = {}
+
+        # Prevent duplicate discovery items from being processed more than
+        # once in the same scan cycle.
+        self._scan_seen_mints: set[str] = set()
+
         self._notified_fail: set[
             tuple[str, int]
         ] = set()
@@ -294,6 +305,12 @@ class ScannerService:
         for item in discovered:
 
             mint = item["mint"]
+
+            # The websocket/polling layer can return the same launch multiple
+            # times. De-duplicate before any state/logging work.
+            if mint in self._scan_seen_mints:
+                continue
+            self._scan_seen_mints.add(mint)
 
             if mint in self._pending_watch:
                 continue
@@ -472,6 +489,14 @@ class ScannerService:
     ) -> TokenSnapshot | None:
         """Build a TokenSnapshot from Pump.fun's bonding curve."""
 
+        # Newly launched Pump.fun accounts can take a short time to become
+        # readable from the configured RPC. Avoid hammering the same mint and
+        # emitting the same warning on every scan cycle.
+        now = datetime.now(timezone.utc)
+        retry_state = self._snapshot_retry.get(mint)
+        if retry_state and now < retry_state["next_retry"]:
+            return None
+
         try:
 
             info = (
@@ -481,6 +506,8 @@ class ScannerService:
                     commitment="processed",
                 )
             )
+
+            self._snapshot_retry.pop(mint, None)
 
         except (
             PumpFunPoolNotFound,
@@ -506,11 +533,33 @@ class ScannerService:
                 # account is readable through the RPC used by pumpfun.py.
                 # Keep the launch pending so the existing retry loop can
                 # process it once the account becomes available.
+                state = self._snapshot_retry.get(
+                    mint,
+                    {"attempts": 0},
+                )
+                attempts = int(state.get("attempts", 0)) + 1
+                delay = min(5.0, 0.25 * (2 ** min(attempts - 1, 4)))
+
+                self._snapshot_retry[mint] = {
+                    "attempts": attempts,
+                    "next_retry": (
+                        datetime.now(timezone.utc)
+                        + timedelta(seconds=delay)
+                    ),
+                }
+
                 logger.warning(
-                    "pumpfun_snapshot_account_not_ready",
+                    (
+                        "pumpfun_snapshot_account_not_ready "
+                        f"mint={mint} "
+                        f"retry_in={delay:.2f}s "
+                        f"attempt={attempts}"
+                    ),
                     extra={
                         "mint": mint,
                         "error": str(exc),
+                        "retry_in_seconds": delay,
+                        "attempt": attempts,
                     },
                 )
             else:
@@ -1332,6 +1381,7 @@ class ScannerService:
                     del self._pending_watch[
                         mint
                     ]
+                    self._snapshot_retry.pop(mint, None)
 
                 continue
 
@@ -1347,6 +1397,7 @@ class ScannerService:
                 del self._pending_watch[
                     mint
                 ]
+                self._snapshot_retry.pop(mint, None)
 
                 for rule in active_rules:
 
@@ -1432,6 +1483,7 @@ class ScannerService:
                 del self._pending_watch[
                     mint
                 ]
+                self._snapshot_retry.pop(mint, None)
 
                 for rule in active_rules:
 
@@ -1449,6 +1501,9 @@ class ScannerService:
     async def scan_once(
         self,
     ):
+
+        # This set is only for the current polling cycle.
+        self._scan_seen_mints.clear()
 
         active_rules = (
             await repo.get_all_active_rules()
