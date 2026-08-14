@@ -23,7 +23,6 @@ import struct
 from collections import deque
 from typing import Optional
 from urllib.parse import urlsplit, urlunsplit
-from app.config.settings import settings
 
 import httpx
 import websockets
@@ -279,39 +278,6 @@ async def _direct_rpc_request(
     )
 
 
-async def _direct_rpc_request_with_fallback(
-    rpc_url: str,
-    method: str,
-    params: list,
-) -> dict:
-    """Direct JSON-RPC request with optional Alchemy failover."""
-
-    try:
-        return await _direct_rpc_request(
-            rpc_url,
-            method,
-            params,
-        )
-    except Exception as primary_exc:
-        fallback = getattr(settings, "alchemy_solana_rpc_url", None)
-        if not fallback or fallback == rpc_url:
-            raise
-
-        logger.warning(
-            "onchain_rpc_fallback_to_alchemy",
-            extra={
-                "method": method,
-                "error": str(primary_exc),
-            },
-        )
-        return await _direct_rpc_request(
-            fallback,
-            method,
-            params,
-        )
-
-
-
 async def _get_signatures_direct(
     rpc_url: str,
     address: str,
@@ -334,7 +300,7 @@ async def _get_signatures_direct(
             "until"
         ] = until
 
-    body = await _direct_rpc_request_with_fallback(
+    body = await _direct_rpc_request(
         rpc_url,
         "getSignaturesForAddress",
         params,
@@ -372,7 +338,7 @@ async def _get_transaction_direct(
         },
     ]
 
-    body = await _direct_rpc_request_with_fallback(
+    body = await _direct_rpc_request(
         rpc_url,
         "getTransaction",
         params,
@@ -1596,10 +1562,6 @@ async def _pumpfun_stream_worker(
     ws_url = _rpc_http_to_ws_url(rpc_url)
     backoff = PUMPFUN_STREAM_RECONNECT_SECONDS
 
-    # Pump.fun discovery is program-wide. The caller's legacy
-    # mint_authority argument is retained only for compatibility.
-    pumpfun_target = PUMPFUN_PROGRAM_ID
-
     while not stop_event.is_set():
         try:
             async with websockets.connect(
@@ -1614,7 +1576,7 @@ async def _pumpfun_stream_worker(
                     "id": 1,
                     "method": "logsSubscribe",
                     "params": [
-                        {"mentions": [pumpfun_target]},
+                        {"mentions": [mint_authority]},
                         {"commitment": "processed"},
                     ],
                 }
@@ -1630,7 +1592,7 @@ async def _pumpfun_stream_worker(
                 logger.info(
                     "pumpfun_stream_connected",
                     extra={
-                        "mint_authority": pumpfun_target,
+                        "mint_authority": mint_authority,
                     },
                 )
 
@@ -1659,7 +1621,7 @@ async def _pumpfun_stream_worker(
 
                     launch["tx_signature"] = signature
                     launch["block_time"] = None
-                    launch["watched_wallet"] = pumpfun_target
+                    launch["watched_wallet"] = mint_authority
                     launch["discovery"] = "websocket_create_event"
 
                     try:
@@ -1684,7 +1646,7 @@ async def _pumpfun_stream_worker(
             logger.warning(
                 "pumpfun_stream_disconnected",
                 extra={
-                    "mint_authority": pumpfun_target,
+                    "mint_authority": mint_authority,
                     "error": f"{type(exc).__name__}: {exc}",
                     "retry_seconds": backoff,
                 },
@@ -1774,13 +1736,9 @@ async def poll_new_pumpfun_mints(
         events without making transaction calls during normal streaming.
     """
 
-    # Pump.fun discovery is program-wide. Keep mint_authority in the
-    # public signature for compatibility with existing scanner.py.
-    pumpfun_target = PUMPFUN_PROGRAM_ID
-
     state = _get_or_create_pumpfun_stream(
         rpc_url,
-        pumpfun_target,
+        mint_authority,
     )
 
     discovered = []
@@ -1848,11 +1806,11 @@ async def poll_new_pumpfun_mints(
 
     state["last_fallback"] = loop_time
 
-    watermark_key = f"pumpfun:{pumpfun_target}"
+    watermark_key = f"pumpfun:{mint_authority}"
     until = watermarks.get(watermark_key)
 
     try:
-        authority_pubkey = Pubkey.from_string(pumpfun_target)
+        authority_pubkey = Pubkey.from_string(mint_authority)
 
         async with AsyncClient(rpc_url) as client:
             resp = await client.get_signatures_for_address(
@@ -1892,7 +1850,7 @@ async def poll_new_pumpfun_mints(
                 logger.info(
                     "pumpfun_watermark_initialized",
                     extra={
-                        "mint_authority": pumpfun_target,
+                        "mint_authority": mint_authority,
                         "signature": (
                             normalized[0]["signature"]
                             if normalized
@@ -1955,7 +1913,7 @@ async def poll_new_pumpfun_mints(
 
                 launch["tx_signature"] = signature
                 launch["block_time"] = sig_info.get("block_time")
-                launch["watched_wallet"] = pumpfun_target
+                launch["watched_wallet"] = mint_authority
                 launch["discovery"] = "rpc_recovery"
 
                 discovered.append(launch)
@@ -1978,7 +1936,7 @@ async def poll_new_pumpfun_mints(
         logger.warning(
             "pumpfun_recovery_poll_failed",
             extra={
-                "mint_authority": pumpfun_target,
+                "mint_authority": mint_authority,
                 "error": f"{type(exc).__name__}: {exc}",
             },
         )
