@@ -703,6 +703,19 @@ async def _send_transaction(
 # Send + confirm
 # ---------------------------------------------------------------------------
 
+def _transaction_confirmation_summary(transaction: dict) -> dict:
+    """Return a compact, log-safe summary of a verified transaction."""
+    meta = transaction.get("meta") or {}
+    return {
+        "slot": transaction.get("slot"),
+        "block_time": transaction.get("blockTime"),
+        "fee_lamports": meta.get("fee"),
+        "compute_units_consumed": meta.get("computeUnitsConsumed"),
+        "meta_err": meta.get("err"),
+        "transaction_version": transaction.get("version"),
+    }
+
+
 async def send_and_confirm(
     rpc_url: str,
     signed_tx_bytes: bytes,
@@ -742,12 +755,15 @@ async def send_and_confirm(
         signed_tx_bytes
     )
 
+    delivery_started_at = time.monotonic()
+    first_submission_at = None
+
     solscan_link = (
         f"https://solscan.io/tx/{signature}"
     )
 
     logger.info(
-        "transaction_delivery_started",
+        f"transaction_delivery_started signature={signature}",
         extra={
             "signature": signature,
             "last_valid_block_height": (
@@ -877,15 +893,36 @@ async def send_and_confirm(
                         f"{solscan_link}"
                     )
 
+                summary = _transaction_confirmation_summary(
+                    transaction
+                )
+                elapsed_ms = int(
+                    (time.monotonic() - delivery_started_at) * 1000
+                )
+                first_submit_elapsed_ms = (
+                    int((first_submission_at - delivery_started_at) * 1000)
+                    if first_submission_at is not None
+                    else None
+                )
+
                 logger.info(
-                    "transaction_confirmed",
+                    f"transaction_confirmed signature={signature} "
+                    f"status={confirmation_status} "
+                    f"slot={summary.get('slot')} "
+                    f"fee_lamports={summary.get('fee_lamports')} "
+                    f"compute_units={summary.get('compute_units_consumed')} "
+                    f"send_count={send_count} "
+                    f"elapsed_ms={elapsed_ms} "
+                    f"verified=true solscan={solscan_link}",
                     extra={
                         "signature": signature,
-                        "confirmation_status": (
-                            confirmation_status
-                        ),
+                        "confirmation_status": confirmation_status,
                         "send_count": send_count,
                         "transaction_verified": True,
+                        "confirmation_summary": summary,
+                        "elapsed_ms": elapsed_ms,
+                        "first_submit_elapsed_ms": first_submit_elapsed_ms,
+                        "solscan_link": solscan_link,
                     },
                 )
 
@@ -983,16 +1020,32 @@ async def send_and_confirm(
                                     f"{solscan_link}"
                                 )
 
+                            summary = _transaction_confirmation_summary(
+                                final_transaction
+                            )
+                            elapsed_ms = int(
+                                (time.monotonic() - delivery_started_at) * 1000
+                            )
+
                             logger.info(
-                                "transaction_confirmed",
+                                f"transaction_confirmed signature={signature} "
+                                f"status={final_confirmation} "
+                                f"slot={summary.get('slot')} "
+                                f"fee_lamports={summary.get('fee_lamports')} "
+                                f"compute_units={summary.get('compute_units_consumed')} "
+                                f"send_count={send_count} "
+                                f"elapsed_ms={elapsed_ms} "
+                                f"verified=true expiry_boundary=true "
+                                f"solscan={solscan_link}",
                                 extra={
                                     "signature": signature,
-                                    "confirmation_status": (
-                                        final_confirmation
-                                    ),
+                                    "confirmation_status": final_confirmation,
                                     "send_count": send_count,
                                     "transaction_verified": True,
                                     "verified_at_expiry_boundary": True,
+                                    "confirmation_summary": summary,
+                                    "elapsed_ms": elapsed_ms,
+                                    "solscan_link": solscan_link,
                                 },
                             )
 
@@ -1056,17 +1109,27 @@ async def send_and_confirm(
                         },
                     )
 
+                if first_submission_at is None:
+                    first_submission_at = time.monotonic()
+
                 logger.info(
-                    "transaction_submitted",
+                    f"transaction_submitted signature={signature} "
+                    f"rpc_signature={returned_signature} "
+                    f"signature_match={returned_signature == signature} "
+                    f"attempt={send_count} "
+                    f"block_height={current_height} "
+                    f"last_valid_block_height={last_valid_block_height} "
+                    f"elapsed_ms={int((time.monotonic() - delivery_started_at) * 1000)} "
+                    f"solscan={solscan_link}",
                     extra={
                         "signature": signature,
+                        "rpc_returned_signature": returned_signature,
+                        "signature_match": returned_signature == signature,
                         "attempt": send_count,
-                        "current_block_height": (
-                            current_height
-                        ),
-                        "last_valid_block_height": (
-                            last_valid_block_height
-                        ),
+                        "current_block_height": current_height,
+                        "last_valid_block_height": last_valid_block_height,
+                        "elapsed_ms": int((time.monotonic() - delivery_started_at) * 1000),
+                        "solscan_link": solscan_link,
                     },
                 )
 
@@ -1075,7 +1138,7 @@ async def send_and_confirm(
                 error_text = str(exc)
 
                 logger.warning(
-                    "transaction_submission_error",
+                    f"transaction_submission_error signature={signature}",
                     extra={
                         "signature": signature,
                         "attempt": send_count + 1,
@@ -1103,7 +1166,8 @@ async def send_and_confirm(
                     last_send_time = now
 
                     logger.info(
-                        "transaction_already_processed_waiting_confirmation",
+                        f"transaction_already_processed_waiting_confirmation signature={signature} "
+                        f"attempt={send_count}",
                         extra={
                             "signature": signature,
                             "attempt": send_count,
