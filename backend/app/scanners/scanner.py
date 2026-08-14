@@ -26,10 +26,6 @@ import logging
 from datetime import datetime, timedelta, timezone
 
 from app.config.settings import settings
-from app.connectors.solana_tracker import (
-    SolanaTrackerClient,
-    SmartMoneySignal,
-)
 
 from app.connectors.anoncoin import (
     AnoncoinAPIError,
@@ -101,18 +97,6 @@ SOURCE_PUMPFUN = "pumpfun"
 SOURCE_MOCK = "mock_simulated"
 
 
-def _is_anoncoin_source(source: str) -> bool:
-    """True for any Anoncoin-origin source tag.
-
-    Covers both the on-chain watcher tag (anoncoin_onchain) and the
-    legacy Anoncoin-API discovery tag (anoncoin), so the
-    anoncoin_trading_enabled toggle applies no matter which path
-    produced the token.
-    """
-
-    return bool(source) and source.startswith("anoncoin")
-
-
 # ---------------------------------------------------------------------------
 # Scanner service
 # ---------------------------------------------------------------------------
@@ -133,11 +117,6 @@ class ScannerService:
         self._holders_client = holders_client
         self._execution_router = execution_router
 
-        # Phase 1 smart-money telemetry. This is intentionally read-only
-        # and is queried only after the existing qualification threshold
-        # is passed. It never gates the existing trade decision.
-        self._smart_money = SolanaTrackerClient()
-
         self._watermarks = (
             onchain_watcher.WatermarkStore()
         )
@@ -146,17 +125,6 @@ class ScannerService:
             str,
             dict,
         ] = {}
-
-        # Prevent repeated snapshot RPC calls/warnings for a mint while its
-        # newly-created Pump.fun accounts are still propagating.
-        self._snapshot_retry: dict[
-            str,
-            dict,
-        ] = {}
-
-        # Prevent duplicate discovery items from being processed more than
-        # once in the same scan cycle.
-        self._scan_seen_mints: set[str] = set()
 
         self._notified_fail: set[
             tuple[str, int]
@@ -306,12 +274,6 @@ class ScannerService:
 
             mint = item["mint"]
 
-            # The websocket/polling layer can return the same launch multiple
-            # times. De-duplicate before any state/logging work.
-            if mint in self._scan_seen_mints:
-                continue
-            self._scan_seen_mints.add(mint)
-
             if mint in self._pending_watch:
                 continue
 
@@ -455,28 +417,6 @@ class ScannerService:
             source=SOURCE_ANONCOIN,
         )
 
-    @staticmethod
-    def _is_missing_account_error(exc: Exception) -> bool:
-        """Return True for transient Solana RPC errors caused by an account
-        not being available yet.
-
-        Pump.fun launches can be detected before the mint/token account is
-        fully visible through the RPC used by the pool reader. In that case
-        pumpfun.get_pool_info() can surface the raw RPC error:
-        "Invalid param: could not find account".
-
-        This is a normal transient condition for a newly detected launch, so
-        the mint should remain in _pending_watch and be retried on the next
-        scan instead of producing a full traceback.
-        """
-        message = str(exc).lower()
-        return (
-            "could not find account" in message
-            or "account not found" in message
-            or "invalid param" in message
-            and "account" in message
-        )
-
     # ------------------------------------------------------------------
     # Pump.fun snapshot
     # ------------------------------------------------------------------
@@ -489,14 +429,6 @@ class ScannerService:
     ) -> TokenSnapshot | None:
         """Build a TokenSnapshot from Pump.fun's bonding curve."""
 
-        # Newly launched Pump.fun accounts can take a short time to become
-        # readable from the configured RPC. Avoid hammering the same mint and
-        # emitting the same warning on every scan cycle.
-        now = datetime.now(timezone.utc)
-        retry_state = self._snapshot_retry.get(mint)
-        if retry_state and now < retry_state["next_retry"]:
-            return None
-
         try:
 
             info = (
@@ -506,8 +438,6 @@ class ScannerService:
                     commitment="processed",
                 )
             )
-
-            self._snapshot_retry.pop(mint, None)
 
         except (
             PumpFunPoolNotFound,
@@ -527,49 +457,13 @@ class ScannerService:
 
         except Exception as exc:
 
-            if self._is_missing_account_error(exc):
-                # Newly launched Pump.fun mints can become visible to the
-                # mint-authority watcher slightly before the mint/token
-                # account is readable through the RPC used by pumpfun.py.
-                # Keep the launch pending so the existing retry loop can
-                # process it once the account becomes available.
-                state = self._snapshot_retry.get(
-                    mint,
-                    {"attempts": 0},
-                )
-                attempts = int(state.get("attempts", 0)) + 1
-                delay = min(5.0, 0.25 * (2 ** min(attempts - 1, 4)))
-
-                self._snapshot_retry[mint] = {
-                    "attempts": attempts,
-                    "next_retry": (
-                        datetime.now(timezone.utc)
-                        + timedelta(seconds=delay)
-                    ),
-                }
-
-                logger.warning(
-                    (
-                        "pumpfun_snapshot_account_not_ready "
-                        f"mint={mint} "
-                        f"retry_in={delay:.2f}s "
-                        f"attempt={attempts}"
-                    ),
-                    extra={
-                        "mint": mint,
-                        "error": str(exc),
-                        "retry_in_seconds": delay,
-                        "attempt": attempts,
-                    },
-                )
-            else:
-                logger.exception(
-                    "pumpfun_snapshot_unexpected_error",
-                    extra={
-                        "mint": mint,
-                        "error": str(exc),
-                    },
-                )
+            logger.exception(
+                "pumpfun_snapshot_unexpected_error",
+                extra={
+                    "mint": mint,
+                    "error": str(exc),
+                },
+            )
 
             return None
 
@@ -757,85 +651,6 @@ class ScannerService:
             holder_count,
         )
 
-
-    # ------------------------------------------------------------------
-    # Phase 1 smart-money telemetry
-    # ------------------------------------------------------------------
-
-    async def _get_smart_money_signal(
-        self,
-        token,
-        first_seen: datetime | None = None,
-    ) -> SmartMoneySignal:
-        """Inspect tracked-wallet activity for an already-qualified token.
-
-        This is deliberately called AFTER hard filters and the qualification
-        score pass. A failure here returns an empty signal and never changes
-        the existing trading path.
-        """
-        if token.source != SOURCE_PUMPFUN:
-            return SmartMoneySignal(detected=False)
-
-        if not settings.smart_money_enabled:
-            return SmartMoneySignal(detected=False)
-
-        if not self._smart_money.enabled:
-            logger.info(
-                "smart_money_disabled_or_unconfigured",
-                extra={"mint": token.mint},
-            )
-            return SmartMoneySignal(detected=False)
-
-        observed_at = (
-            first_seen
-            or getattr(token, "created_on", None)
-            or datetime.now(timezone.utc)
-        )
-
-        try:
-            signal = await self._smart_money.find_smart_money(
-                token.mint,
-                first_seen_timestamp=observed_at.timestamp(),
-            )
-        except Exception as exc:
-            logger.exception(
-                "smart_money_check_failed",
-                extra={
-                    "mint": token.mint,
-                    "error": str(exc),
-                },
-            )
-            return SmartMoneySignal(detected=False)
-
-        if signal.detected:
-            logger.info(
-                "smart_money_signal_detected",
-                extra={
-                    "mint": token.mint,
-                    "score": signal.score,
-                    "wallet_count": signal.wallet_count,
-                    "wallets": [
-                        trade.wallet
-                        for trade in signal.trades[:5]
-                    ],
-                    "buys_usd": [
-                        trade.amount_usd
-                        for trade in signal.trades[:5]
-                    ],
-                    "latencies_seconds": [
-                        trade.seconds_after_seen
-                        for trade in signal.trades[:5]
-                    ],
-                },
-            )
-        else:
-            logger.info(
-                "smart_money_no_signal",
-                extra={"mint": token.mint},
-            )
-
-        return signal
-
     # ------------------------------------------------------------------
     # Trade
     # ------------------------------------------------------------------
@@ -853,44 +668,6 @@ class ScannerService:
 
         if not state.trading_enabled:
             return False
-
-        if (
-            _is_anoncoin_source(token.source)
-            and not state.anoncoin_trading_enabled
-        ):
-
-            await repo.save_trade_decision(
-                token.mint,
-                rule_row.id,
-                "skip",
-                (
-                    "Anoncoin trading is currently "
-                    "disabled (/enableanoncoin to "
-                    "resume) - skipped"
-                ),
-                score_result.score,
-            )
-
-            return True
-
-        if (
-            token.source == SOURCE_PUMPFUN
-            and not state.pumpfun_trading_enabled
-        ):
-
-            await repo.save_trade_decision(
-                token.mint,
-                rule_row.id,
-                "skip",
-                (
-                    "Pump.fun trading is currently "
-                    "disabled (/enablepumpfun to "
-                    "resume) - skipped"
-                ),
-                score_result.score,
-            )
-
-            return True
 
         if (
             state.mode == "live"
@@ -1073,12 +850,71 @@ class ScannerService:
                 or token.price_usd
             )
 
+            # --------------------------------------------------------------
+            # IMPORTANT: position.amount_tokens must be in TOKEN units.
+            #
+            # amount_sol is denominated in SOL, while fill_price is USD per
+            # token. Dividing SOL directly by a USD/token price creates a
+            # large unit mismatch (typically around 100x at current SOL
+            # prices), which causes TP/SL to sell only a tiny fraction of the
+            # real wallet position.
+            #
+            # Convert the SOL spend to USD first, then divide by the token
+            # USD price:
+            #
+            #     tokens = SOL spent * SOL/USD / USD per token
+            #
+            # The sell manager already applies the configured TP/SL
+            # percentage to this stored token quantity, so we must store the
+            # full purchased token quantity here and never apply a sell
+            # percentage during position creation.
+            # --------------------------------------------------------------
+            try:
+                sol_price_usd = (
+                    await price_feed.get_sol_usd_price(
+                        settings.jupiter_price_url
+                    )
+                )
+            except Exception as exc:
+                logger.error(
+                    "buy_position_sol_price_failed",
+                    extra={
+                        "mint": token.mint,
+                        "amount_sol": amount_sol,
+                        "fill_price": fill_price,
+                        "error": str(exc),
+                    },
+                )
+                return False
+
+            if sol_price_usd <= 0 or fill_price <= 0:
+                logger.error(
+                    "buy_position_invalid_price_data",
+                    extra={
+                        "mint": token.mint,
+                        "amount_sol": amount_sol,
+                        "sol_price_usd": sol_price_usd,
+                        "fill_price": fill_price,
+                    },
+                )
+                return False
+
             amount_tokens = (
                 amount_sol
-                / max(
-                    fill_price,
-                    1e-12,
-                )
+                * sol_price_usd
+                / fill_price
+            )
+
+            logger.info(
+                "buy_position_amount_calculated",
+                extra={
+                    "mint": token.mint,
+                    "amount_sol": amount_sol,
+                    "sol_price_usd": sol_price_usd,
+                    "fill_price_usd": fill_price,
+                    "amount_tokens": amount_tokens,
+                    "source": token.source,
+                },
             )
 
             await repo.create_position(
@@ -1273,22 +1109,6 @@ class ScannerService:
             },
         )
 
-        # --------------------------------------------------------------
-        # Phase 1 Smart Money
-        #
-        # IMPORTANT:
-        # - Existing qualification has already passed.
-        # - Smart money is telemetry only in Phase 1.
-        # - It does NOT gate or alter the BUY decision.
-        # - It is only queried for Pump.fun.
-        # --------------------------------------------------------------
-        smart_money_signal = (
-            await self._get_smart_money_signal(
-                token,
-                first_seen=token.created_on,
-            )
-        )
-
         await self._notifier.new_qualified_token(
             rule.created_by,
             (
@@ -1298,28 +1118,6 @@ class ScannerService:
             token.mint,
             score_result.score,
             token.source,
-        )
-
-        # Keep the existing Telegram notifier call untouched until its
-        # implementation is provided. Smart-money data is available in
-        # structured logs for Phase 1 and can be rendered by notifier.py /
-        # telegram_app.py without risking the working trade path.
-        logger.info(
-            "qualified_token_smart_money_summary",
-            extra={
-                "mint": token.mint,
-                "rule_id": rule.id,
-                "rule_score": score_result.score,
-                "smart_money_detected": (
-                    smart_money_signal.detected
-                ),
-                "smart_money_score": (
-                    smart_money_signal.score
-                ),
-                "smart_money_wallet_count": (
-                    smart_money_signal.wallet_count
-                ),
-            },
         )
 
         return await self._maybe_trade(
@@ -1381,7 +1179,6 @@ class ScannerService:
                     del self._pending_watch[
                         mint
                     ]
-                    self._snapshot_retry.pop(mint, None)
 
                 continue
 
@@ -1397,7 +1194,6 @@ class ScannerService:
                 del self._pending_watch[
                     mint
                 ]
-                self._snapshot_retry.pop(mint, None)
 
                 for rule in active_rules:
 
@@ -1452,13 +1248,8 @@ class ScannerService:
                     await self._screen_and_maybe_trade(
                         token,
                         rule,
-                        # Pump.fun is intentionally silent for rejected
-                        # tokens. Only qualified Pump.fun launches should
-                        # reach Telegram. Keep the existing Anoncoin
-                        # rejection notifications unchanged.
                         notify_on_fail=(
-                            source != SOURCE_PUMPFUN
-                            and key
+                            key
                             not in self._notified_fail
                         ),
                     )
@@ -1483,7 +1274,6 @@ class ScannerService:
                 del self._pending_watch[
                     mint
                 ]
-                self._snapshot_retry.pop(mint, None)
 
                 for rule in active_rules:
 
@@ -1501,9 +1291,6 @@ class ScannerService:
     async def scan_once(
         self,
     ):
-
-        # This set is only for the current polling cycle.
-        self._scan_seen_mints.clear()
 
         active_rules = (
             await repo.get_all_active_rules()
