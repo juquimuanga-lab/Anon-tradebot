@@ -224,11 +224,11 @@ async def recoverent_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     context.user_data.pop("rent_recovery_scan", None)
     await update.message.reply_text(
         "🧹 *SOL Rent Recovery*\n\n"
-        "Send the confirmed Solana transaction signatures you want me to scan.\n\n"
-        "• Separate multiple signatures with commas or new lines.\n"
-        "• Maximum 20 signatures per scan.\n"
-        "• Only token accounts belonging to the connected sniper wallet and "
-        "holding exactly 0 tokens can be recovered.\n\n"
+        "Send the *BUY transaction signature(s) or SELL transaction signature(s)* from the sniper trades you want to recover rent from.\n\n"
+        "• You can send multiple confirmed signatures separated by commas.\n"
+        "• It must be the actual BUY or SELL transaction — not the token address, wallet address, or a recovery transaction.\n"
+        "• Every signature must be an actual BUY or SELL transaction for the connected sniper wallet.\n"
+        "• The bot will use those trade transactions to find token accounts belonging to the connected sniper wallet that are now empty.\n\n"
         "Send /cancel to abort.",
         parse_mode="Markdown",
     )
