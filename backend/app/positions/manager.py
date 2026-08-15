@@ -685,6 +685,7 @@ class PositionManager:
         current_price: float,
         sell_pct: float,
         reason: str,
+        reconcile_wallet: bool = True,
     ) -> bool:
         """Execute a partial/full sell.
 
@@ -717,7 +718,7 @@ class PositionManager:
             # happened between monitoring cycles.
             # ----------------------------------------------------------
 
-            if position.mode == "live":
+            if position.mode == "live" and reconcile_wallet:
 
                 reconciled = (
                     await self._reconcile_live_position(
@@ -803,6 +804,14 @@ class PositionManager:
                     ),
                     "reason": reason,
                     "mode": position.mode,
+                    "entry_price_usd": position.entry_price_usd,
+                    "trigger_price_usd": current_price,
+                    "trigger_pnl_pct": self._pnl_pct(
+                        position.entry_price_usd,
+                        current_price,
+                    ),
+                    "amount_tokens": amount_to_sell,
+                    "wallet_reconciliation_skipped": not reconcile_wallet,
                 },
             )
 
@@ -1475,6 +1484,7 @@ class PositionManager:
                     current_price,
                     position.remaining_pct,
                     "time-based exit",
+                    reconcile_wallet=False,
                 )
 
                 return
@@ -1545,12 +1555,26 @@ class PositionManager:
                 },
             )
 
+            logger.info(
+                "stop_loss_fast_exit",
+                extra={
+                    "mint": token.mint,
+                    "position_id": position.id,
+                    "entry_price_usd": position.entry_price_usd,
+                    "trigger_price_usd": current_price,
+                    "trigger_pnl_pct": pnl_pct,
+                    "stop_loss_pct": rule.stop_loss_pct,
+                    "wallet_reconciliation": "already_checked",
+                },
+            )
+
             await self._close_position(
                 position,
                 token,
                 current_price,
                 position.remaining_pct,
                 "stop loss hit",
+                reconcile_wallet=False,
             )
 
             return
@@ -1603,6 +1627,7 @@ class PositionManager:
                     current_price,
                     position.remaining_pct,
                     "trailing stop hit",
+                    reconcile_wallet=False,
                 )
 
                 return
@@ -1653,6 +1678,7 @@ class PositionManager:
                     current_price,
                     position.remaining_pct,
                     "volume drop exit",
+                    reconcile_wallet=False,
                 )
 
                 return
