@@ -1,6 +1,6 @@
 """Admin-only Solana token-account rent recovery.
 
-This module scans user-supplied confirmed transaction signatures for token
+This module accepts one confirmed BUY or SELL transaction signature and scans that trade for token
 accounts that are still open, owned by the sniper wallet, and have an exact
 zero token balance. Eligible accounts are closed with the standard SPL Token
 CloseAccount instruction so their account lamports are returned to the wallet.
@@ -92,10 +92,12 @@ def _normalize_signatures(text: str) -> list[str]:
         if value not in values:
             values.append(value)
     if not values:
-        raise RentRecoveryError("No transaction signatures were supplied.")
+        raise RentRecoveryError(
+            "Send at least one BUY or SELL transaction signature."
+        )
     if len(values) > MAX_INPUT_SIGNATURES:
         raise RentRecoveryError(
-            f"Please provide no more than {MAX_INPUT_SIGNATURES} transaction signatures at a time."
+            f"Send no more than {MAX_INPUT_SIGNATURES} BUY/SELL transaction signatures at a time."
         )
     return values
 
@@ -286,30 +288,66 @@ def _token_balance_candidates(
     transaction: dict,
     wallet: str,
 ) -> list[tuple[str, Optional[str]]]:
+    """Find token accounts touched by the supplied trade.
+
+    A BUY is an important special case: immediately after the BUY, the token
+    account normally has a NON-zero balance.  The old implementation only
+    considered zero balances in the historical transaction, so BUY signatures
+    could never discover the account that later became empty after a SELL.
+
+    We therefore collect wallet-owned token accounts from both token-balance
+    records (regardless of historical amount) and explicit ATA create/createIdempotent
+    instructions in the transaction.  We then verify the account's *current*
+    on-chain balance before allowing closure.
+    """
     message = (transaction.get("transaction") or {}).get("message") or {}
     account_keys = list(message.get("accountKeys") or [])
-    loaded = (transaction.get("meta") or {}).get("loadedAddresses") or {}
+    meta = transaction.get("meta") or {}
+    loaded = meta.get("loadedAddresses") or {}
     account_keys.extend(loaded.get("writable") or [])
     account_keys.extend(loaded.get("readonly") or [])
+
     candidates: dict[str, Optional[str]] = {}
 
+    def key_at(index: Any) -> Optional[str]:
+        try:
+            key = account_keys[int(index)]
+        except (TypeError, ValueError, IndexError):
+            return None
+        return str(key.get("pubkey")) if isinstance(key, dict) else str(key)
+
+    # 1. Token balances: include BOTH pre and post accounts, regardless of
+    # historical amount. The current account state is checked later.
     for bucket_name in ("preTokenBalances", "postTokenBalances"):
-        for item in (transaction.get("meta") or {}).get(bucket_name) or []:
+        for item in meta.get(bucket_name) or []:
             if str(item.get("owner") or "") != wallet:
                 continue
-            token_amount = item.get("uiTokenAmount") or {}
-            if str(token_amount.get("amount") or "0") != "0":
-                continue
-            account_index = item.get("accountIndex")
-            try:
-                key = account_keys[int(account_index)]
-            except (TypeError, ValueError, IndexError):
-                continue
-            address = key.get("pubkey") if isinstance(key, dict) else key
+            address = key_at(item.get("accountIndex"))
             if address:
-                candidates[str(address)] = (
+                candidates[address] = (
                     str(item.get("mint")) if item.get("mint") else None
                 )
+
+    # 2. Explicit Associated Token Account creation. This is the key path for
+    # a BUY that created the ATA during the supplied transaction.
+    instructions: list[dict] = []
+    instructions.extend(message.get("instructions") or [])
+    for group in meta.get("innerInstructions") or []:
+        instructions.extend(group.get("instructions") or [])
+
+    for instruction in instructions:
+        if instruction.get("program") != "spl-associated-token-account":
+            continue
+        parsed = instruction.get("parsed") or {}
+        if parsed.get("type") not in ("create", "createIdempotent"):
+            continue
+        info = parsed.get("info") or {}
+        account = info.get("account")
+        owner = info.get("wallet") or info.get("owner") or info.get("source")
+        mint = info.get("mint")
+        if not account or str(owner or "") != wallet:
+            continue
+        candidates[str(account)] = str(mint) if mint else candidates.get(str(account))
 
     return list(candidates.items())
 
@@ -341,6 +379,61 @@ def _parsed_token_info(
     )
 
 
+def _is_buy_or_sell_transaction(transaction: dict, wallet: str) -> bool:
+    """Return True when the supplied transaction looks like a wallet buy/sell.
+
+    We require both a wallet-owned SPL token balance change and a native SOL
+    balance change. This accepts either direction (buy or sell) while rejecting
+    unrelated signatures such as token-only transfers or recovery transactions.
+    """
+    meta = transaction.get("meta") or {}
+    pre_tokens = meta.get("preTokenBalances") or []
+    post_tokens = meta.get("postTokenBalances") or []
+
+    token_changed = False
+    by_key = {}
+    for item in pre_tokens + post_tokens:
+        if str(item.get("owner") or "") != wallet:
+            continue
+        key = (item.get("accountIndex"), item.get("mint"))
+        amount = str((item.get("uiTokenAmount") or {}).get("amount") or "0")
+        by_key.setdefault(key, {})["prepost"] = by_key.get(key, {}).get("prepost", []) + [amount]
+
+    # Compare aggregate wallet-owned token amounts by mint.
+    pre_by_mint = {}
+    post_by_mint = {}
+    for item in pre_tokens:
+        if str(item.get("owner") or "") == wallet:
+            mint = str(item.get("mint") or "")
+            pre_by_mint[mint] = pre_by_mint.get(mint, 0) + int((item.get("uiTokenAmount") or {}).get("amount") or 0)
+    for item in post_tokens:
+        if str(item.get("owner") or "") == wallet:
+            mint = str(item.get("mint") or "")
+            post_by_mint[mint] = post_by_mint.get(mint, 0) + int((item.get("uiTokenAmount") or {}).get("amount") or 0)
+    for mint in set(pre_by_mint) | set(post_by_mint):
+        if pre_by_mint.get(mint, 0) != post_by_mint.get(mint, 0):
+            token_changed = True
+            break
+
+    # Find the wallet account index and compare SOL/lamport balance.
+    message = (transaction.get("transaction") or {}).get("message") or {}
+    keys = list(message.get("accountKeys") or [])
+    wallet_index = None
+    for i, key in enumerate(keys):
+        address = key.get("pubkey") if isinstance(key, dict) else key
+        if str(address) == wallet:
+            wallet_index = i
+            break
+    sol_changed = False
+    if wallet_index is not None:
+        pre = meta.get("preBalances") or []
+        post = meta.get("postBalances") or []
+        if wallet_index < len(pre) and wallet_index < len(post):
+            sol_changed = int(pre[wallet_index]) != int(post[wallet_index])
+
+    return token_changed and sol_changed
+
+
 async def scan_rent_recovery(
     rpc_url: str,
     wallet_pubkey: str,
@@ -359,6 +452,11 @@ async def scan_rent_recovery(
         if (transaction.get("meta") or {}).get("err") is not None:
             skipped.append(f"{signature}: transaction failed on-chain")
             continue
+        if not _is_buy_or_sell_transaction(transaction, wallet):
+            raise RentRecoveryError(
+                "The supplied signature is not recognized as a BUY or SELL transaction for the connected sniper wallet. "
+                "Send the actual buy signature or sell signature from the trade."
+            )
         for address, mint in _token_balance_candidates(transaction, wallet):
             if len(candidate_map) >= MAX_CANDIDATE_ACCOUNTS:
                 skipped.append("candidate limit reached")
