@@ -65,6 +65,9 @@ RPC_REQUEST_TIMEOUT_SECONDS = 8.0
 # We control rebroadcasting ourselves.
 RPC_MAX_RETRIES = 0
 
+# Small backoff before switching providers after throttling/temporary failures.
+RPC_PROVIDER_RETRY_DELAYS = (0.10, 0.25)
+
 # Keep preflight enabled while we establish reliable execution.
 SKIP_PREFLIGHT = False
 
@@ -191,6 +194,8 @@ async def _rpc_request(
             retryable = "retryable rpc" in lower
 
             if index < len(urls) - 1 and retryable:
+                if index < len(RPC_PROVIDER_RETRY_DELAYS):
+                    await asyncio.sleep(RPC_PROVIDER_RETRY_DELAYS[index])
                 logger.warning(
                     "solana_rpc_primary_retrying_with_alchemy",
                     extra={
@@ -224,6 +229,8 @@ async def _rpc_request(
             )
 
             if index < len(urls) - 1 and retryable:
+                if index < len(RPC_PROVIDER_RETRY_DELAYS):
+                    await asyncio.sleep(RPC_PROVIDER_RETRY_DELAYS[index])
                 logger.warning(
                     "solana_rpc_primary_retrying_with_alchemy",
                     extra={
