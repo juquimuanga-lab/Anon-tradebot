@@ -1384,10 +1384,22 @@ class ScannerService:
             token.source,
         )
 
-        # Keep the existing Telegram notifier call untouched until its
-        # implementation is provided. Smart-money data is available in
-        # structured logs for Phase 1 and can be rendered by notifier.py /
-        # telegram_app.py without risking the working trade path.
+        # Smart money remains telemetry-only: it does not gate or alter BUY.
+        if smart_money_signal.detected:
+            try:
+                await self._notifier.smart_money_signal(
+                    rule.created_by,
+                    token.ticker_symbol or token.mint[:8],
+                    token.mint,
+                    smart_money_signal.score,
+                    smart_money_signal.wallet_count,
+                    smart_money_signal.trades,
+                )
+            except Exception:
+                logger.exception(
+                    "smart_money_notification_failed",
+                    extra={"mint": token.mint},
+                )
         logger.info(
             "qualified_token_smart_money_summary",
             extra={
