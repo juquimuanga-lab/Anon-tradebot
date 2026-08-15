@@ -44,6 +44,33 @@ class Notifier:
             f"{tag}*New qualified token* `{ticker}`\nMint: `{mint[:6]}...{mint[-4:]}`\nScore: {score:.1f}/100",
         )
 
+    async def smart_money_signal(
+        self,
+        recipient_id: int,
+        ticker: str,
+        mint: str,
+        score: float,
+        wallet_count: int,
+        trades: list,
+    ) -> None:
+        """Send a structured smart-money alert to the rule owner."""
+        lines = [
+            f"*Smart Money detected* `{ticker}`",
+            f"Mint: `{mint[:6]}...{mint[-4:]}`",
+            f"Score: {score:.1f}",
+            f"Wallets: {wallet_count}",
+        ]
+        for trade in (trades or [])[:5]:
+            wallet = getattr(trade, "wallet", "") or ""
+            amount = float(getattr(trade, "amount_usd", 0.0) or 0.0)
+            latency = float(getattr(trade, "seconds_after_seen", 0.0) or 0.0)
+            tx = getattr(trade, "tx", None) or getattr(trade, "signature", None)
+            row = f"- `{wallet[:6]}...{wallet[-4:]}` ${amount:,.0f} ({latency:.1f}s)"
+            if tx:
+                row += f" [tx](https://solscan.io/tx/{tx})"
+            lines.append(row)
+        await self._send_to(recipient_id, "\n".join(lines))
+
     async def rule_violation(self, recipient_id: int, ticker: str, reasons: list[str]) -> None:
         await self._send_to(recipient_id, f"*Skipped* `{ticker}`\n- " + "\n- ".join(reasons[:5]))
 
