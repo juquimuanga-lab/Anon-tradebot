@@ -909,6 +909,16 @@ class PositionManager:
 
             # For a confirmed live sell, use actual SOL proceeds for
             # settlement/PnL whenever transaction reconciliation succeeded.
+            #
+            # IMPORTANT:
+            # Stop-loss PnL is intentionally calculated from the entry/exit
+            # price instead of trusting raw SOL proceeds. The proceeds
+            # reconciliation can be polluted by an unrelated inbound SOL
+            # transfer in the same transaction/wallet, which can make a real
+            # stop-loss appear as a positive PnL in Telegram.
+            #
+            # Take-profit and other exits retain the existing settlement
+            # behavior.
             if actual_execution:
                 actual_proceeds_usd = (
                     actual_execution["sol_received"]
@@ -920,13 +930,52 @@ class PositionManager:
                 )
 
                 if actual_proceeds_usd > 0:
-                    pnl_amount = (
-                        actual_proceeds_usd
-                        - invested_portion
-                    )
-                    proceeds = (
-                        actual_proceeds_usd
-                    )
+                    if reason == "stop loss hit":
+                        # A stop-loss must reflect the price relationship:
+                        # below entry = loss. Do not allow wallet-level
+                        # proceeds anomalies to flip the sign.
+                        pnl_amount = (
+                            invested_portion
+                            * (
+                                exit_price
+                                - position.entry_price_usd
+                            )
+                            / max(
+                                position.entry_price_usd,
+                                1e-12,
+                            )
+                        )
+
+                        # Defensive guard: if this exit was explicitly
+                        # classified as a stop loss, its notification must
+                        # never claim a positive PnL.
+                        pnl_amount = min(
+                            0.0,
+                            pnl_amount,
+                        )
+
+                        logger.info(
+                            "stop_loss_pnl_price_based",
+                            extra={
+                                "mint": token.mint,
+                                "position_id": position.id,
+                                "entry_price_usd": (
+                                    position.entry_price_usd
+                                ),
+                                "exit_price_usd": exit_price,
+                                "pnl_amount_usd": pnl_amount,
+                                "actual_proceeds_usd": (
+                                    actual_proceeds_usd
+                                ),
+                            },
+                        )
+                    else:
+                        pnl_amount = (
+                            actual_proceeds_usd
+                            - invested_portion
+                        )
+
+                    proceeds = actual_proceeds_usd
                 else:
                     proceeds = (
                         invested_portion
