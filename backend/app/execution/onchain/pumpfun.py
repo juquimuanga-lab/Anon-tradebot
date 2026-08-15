@@ -57,6 +57,10 @@ BONDING_CURVE_SEED = b"bonding-curve"
 
 SOL_LAMPORTS_PER_SOL = 1_000_000_000
 
+# Avoid duplicate bonding-curve reads during rapid qualification passes.
+PUMPFUN_POOL_CACHE_SECONDS = 0.75
+_pumpfun_pool_cache: dict[str, tuple[float, dict]] = {}
+
 
 # ---------------------------------------------------------------------------
 # Builder configuration
@@ -526,6 +530,11 @@ async def get_pool_info(
 ) -> dict:
     """Return normalized Pump.fun bonding-curve market information."""
 
+    now = asyncio.get_running_loop().time()
+    cached = _pumpfun_pool_cache.get(mint)
+    if cached and (now - cached[0]) < PUMPFUN_POOL_CACHE_SECONDS:
+        return dict(cached[1])
+
     mint_pubkey = Pubkey.from_string(
         mint
     )
@@ -713,7 +722,7 @@ async def get_pool_info(
         * sol_usd
     )
 
-    return {
+    result = {
         "success": True,
 
         "source": "pumpfun",
@@ -795,6 +804,9 @@ async def get_pool_info(
             curve.is_cashback_coin
         ),
     }
+
+    _pumpfun_pool_cache[mint] = (now, result)
+    return dict(result)
 
 
 # ---------------------------------------------------------------------------
