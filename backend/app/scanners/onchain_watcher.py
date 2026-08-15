@@ -1800,9 +1800,36 @@ async def _pumpfun_stream_worker(
                         launch["discovery"] = "websocket_create_event"
                         launch["rpc_transport"] = "primary"
 
+                        # Stream telemetry: make it obvious that Pump.fun CreateEvents
+                        # are actually arriving, and never silently hide queue pressure.
+                        state["events_seen"] = int(state.get("events_seen", 0)) + 1
+                        state["last_event_signature"] = signature
+                        state["last_event_mint"] = launch.get("mint")
+                        logger.info(
+                            "pumpfun_create_event_received",
+                            extra={
+                                "mint": launch.get("mint"),
+                                "creator": launch.get("creator"),
+                                "tx_signature": signature,
+                                "event_count": state["events_seen"],
+                                "rpc_transport": "primary",
+                            },
+                        )
+
                         try:
                             queue.put_nowait(launch)
                         except asyncio.QueueFull:
+                            state["queue_drops"] = int(state.get("queue_drops", 0)) + 1
+                            logger.error(
+                                "pumpfun_event_queue_full",
+                                extra={
+                                    "mint": launch.get("mint"),
+                                    "tx_signature": signature,
+                                    "queue_maxsize": PUMPFUN_EVENT_QUEUE_MAXSIZE,
+                                    "queue_drops": state["queue_drops"],
+                                },
+                            )
+                            # Keep the newest launch, since the watcher is latency-sensitive.
                             try:
                                 queue.get_nowait()
                             except asyncio.QueueEmpty:
@@ -1810,7 +1837,11 @@ async def _pumpfun_stream_worker(
                             try:
                                 queue.put_nowait(launch)
                             except asyncio.QueueFull:
-                                pass
+                                state["queue_drops"] = int(state.get("queue_drops", 0)) + 1
+                                logger.error(
+                                    "pumpfun_event_queue_drop_newest",
+                                    extra={"mint": launch.get("mint"), "tx_signature": signature},
+                                )
 
             except asyncio.CancelledError:
                 raise
@@ -1880,6 +1911,10 @@ def _get_or_create_pumpfun_stream(
         "task": None,
         "last_fallback": 0.0,
         "connected": False,
+        "events_seen": 0,
+        "queue_drops": 0,
+        "last_event_signature": None,
+        "last_event_mint": None,
     }
 
     task = asyncio.create_task(
