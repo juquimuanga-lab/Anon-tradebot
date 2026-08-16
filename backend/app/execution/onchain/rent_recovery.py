@@ -63,6 +63,22 @@ class RecoverableAccount:
         return self.lamports / LAMPORTS_PER_SOL
 
 
+@dataclass(frozen=True)
+class BurnCloseAccount:
+    address: str
+    token_program: str
+    mint: str
+    amount: int
+    decimals: int
+    ui_amount: Optional[float]
+    lamports: int
+    close_authority: str
+
+    @property
+    def rent_sol(self) -> float:
+        return self.lamports / LAMPORTS_PER_SOL
+
+
 @dataclass
 class RecoveryScan:
     signatures: list[str]
@@ -517,6 +533,195 @@ async def scan_rent_recovery(
         eligible=eligible,
         skipped=skipped,
     )
+
+
+def _normalize_account_addresses(text: str) -> list[str]:
+    values: list[str] = []
+    for part in text.replace("\n", ",").split(","):
+        value = part.strip()
+        if not value:
+            continue
+        try:
+            value = str(Pubkey.from_string(value))
+        except Exception as exc:
+            raise RentRecoveryError(f"Invalid token account address: {value}") from exc
+        if value not in values:
+            values.append(value)
+    if not values:
+        raise RentRecoveryError("Send at least one token-account address.")
+    if len(values) > MAX_INPUT_SIGNATURES:
+        raise RentRecoveryError(
+            f"Send no more than {MAX_INPUT_SIGNATURES} token-account addresses at a time."
+        )
+    return values
+
+
+async def scan_burn_close(
+    rpc_url: str,
+    wallet_pubkey: str,
+    account_text: str,
+) -> list[BurnCloseAccount]:
+    """Validate explicit token accounts for a full-balance burn followed by close."""
+    wallet = str(Pubkey.from_string(wallet_pubkey))
+    addresses = _normalize_account_addresses(account_text)
+    accounts = await _get_accounts(rpc_url, addresses)
+    eligible: list[BurnCloseAccount] = []
+
+    for address, account in zip(addresses, accounts):
+        if not account:
+            raise RentRecoveryError(f"{address}: token account is closed or unavailable.")
+
+        program_owner = str(account.get("owner") or "")
+        if not _account_is_token_program(program_owner):
+            raise RentRecoveryError(f"{address}: not an SPL/Token-2022 token account.")
+
+        info_owner, mint, close_authority, rent_lamports = _parsed_token_info(account)
+        if not info_owner or info_owner != wallet:
+            raise RentRecoveryError(f"{address}: token account owner is not the connected wallet.")
+
+        effective_close_authority = close_authority or info_owner
+        if effective_close_authority != wallet:
+            raise RentRecoveryError(f"{address}: close authority is not the connected wallet.")
+
+        data = ((account.get("data") or {}).get("parsed") or {}).get("info") or {}
+        token_amount = data.get("tokenAmount") or {}
+        if token_amount.get("isNative") is not None:
+            raise RentRecoveryError(
+                f"{address}: wrapped/native SOL token accounts are not handled by /burnclose; use /recoverent or close them separately."
+            )
+        raw_amount = token_amount.get("amount")
+        decimals = token_amount.get("decimals")
+        if raw_amount is None or decimals is None or not mint:
+            raise RentRecoveryError(f"{address}: token balance/mint metadata could not be verified.")
+
+        try:
+            amount = int(raw_amount)
+            decimals_int = int(decimals)
+        except (TypeError, ValueError) as exc:
+            raise RentRecoveryError(f"{address}: invalid token amount metadata.") from exc
+
+        if amount < 0:
+            raise RentRecoveryError(f"{address}: invalid negative token balance.")
+        if rent_lamports is None or rent_lamports <= 0:
+            raise RentRecoveryError(f"{address}: no recoverable account rent.")
+
+        ui_amount = token_amount.get("uiAmount")
+        try:
+            ui_amount = float(ui_amount) if ui_amount is not None else None
+        except (TypeError, ValueError):
+            ui_amount = None
+
+        eligible.append(
+            BurnCloseAccount(
+                address=address,
+                token_program=program_owner,
+                mint=str(mint),
+                amount=amount,
+                decimals=decimals_int,
+                ui_amount=ui_amount,
+                lamports=rent_lamports,
+                close_authority=effective_close_authority,
+            )
+        )
+
+    return eligible
+
+
+def _burn_checked_instruction(account: BurnCloseAccount, wallet: Pubkey) -> Instruction:
+    """Create SPL Token/Token-2022 BurnChecked with the mint's exact decimals."""
+    program_id = Pubkey.from_string(account.token_program)
+    data = bytes([15]) + int(account.amount).to_bytes(8, "little") + bytes([account.decimals])
+    return Instruction(
+        program_id,
+        data,
+        [
+            AccountMeta(Pubkey.from_string(account.address), False, True),
+            AccountMeta(Pubkey.from_string(account.mint), False, False),
+            AccountMeta(wallet, True, False),
+        ],
+    )
+
+
+def _burn_close_instructions(account: BurnCloseAccount, wallet: Pubkey) -> list[Instruction]:
+    instructions: list[Instruction] = []
+    if account.amount > 0:
+        instructions.append(_burn_checked_instruction(account, wallet))
+    instructions.append(
+        Instruction(
+            Pubkey.from_string(account.token_program),
+            bytes([9]),
+            [
+                AccountMeta(Pubkey.from_string(account.address), False, True),
+                AccountMeta(wallet, False, True),
+                AccountMeta(wallet, True, False),
+            ],
+        )
+    )
+    return instructions
+
+
+async def burn_and_close(
+    rpc_url: str,
+    keypair: Keypair,
+    accounts: list[BurnCloseAccount],
+) -> dict[str, Any]:
+    """Burn full balances and close the same token accounts in confirmed batches."""
+    if not accounts:
+        return {
+            "burned_accounts": 0,
+            "closed": 0,
+            "recovered_lamports": 0,
+            "recovered_sol": 0.0,
+            "transactions": [],
+            "failed": [],
+        }
+
+    wallet = keypair.pubkey()
+    results: list[str] = []
+    failed: list[str] = []
+    burned_accounts = 0
+    closed_accounts = 0
+    recovered_lamports = 0
+
+    for start in range(0, len(accounts), ACCOUNTS_PER_RECOVERY_TX):
+        batch = accounts[start : start + ACCOUNTS_PER_RECOVERY_TX]
+        try:
+            blockhash, last_valid = await _latest_blockhash(rpc_url)
+            instructions: list[Instruction] = []
+            for account in batch:
+                instructions.extend(_burn_close_instructions(account, wallet))
+
+            tx = Transaction.new_signed_with_payer(
+                instructions, wallet, [keypair], Hash.from_string(blockhash)
+            )
+            signature = await send_and_confirm(
+                rpc_url, bytes(tx), last_valid_block_height=last_valid
+            )
+            results.append(signature)
+            burned_accounts += sum(1 for item in batch if item.amount > 0)
+            closed_accounts += len(batch)
+            recovered_lamports += sum(item.lamports for item in batch)
+            logger.info(
+                "burn_close_batch_confirmed",
+                extra={
+                    "signature": signature,
+                    "accounts": len(batch),
+                    "recovered_lamports": sum(item.lamports for item in batch),
+                },
+            )
+        except Exception as exc:
+            message = redact_text(str(exc))
+            failed.append(f"{len(batch)} account(s): {message}")
+            logger.exception("burn_close_batch_failed")
+
+    return {
+        "burned_accounts": burned_accounts,
+        "closed": closed_accounts,
+        "recovered_lamports": recovered_lamports,
+        "recovered_sol": recovered_lamports / LAMPORTS_PER_SOL,
+        "transactions": results,
+        "failed": failed,
+    }
 
 
 async def _latest_blockhash(rpc_url: str) -> tuple[str, int]:
