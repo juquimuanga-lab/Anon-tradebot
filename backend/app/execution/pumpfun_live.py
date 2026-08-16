@@ -566,8 +566,15 @@ class PumpFunExecutionAdapter(
         token: TokenSnapshot,
         amount_tokens: float,
         sell_pct: float,
+        exit_reason: str | None = None,
     ) -> OrderResult:
-        """Sell a Pump.fun bonding-curve position."""
+        """Sell a Pump.fun bonding-curve position.
+
+        ``exit_reason`` is optional so the shared ExecutionAdapter contract
+        remains compatible.  Stop-loss and trailing-stop exits are treated as
+        risk-control exits: their configured slippage is a hard ceiling and
+        the 6003 retry path never widens that ceiling.
+        """
 
         try:
 
@@ -694,16 +701,40 @@ class PumpFunExecutionAdapter(
             self._default_slippage_bps
         )
 
+        # Stop-loss and trailing-stop exits are risk controls.  Never widen
+        # their slippage after a 6003 rejection: a wider retry can turn a
+        # configured 12% stop into a much larger realized loss during a fast
+        # Pump.fun collapse.
+        protected_exit = exit_reason in {
+            "stop loss hit",
+            "trailing stop hit",
+        }
+
         max_attempts = 3
 
         force_jupiter = False
 
+        logger.info(
+            "pumpfun_sell_exit_policy",
+            extra={
+                "mint": token.mint,
+                "exit_reason": exit_reason,
+                "protected_exit": protected_exit,
+                "base_slippage_bps": base_slippage_bps,
+                "max_slippage_bps": base_slippage_bps,
+            },
+        )
+
         for attempt in range(
             max_attempts
         ):
-            slippage_bps = _sell_slippage_for_attempt(
-                base_slippage_bps,
-                attempt,
+            slippage_bps = (
+                base_slippage_bps
+                if protected_exit
+                else _sell_slippage_for_attempt(
+                    base_slippage_bps,
+                    attempt,
+                )
             )
 
             try:
@@ -786,6 +817,8 @@ class PumpFunExecutionAdapter(
                             "sell_pct": (
                                 sell_pct_float
                             ),
+                            "exit_reason": exit_reason,
+                            "protected_exit": protected_exit,
                             "amount_tokens_sold": (
                                 tokens_to_sell
                             ),
@@ -944,16 +977,25 @@ class PumpFunExecutionAdapter(
 
                 # Pump.fun 6003 (TooLittleSolReceived) means the
                 # curve moved after the quote and the minimum SOL output was
-                # not met. Rebuild fresh with boundedly wider tolerance.
-                # This is an explicit rejection, so retrying cannot double-
-                # sell an unknown/possibly successful transaction.
+                # not met. Rebuild fresh.
+                #
+                # For stop-loss/trailing-stop exits, the configured slippage
+                # is a HARD CEILING. We may rebuild with a fresh quote, but we
+                # must never widen the allowed price movement.
+                #
+                # For normal exits, preserve the existing bounded widening
+                # behavior.
                 if (
                     attempt < max_attempts - 1
                     and _is_too_little_sol_received_error(exc)
                 ):
-                    next_slippage_bps = _sell_slippage_for_attempt(
-                        base_slippage_bps,
-                        attempt + 1,
+                    next_slippage_bps = (
+                        base_slippage_bps
+                        if protected_exit
+                        else _sell_slippage_for_attempt(
+                            base_slippage_bps,
+                            attempt + 1,
+                        )
                     )
 
                     logger.warning(
@@ -963,6 +1005,8 @@ class PumpFunExecutionAdapter(
                             "attempt": attempt + 1,
                             "current_slippage_bps": slippage_bps,
                             "next_slippage_bps": next_slippage_bps,
+                            "exit_reason": exit_reason,
+                            "protected_exit": protected_exit,
                             "amount_tokens_sold": tokens_to_sell,
                             "amount_tokens_raw": amount_tokens_raw,
                             "error": str(exc),
@@ -1029,6 +1073,8 @@ class PumpFunExecutionAdapter(
                         "sell_pct": (
                             sell_pct_float
                         ),
+                        "exit_reason": exit_reason,
+                        "protected_exit": protected_exit,
                         "attempt": (
                             attempt + 1
                         ),
@@ -1054,6 +1100,8 @@ class PumpFunExecutionAdapter(
                         "amount_tokens_sold": (
                             tokens_to_sell
                         ),
+                        "exit_reason": exit_reason,
+                        "protected_exit": protected_exit,
                     },
                 )
 
