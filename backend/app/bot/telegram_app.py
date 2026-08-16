@@ -60,22 +60,25 @@ def build_application() -> Application:
     )
     application.add_handler(connectwallet_conv)
 
-    setrule_conv = ConversationHandler(
-        entry_points=[CommandHandler("setrule", setrule_start)],
+    burnclose_conv = ConversationHandler(
+        entry_points=[CommandHandler("burnclose", handlers_admin.burnclose_cmd)],
         states={
-            COLLECTING: [
-                MessageHandler(filters.TEXT & ~filters.COMMAND | filters.Regex("^/(skip|cancel)$"), setrule_collect)
+            handlers_admin.BURN_CLOSE_WAITING_ACCOUNTS: [
+                MessageHandler(
+                    filters.TEXT & ~filters.COMMAND | filters.Regex("^/cancel$"),
+                    handlers_admin.burnclose_receive,
+                )
             ]
         },
-        fallbacks=[CommandHandler("cancel", setrule_collect)],
-        name="setrule_conversation",
+        fallbacks=[CommandHandler("cancel", handlers_admin.burnclose_receive)],
+        name="burnclose_conversation",
     )
-    application.add_handler(setrule_conv)
+    application.add_handler(burnclose_conv)
 
+    # SOL rent recovery: recover rent from empty token accounts discovered from
+    # confirmed BUY/SELL transaction signatures.
     rent_recovery_conv = ConversationHandler(
-        entry_points=[
-            CommandHandler("recoverent", handlers_admin.recoverent_cmd)
-        ],
+        entry_points=[CommandHandler("recoverent", handlers_admin.recoverent_cmd)],
         states={
             handlers_admin.RENT_RECOVERY_WAITING_SIGNATURES: [
                 MessageHandler(
@@ -89,9 +92,20 @@ def build_application() -> Application:
     )
     application.add_handler(rent_recovery_conv)
 
-    application.add_handler(
-        CallbackQueryHandler(handlers_admin.rent_recovery_callback, pattern=r"^rent:")
+    setrule_conv = ConversationHandler(
+        entry_points=[CommandHandler("setrule", setrule_start)],
+        states={
+            COLLECTING: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND | filters.Regex("^/(skip|cancel)$"), setrule_collect)
+            ]
+        },
+        fallbacks=[CommandHandler("cancel", setrule_collect)],
+        name="setrule_conversation",
     )
+    application.add_handler(setrule_conv)
+
     application.add_handler(CallbackQueryHandler(handlers_admin.confirmation_callback, pattern=r"^confirm:"))
+    application.add_handler(CallbackQueryHandler(handlers_admin.burnclose_callback, pattern=r"^burnclose:"))
+    application.add_handler(CallbackQueryHandler(handlers_admin.rent_recovery_callback, pattern=r"^rent:"))
 
     return application
