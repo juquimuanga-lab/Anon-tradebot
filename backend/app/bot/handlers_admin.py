@@ -18,6 +18,7 @@ logger = logging.getLogger("app.bot.admin")
 
 CONNECT_WAITING_KEY = 2
 RENT_RECOVERY_WAITING_SIGNATURES = 3
+BURN_CLOSE_WAITING_ACCOUNTS = 4
 
 
 @admin_required
@@ -213,6 +214,183 @@ async def confirmation_callback(update: Update, context: ContextTypes.DEFAULT_TY
         await secrets_manager.delete_wallet_private_key(entry.payload["user_id"])
         await repo.write_audit_log(str(update.effective_user.id), "disconnect_wallet", {})
         await query.edit_message_text("Wallet disconnected and key deleted.")
+
+# ---------------------------------------------------------------------------
+# Burn + close token accounts
+# ---------------------------------------------------------------------------
+
+
+@admin_required
+async def burnclose_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Start the explicit admin-only full-balance burn + close flow."""
+    context.user_data.pop("burn_close_accounts", None)
+    context.user_data.pop("burn_close_wallet", None)
+    await update.message.reply_text(
+        "🔥 *Burn + Close*\n\n"
+        "Send the *token-account address(es)* you want to clean. "
+        "Use the token-account address, not the mint address.\n\n"
+        "• Up to 20 addresses, separated by commas or new lines.\n"
+        "• The bot verifies that every account belongs to the connected sniper wallet.\n"
+        "• If the balance is non-zero, the *entire token balance is burned*.\n"
+        "• After the balance is zero, the token account is closed and its SOL rent is returned.\n"
+        "• The bot will NOT automatically burn every token in the wallet.\n\n"
+        "⚠️ Burning is permanent. Only submit tokens you intentionally want to destroy.\n\n"
+        "Send /cancel to abort.",
+        parse_mode="Markdown",
+    )
+    return BURN_CLOSE_WAITING_ACCOUNTS
+
+
+async def burnclose_receive(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    text = (update.message.text or "").strip()
+    if text == "/cancel":
+        context.user_data.pop("burn_close_accounts", None)
+        context.user_data.pop("burn_close_wallet", None)
+        await update.message.reply_text("Burn + close cancelled. Nothing was burned or closed.")
+        return ConversationHandler.END
+
+    try:
+        keypair = await rent_recovery.resolve_wallet_keypair(
+            context.application, str(update.effective_user.id)
+        )
+        wallet = str(keypair.pubkey())
+        accounts = await rent_recovery.scan_burn_close(
+            settings.solana_rpc_url, wallet, text
+        )
+    except Exception as exc:
+        logger.warning("burn_close_scan_failed", extra={"error": str(exc)})
+        await update.message.reply_text(
+            "❌ Burn + close scan failed:\n"
+            f"{rent_recovery.redact_text(str(exc))}\n\n"
+            "Nothing was burned or closed. Try again or /cancel."
+        )
+        return BURN_CLOSE_WAITING_ACCOUNTS
+
+    context.user_data["burn_close_accounts"] = text
+    context.user_data["burn_close_wallet"] = wallet
+
+    total_rent = sum(item.lamports for item in accounts)
+    burn_count = sum(1 for item in accounts if item.amount > 0)
+    zero_count = len(accounts) - burn_count
+    rows = []
+    for item in accounts[:12]:
+        balance = item.ui_amount if item.ui_amount is not None else item.amount
+        rows.append(
+            f"• `{item.address}`\n"
+            f"  Balance: `{balance}` | Rent: `{rent_recovery.format_sol(item.lamports)} SOL`"
+        )
+    if len(accounts) > 12:
+        rows.append(f"• … and {len(accounts) - 12} more")
+
+    keyboard = InlineKeyboardMarkup(
+        [[
+            InlineKeyboardButton("🔥 Burn + Close", callback_data="burnclose:confirm"),
+            InlineKeyboardButton("❌ Cancel", callback_data="burnclose:cancel"),
+        ]]
+    )
+    message = (
+        "🔎 *Burn + Close Preview*\n\n"
+        f"Accounts: *{len(accounts)}*\n"
+        f"Accounts with tokens to burn: *{burn_count}*\n"
+        f"Already-zero accounts: *{zero_count}*\n"
+        f"SOL rent to recover: *{rent_recovery.format_sol(total_rent)} SOL*\n\n"
+        "*Accounts:*\n" + "\n".join(rows) + "\n\n"
+        "⚠️ Confirming will permanently burn the full balance of every non-zero account, "
+        "then close those accounts and return their rent."
+    )
+    await update.message.reply_text(
+        message, parse_mode="Markdown", reply_markup=keyboard
+    )
+    return ConversationHandler.END
+
+
+async def burnclose_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Re-check and execute the explicit burn + close confirmation."""
+    query = update.callback_query
+    await query.answer()
+
+    from app.security.allowlist import is_admin
+
+    if not is_admin(update.effective_user.id):
+        await query.edit_message_text("Restricted to admin.")
+        return
+
+    action = query.data.split(":", 1)[1]
+    account_text = context.user_data.get("burn_close_accounts")
+    expected_wallet = context.user_data.get("burn_close_wallet")
+
+    if action == "cancel":
+        context.user_data.pop("burn_close_accounts", None)
+        context.user_data.pop("burn_close_wallet", None)
+        await query.edit_message_text("Burn + close cancelled. Nothing was burned or closed.")
+        return
+
+    if action != "confirm" or not account_text or not expected_wallet:
+        await query.edit_message_text("This burn + close confirmation has expired. Run /burnclose again.")
+        return
+
+    await query.edit_message_text("⏳ Re-checking balances, burning tokens, and closing accounts…")
+
+    try:
+        keypair = await rent_recovery.resolve_wallet_keypair(
+            context.application, str(update.effective_user.id)
+        )
+        if str(keypair.pubkey()) != expected_wallet:
+            raise rent_recovery.RentRecoveryError(
+                "The connected wallet changed after the scan. Nothing was burned or closed."
+            )
+
+        accounts = await rent_recovery.scan_burn_close(
+            settings.solana_rpc_url, expected_wallet, account_text
+        )
+        result = await rent_recovery.burn_and_close(
+            settings.solana_rpc_url, keypair, accounts
+        )
+
+        tx_lines = [
+            f"• https://solscan.io/tx/{signature}"
+            for signature in result.get("transactions", [])
+        ]
+        failures = result.get("failed") or []
+        message = (
+            "✅ *Burn + Close Finished*\n\n"
+            f"Accounts closed: *{result.get('closed', 0)}*\n"
+            f"Accounts burned: *{result.get('burned_accounts', 0)}*\n"
+            f"SOL recovered: *{rent_recovery.format_sol(result.get('recovered_lamports', 0))} SOL*\n"
+            f"Transactions: *{len(tx_lines)}*"
+        )
+        if tx_lines:
+            message += "\n\n*Confirmed transactions:*\n" + "\n".join(tx_lines)
+        if failures:
+            message += "\n\n⚠️ *Some batches failed:*\n" + "\n".join(
+                f"• {item}" for item in failures[:5]
+            )
+        await query.edit_message_text(message, parse_mode="Markdown")
+        await repo.write_audit_log(
+            str(update.effective_user.id),
+            "burn_and_close",
+            {
+                "wallet": expected_wallet,
+                "accounts_requested": len(accounts),
+                "burned_accounts": result.get("burned_accounts", 0),
+                "closed_accounts": result.get("closed", 0),
+                "recovered_lamports": result.get("recovered_lamports", 0),
+                "transactions": result.get("transactions", []),
+                "failed_batches": len(failures),
+            },
+        )
+    except Exception as exc:
+        logger.exception("burn_close_failed")
+        await query.edit_message_text(
+            "❌ *Burn + close failed.*\n\n"
+            f"{rent_recovery.redact_text(str(exc))}\n\n"
+            "No further accounts were attempted after the failure.",
+            parse_mode="Markdown",
+        )
+    finally:
+        context.user_data.pop("burn_close_accounts", None)
+        context.user_data.pop("burn_close_wallet", None)
+
 
 # ---------------------------------------------------------------------------
 # SOL rent recovery
