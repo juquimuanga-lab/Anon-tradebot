@@ -82,7 +82,7 @@ SOL_USD_CACHE_TTL_SECONDS = 2.0
 # for live market data. It only prevents duplicate RPC requests when two
 # parts of the application request the exact same token price almost
 # simultaneously.
-PUMPFUN_PRICE_CACHE_TTL_SECONDS = 1.0
+PUMPFUN_PRICE_CACHE_TTL_SECONDS = 0.0
 
 
 # ---------------------------------------------------------------------------
