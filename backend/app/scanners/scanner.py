@@ -105,6 +105,11 @@ SOURCE_ANONCOIN = "anoncoin_onchain"
 SOURCE_PUMPFUN = "pumpfun"
 SOURCE_MOCK = "mock_simulated"
 
+# Pump.fun anti-farming launch guard.
+PUMPFUN_MIN_LIQUIDITY_USD = 5_000.0
+PUMPFUN_MIN_HOLDERS = 10
+PUMPFUN_MAX_MARKET_CAP_TO_LIQUIDITY = 50.0
+
 
 def _is_anoncoin_source(source: str) -> bool:
     """True for any Anoncoin-origin source tag.
@@ -713,6 +718,57 @@ class ScannerService:
             holder_count,
         )
 
+
+    # ------------------------------------------------------------------
+    # Pump.fun anti-farming launch guard
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _pumpfun_farming_guard(token) -> tuple[bool, list[str]]:
+        """Reject suspiciously thin Pump.fun launches before trading."""
+        if token.source != SOURCE_PUMPFUN:
+            return True, []
+
+        reasons: list[str] = []
+        liquidity = float(token.liquidity_usd or 0.0)
+        holders = int(token.holders or 0)
+        market_cap = float(token.market_cap_usd or 0.0)
+
+        if liquidity < PUMPFUN_MIN_LIQUIDITY_USD:
+            reasons.append(
+                f"Pump.fun liquidity too low (${liquidity:,.0f} < "
+                f"${PUMPFUN_MIN_LIQUIDITY_USD:,.0f})"
+            )
+
+        if holders < PUMPFUN_MIN_HOLDERS:
+            reasons.append(
+                f"Pump.fun holder count too low ({holders} < "
+                f"{PUMPFUN_MIN_HOLDERS})"
+            )
+
+        if liquidity > 0 and market_cap > 0:
+            ratio = market_cap / liquidity
+            if ratio > PUMPFUN_MAX_MARKET_CAP_TO_LIQUIDITY:
+                reasons.append(
+                    "Pump.fun market-cap/liquidity ratio too high "
+                    f"({ratio:.1f}x > "
+                    f"{PUMPFUN_MAX_MARKET_CAP_TO_LIQUIDITY:.1f}x)"
+                )
+
+        if reasons:
+            logger.info(
+                "pumpfun_farming_guard_rejected",
+                extra={
+                    "mint": token.mint,
+                    "liquidity_usd": liquidity,
+                    "holders": holders,
+                    "market_cap_usd": market_cap,
+                    "reasons": reasons,
+                },
+            )
+            return False, reasons
+
+        return True, []
 
     # ------------------------------------------------------------------
     # Phase 1 smart-money telemetry
@@ -1532,6 +1588,35 @@ class ScannerService:
                     token
                 )
             )
+
+            # Apply the Pump.fun anti-farming guard after holder enrichment
+            # and before the normal rule engine / BUY path.
+            farming_guard_passed, farming_guard_reasons = (
+                self._pumpfun_farming_guard(token)
+            )
+
+            if not farming_guard_passed:
+                for rule in due_rules:
+                    await repo.save_screening_result(
+                        token.mint,
+                        False,
+                        0.0,
+                        farming_guard_reasons,
+                        token.liquidity_usd,
+                        token.holders,
+                        token.market_cap_usd,
+                        False,
+                        {
+                            "source": token.source,
+                            "rule_id": rule.id,
+                            "pumpfun_farming_guard": True,
+                        },
+                    )
+
+                del self._pending_watch[mint]
+                for rule in active_rules:
+                    self._notified_fail.discard((mint, rule.id))
+                continue
 
             all_settled = True
 
