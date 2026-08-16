@@ -636,7 +636,7 @@ def _burn_checked_instruction(account: BurnCloseAccount, wallet: Pubkey) -> Inst
         data,
         [
             AccountMeta(Pubkey.from_string(account.address), False, True),
-            AccountMeta(Pubkey.from_string(account.mint), False, False),
+            AccountMeta(Pubkey.from_string(account.mint), False, True),
             AccountMeta(wallet, True, False),
         ],
     )
