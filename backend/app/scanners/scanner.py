@@ -105,10 +105,11 @@ SOURCE_ANONCOIN = "anoncoin_onchain"
 SOURCE_PUMPFUN = "pumpfun"
 SOURCE_MOCK = "mock_simulated"
 
-# Pump.fun anti-farming launch guard.
-PUMPFUN_MIN_LIQUIDITY_USD = 5_000.0
-PUMPFUN_MIN_HOLDERS = 10
-PUMPFUN_MAX_MARKET_CAP_TO_LIQUIDITY = 50.0
+# Pump.fun launch-quality gate.
+# This is intentionally a score rather than three hard cut-offs so the
+# scanner can reject obviously weak launches without filtering out every
+# legitimate early launch. The normal rule engine still applies afterward.
+PUMPFUN_QUALITY_SCORE_THRESHOLD = 55.0
 
 
 def _is_anoncoin_source(source: str) -> bool:
@@ -720,55 +721,147 @@ class ScannerService:
 
 
     # ------------------------------------------------------------------
-    # Pump.fun anti-farming launch guard
+    # Pump.fun launch-quality gate
     # ------------------------------------------------------------------
 
     @staticmethod
-    def _pumpfun_farming_guard(token) -> tuple[bool, list[str]]:
-        """Reject suspiciously thin Pump.fun launches before trading."""
+    def _pumpfun_quality_gate(token) -> tuple[str, float, list[str], dict]:
+        """Score early Pump.fun launch quality without a brittle hard gate.
+
+        Returns:
+            (status, score, reasons, breakdown)
+
+        status is one of:
+            - ``pass``: score is high enough to reach the normal rule engine
+            - ``reject``: measurable data is available but quality is too low
+            - ``defer``: snapshot data is temporarily unavailable; keep the
+              launch pending so a transient RPC/account-read failure does not
+              permanently discard a potentially valid launch.
+        """
         if token.source != SOURCE_PUMPFUN:
-            return True, []
+            return "pass", 100.0, [], {}
 
-        reasons: list[str] = []
         liquidity = float(token.liquidity_usd or 0.0)
-        holders = int(token.holders or 0)
         market_cap = float(token.market_cap_usd or 0.0)
+        holders_raw = getattr(token, "holders", None)
 
-        if liquidity < PUMPFUN_MIN_LIQUIDITY_USD:
-            reasons.append(
-                f"Pump.fun liquidity too low (${liquidity:,.0f} < "
-                f"${PUMPFUN_MIN_LIQUIDITY_USD:,.0f})"
-            )
-
-        if holders < PUMPFUN_MIN_HOLDERS:
-            reasons.append(
-                f"Pump.fun holder count too low ({holders} < "
-                f"{PUMPFUN_MIN_HOLDERS})"
-            )
-
-        if liquidity > 0 and market_cap > 0:
-            ratio = market_cap / liquidity
-            if ratio > PUMPFUN_MAX_MARKET_CAP_TO_LIQUIDITY:
-                reasons.append(
-                    "Pump.fun market-cap/liquidity ratio too high "
-                    f"({ratio:.1f}x > "
-                    f"{PUMPFUN_MAX_MARKET_CAP_TO_LIQUIDITY:.1f}x)"
-                )
-
-        if reasons:
+        # Do not confuse missing launch data with a bad launch. The pending
+        # watcher will retry while the token is still within the rule age.
+        if liquidity <= 0.0 or market_cap <= 0.0 or holders_raw is None:
+            reasons = [
+                "Pump.fun launch data not ready "
+                f"(liquidity=${liquidity:,.0f}, "
+                f"market_cap=${market_cap:,.0f}, "
+                f"holders={holders_raw})"
+            ]
             logger.info(
-                "pumpfun_farming_guard_rejected",
+                "pumpfun_quality_gate_deferred",
                 extra={
                     "mint": token.mint,
                     "liquidity_usd": liquidity,
-                    "holders": holders,
                     "market_cap_usd": market_cap,
+                    "holders": holders_raw,
                     "reasons": reasons,
                 },
             )
-            return False, reasons
+            return "defer", 0.0, reasons, {
+                "data_ready": False,
+            }
 
-        return True, []
+        holders = int(holders_raw)
+        ratio = market_cap / liquidity
+
+        # Liquidity: 30 points
+        if liquidity >= 10_000:
+            liquidity_score = 30.0
+        elif liquidity >= 5_000:
+            liquidity_score = 20.0
+        elif liquidity >= 2_500:
+            liquidity_score = 10.0
+        else:
+            liquidity_score = 0.0
+
+        # Holder distribution: 25 points
+        if holders >= 35:
+            holder_score = 25.0
+        elif holders >= 20:
+            holder_score = 20.0
+        elif holders >= 10:
+            holder_score = 15.0
+        elif holders >= 5:
+            holder_score = 8.0
+        else:
+            holder_score = 0.0
+
+        # MC/liquidity efficiency: 25 points. Lower is healthier.
+        if ratio <= 20.0:
+            ratio_score = 25.0
+        elif ratio <= 35.0:
+            ratio_score = 20.0
+        elif ratio <= 50.0:
+            ratio_score = 15.0
+        elif ratio <= 60.0:
+            ratio_score = 8.0
+        else:
+            ratio_score = 0.0
+
+        # Age/early-launch bonus: 20 points. This rewards entering while
+        # the launch is genuinely early, while avoiding an age requirement
+        # as a hard rejection by itself.
+        age_seconds = float(getattr(token, "age_seconds", 0.0) or 0.0)
+        if age_seconds <= 30:
+            age_score = 20.0
+        elif age_seconds <= 90:
+            age_score = 16.0
+        elif age_seconds <= 180:
+            age_score = 12.0
+        elif age_seconds <= 300:
+            age_score = 8.0
+        else:
+            age_score = 0.0
+
+        score = (
+            liquidity_score
+            + holder_score
+            + ratio_score
+            + age_score
+        )
+
+        breakdown = {
+            "liquidity_score": liquidity_score,
+            "holder_score": holder_score,
+            "market_cap_liquidity_score": ratio_score,
+            "early_age_score": age_score,
+            "liquidity_usd": liquidity,
+            "holders": holders,
+            "market_cap_usd": market_cap,
+            "market_cap_liquidity_ratio": ratio,
+            "age_seconds": age_seconds,
+            "threshold": PUMPFUN_QUALITY_SCORE_THRESHOLD,
+        }
+
+        if score < PUMPFUN_QUALITY_SCORE_THRESHOLD:
+            reasons = [
+                "Pump.fun launch-quality score too low "
+                f"({score:.0f}/{100:.0f} < "
+                f"{PUMPFUN_QUALITY_SCORE_THRESHOLD:.0f})"
+            ]
+            status = "reject"
+        else:
+            reasons = []
+            status = "pass"
+
+        logger.info(
+            "pumpfun_quality_gate_" + status,
+            extra={
+                "mint": token.mint,
+                "score": score,
+                "breakdown": breakdown,
+                "reasons": reasons,
+            },
+        )
+
+        return status, score, reasons, breakdown
 
     # ------------------------------------------------------------------
     # Phase 1 smart-money telemetry
@@ -1589,19 +1682,29 @@ class ScannerService:
                 )
             )
 
-            # Apply the Pump.fun anti-farming guard after holder enrichment
-            # and before the normal rule engine / BUY path.
-            farming_guard_passed, farming_guard_reasons = (
-                self._pumpfun_farming_guard(token)
-            )
+            # Apply the Pump.fun launch-quality score after holder enrichment.
+            # Unlike the previous 5k/10-holder/50x hard gate, this score lets
+            # decent early launches through while filtering the weakest
+            # launches. Temporary missing snapshot data is deferred rather
+            # than permanently discarded.
+            (
+                quality_status,
+                quality_score,
+                quality_reasons,
+                quality_breakdown,
+            ) = self._pumpfun_quality_gate(token)
 
-            if not farming_guard_passed:
+            if quality_status == "defer":
+                # Keep the token in _pending_watch for another snapshot.
+                continue
+
+            if quality_status == "reject":
                 for rule in due_rules:
                     await repo.save_screening_result(
                         token.mint,
                         False,
-                        0.0,
-                        farming_guard_reasons,
+                        quality_score,
+                        quality_reasons,
                         token.liquidity_usd,
                         token.holders,
                         token.market_cap_usd,
@@ -1609,9 +1712,21 @@ class ScannerService:
                         {
                             "source": token.source,
                             "rule_id": rule.id,
-                            "pumpfun_farming_guard": True,
+                            "pumpfun_quality_gate": True,
+                            "pumpfun_quality_score": quality_score,
+                            "pumpfun_quality_breakdown": quality_breakdown,
                         },
                     )
+
+                logger.info(
+                    "pumpfun_quality_gate_rejected",
+                    extra={
+                        "mint": token.mint,
+                        "score": quality_score,
+                        "breakdown": quality_breakdown,
+                        "reasons": quality_reasons,
+                    },
+                )
 
                 del self._pending_watch[mint]
                 for rule in active_rules:
