@@ -110,6 +110,9 @@ SOURCE_MOCK = "mock_simulated"
 # scanner can reject obviously weak launches without filtering out every
 # legitimate early launch. The normal rule engine still applies afterward.
 PUMPFUN_QUALITY_SCORE_THRESHOLD = 55.0
+PUMPFUN_RPC_MAX_CONCURRENCY = 6
+PUMPFUN_RPC_RETRY_DELAYS = (0.25, 0.5, 1.0)
+
 
 
 def _is_anoncoin_source(source: str) -> bool:
@@ -157,6 +160,12 @@ class ScannerService:
             str,
             dict,
         ] = {}
+
+        # Protect Helius/Pump.fun RPC from launch bursts.
+        self._pumpfun_rpc_semaphore = asyncio.Semaphore(
+            PUMPFUN_RPC_MAX_CONCURRENCY
+        )
+
 
         self._notified_fail: set[
             tuple[str, int]
@@ -472,6 +481,45 @@ class ScannerService:
         )
 
     # ------------------------------------------------------------------
+    async def _get_pumpfun_pool_info(
+        self,
+        mint: str,
+    ):
+        """Fetch Pump.fun curve data without stampeding the RPC."""
+        last_exc = None
+        for attempt, delay in enumerate(
+            (0.0,) + PUMPFUN_RPC_RETRY_DELAYS,
+            start=1,
+        ):
+            if delay:
+                await asyncio.sleep(delay)
+
+            try:
+                async with self._pumpfun_rpc_semaphore:
+                    return await pumpfun.get_pool_info(
+                        mint,
+                        settings.solana_rpc_url,
+                        commitment="processed",
+                    )
+            except Exception as exc:
+                last_exc = exc
+                message = str(exc)
+                if (
+                    "429" not in message
+                    and "Too Many Requests" not in message
+                ):
+                    raise
+
+                logger.warning(
+                    "pumpfun_rpc_rate_limited",
+                    extra={
+                        "mint": mint,
+                        "attempt": attempt,
+                    },
+                )
+
+        raise last_exc
+
     # Pump.fun snapshot
     # ------------------------------------------------------------------
 
@@ -485,13 +533,7 @@ class ScannerService:
 
         try:
 
-            info = (
-                await pumpfun.get_pool_info(
-                    mint,
-                    settings.solana_rpc_url,
-                    commitment="processed",
-                )
-            )
+            info = await self._get_pumpfun_pool_info(mint)
 
         except (
             PumpFunPoolNotFound,
@@ -850,6 +892,15 @@ class ScannerService:
         else:
             reasons = []
             status = "pass"
+
+        if status == "pass":
+            logger.info(
+                "pumpfun_quality_gate_passed_to_rules",
+                extra={
+                    "mint": token.mint,
+                    "score": score,
+                },
+            )
 
         logger.info(
             "pumpfun_quality_gate_" + status,
