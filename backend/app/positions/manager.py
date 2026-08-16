@@ -837,16 +837,38 @@ class PositionManager:
 
             try:
 
-                result = await asyncio.wait_for(
-                    adapter.sell(
-                        token,
-                        amount_to_sell,
-                        sell_pct,
-                    ),
-                    timeout=(
-                        settings.execution_timeout_seconds
-                    ),
-                )
+                # Pump.fun stop-loss/trailing exits need to preserve the
+                # configured slippage ceiling.  The Pump.fun live adapter
+                # supports an optional exit_reason so it can distinguish
+                # risk-control exits from normal TP/manual sells.  Keep the
+                # base ExecutionAdapter contract unchanged for all other
+                # execution sources.
+                if (
+                    position.mode == "live"
+                    and position.source == "pumpfun"
+                ):
+                    result = await asyncio.wait_for(
+                        adapter.sell(
+                            token,
+                            amount_to_sell,
+                            sell_pct,
+                            exit_reason=reason,
+                        ),
+                        timeout=(
+                            settings.execution_timeout_seconds
+                        ),
+                    )
+                else:
+                    result = await asyncio.wait_for(
+                        adapter.sell(
+                            token,
+                            amount_to_sell,
+                            sell_pct,
+                        ),
+                        timeout=(
+                            settings.execution_timeout_seconds
+                        ),
+                    )
 
             except asyncio.TimeoutError:
 
