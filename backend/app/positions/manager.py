@@ -26,6 +26,7 @@ Safety rules:
 
 import asyncio
 import logging
+import time
 from datetime import datetime, timezone
 
 from app.config.settings import settings
@@ -81,6 +82,10 @@ class PositionManager:
         #
         # Only the first exit is allowed to execute.
         self._exit_in_progress: set[int] = set()
+
+        # Failed automated exits should not hammer the same position every
+        # monitoring tick. Manual closes are unaffected.
+        self._exit_retry_after: dict[int, float] = {}
 
         # Cache wallet public keys so we don't have to resolve the wallet
         # through the execution router on every 5-second monitoring cycle.
@@ -505,6 +510,21 @@ class PositionManager:
         self._exit_in_progress.discard(
             position_id
         )
+
+    def _automated_exit_on_cooldown(
+        self,
+        position_id: int,
+    ) -> bool:
+        """Return True while a failed automated exit is cooling down."""
+        retry_after = self._exit_retry_after.get(position_id)
+        if retry_after is None:
+            return False
+
+        if time.monotonic() >= retry_after:
+            self._exit_retry_after.pop(position_id, None)
+            return False
+
+        return True
 
     # ------------------------------------------------------------------
     # Sell execution reconciliation
@@ -1030,6 +1050,34 @@ class PositionManager:
 
             if not result.success:
 
+                automated_reasons = {
+                    "time-based exit",
+                    "stop loss hit",
+                    "trailing stop hit",
+                    "volume drop exit",
+                    "take profit hit",
+                }
+
+                if (
+                    reason in automated_reasons
+                    or reason.startswith(
+                        "take profit level "
+                    )
+                ):
+                    self._exit_retry_after[
+                        position.id
+                    ] = time.monotonic() + 60.0
+
+                    logger.warning(
+                        "automated_sell_retry_cooldown",
+                        extra={
+                            "mint": token.mint,
+                            "position_id": position.id,
+                            "reason": reason,
+                            "retry_after_seconds": 60,
+                        },
+                    )
+
                 logger.warning(
                     "sell_failed_position_unchanged",
                     extra={
@@ -1058,6 +1106,11 @@ class PositionManager:
             #
             # Only now modify position state.
             # ----------------------------------------------------------
+
+            self._exit_retry_after.pop(
+                position.id,
+                None,
+            )
 
             remaining_pct = max(
                 0.0,
@@ -1194,6 +1247,10 @@ class PositionManager:
         position,
     ):
         """Evaluate automated exits for one open position."""
+
+        # Failed automated sells are retried at most once per 60 seconds.
+        if self._automated_exit_on_cooldown(position.id):
+            return
 
         # --------------------------------------------------------------
         # First thing we do for a live position:
