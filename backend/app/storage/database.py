@@ -5,7 +5,7 @@ import os
 from contextlib import asynccontextmanager
 from typing import AsyncIterator
 
-from sqlalchemy import inspect, text
+from sqlalchemy import event, inspect, text
 
 from sqlalchemy.ext.asyncio import (
     AsyncSession,
@@ -41,7 +41,26 @@ engine = create_async_engine(
     settings.database_url,
     echo=False,
     future=True,
+    connect_args={
+        "timeout": 30,
+    },
 )
+
+
+# SQLite is used for the MVP. WAL mode allows the scanner/position monitor
+# to read while another short transaction is committing, and busy_timeout
+# prevents transient lock contention from immediately surfacing as
+# "database is locked" during fast launch bursts.
+@event.listens_for(engine.sync_engine, "connect")
+def _configure_sqlite(dbapi_connection, connection_record):
+    if db_path and db_path != ":memory:":
+        cursor = dbapi_connection.cursor()
+        try:
+            cursor.execute("PRAGMA journal_mode=WAL")
+            cursor.execute("PRAGMA synchronous=NORMAL")
+            cursor.execute("PRAGMA busy_timeout=30000")
+        finally:
+            cursor.close()
 
 
 SessionLocal = async_sessionmaker(
@@ -168,6 +187,21 @@ def _migrate_add_missing_columns(
                     ALTER TABLE positions
                     ADD COLUMN source VARCHAR
                     DEFAULT 'anoncoin_onchain'
+                    """
+                )
+            )
+
+        if (
+            "defensive_exit_done"
+            not in existing_position_columns
+        ):
+
+            conn.execute(
+                text(
+                    """
+                    ALTER TABLE positions
+                    ADD COLUMN defensive_exit_done BOOLEAN
+                    DEFAULT 0
                     """
                 )
             )
