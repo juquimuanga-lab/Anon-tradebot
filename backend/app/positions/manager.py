@@ -46,7 +46,7 @@ from app.scanners.price_feed import (
     get_sol_usd_price,
 )
 from app.execution.router import ExecutionRouter
-from app.scoring.rules import RuleParams, TokenSnapshot
+from app.scoring.rules import RuleParams, TakeProfitLevel, TokenSnapshot
 from app.storage import repository as repo
 
 
@@ -1591,124 +1591,127 @@ class PositionManager:
             return
 
         # --------------------------------------------------------------
-        # STOP LOSS
+        # ADAPTIVE RISK ENGINE
+        #
+        # A tiny fixed stop is unreliable on fast launch markets because
+        # normal micro-wicks can exceed it before the sell lands. Instead:
+        #   - take a one-time 50% defensive exit at -8%;
+        #   - hard-close the remainder at -15%;
+        #   - once the trade proves itself, lock profit progressively;
+        #   - use an adaptive trailing distance on larger winners.
         # --------------------------------------------------------------
 
         if (
-            rule.stop_loss_pct
-            and pnl_pct
-            <= -abs(
-                rule.stop_loss_pct
-            )
+            not position.defensive_exit_done
+            and pnl_pct <= -abs(settings.defensive_stop_loss_pct)
         ):
-
             logger.info(
-                "stop_loss_triggered",
-                extra={
-                    "mint": token.mint,
-                    "position_id": (
-                        position.id
-                    ),
-                    "pnl_pct": pnl_pct,
-                    "stop_loss_pct": (
-                        rule.stop_loss_pct
-                    ),
-                    "trigger_price_usd": current_price,
-                    "expected_stop_price_usd": (
-                        position.entry_price_usd
-                        * (
-                            1.0
-                            - (
-                                abs(
-                                    float(
-                                        rule.stop_loss_pct
-                                    )
-                                )
-                                / 100.0
-                            )
-                        )
-                    ),
-                    "entry_price_usd": (
-                        position.entry_price_usd
-                    ),
-                },
-            )
-
-            logger.info(
-                "stop_loss_fast_exit",
+                "defensive_stop_triggered",
                 extra={
                     "mint": token.mint,
                     "position_id": position.id,
-                    "entry_price_usd": position.entry_price_usd,
-                    "trigger_price_usd": current_price,
-                    "trigger_pnl_pct": pnl_pct,
-                    "stop_loss_pct": rule.stop_loss_pct,
-                    "wallet_reconciliation": "already_checked",
+                    "pnl_pct": pnl_pct,
+                    "threshold": settings.defensive_stop_loss_pct,
+                    "sell_pct": settings.defensive_stop_sell_pct,
                 },
             )
-
-            await self._close_position(
-                position,
-                token,
-                current_price,
-                position.remaining_pct,
-                "stop loss hit",
+            sell_success = await self._close_position(
+                position, token, current_price,
+                settings.defensive_stop_sell_pct,
+                "defensive stop -8% partial",
                 reconcile_wallet=False,
             )
-
+            if sell_success:
+                await repo.update_position(
+                    position.id, defensive_exit_done=True
+                )
+                position.defensive_exit_done = True
             return
 
-        # --------------------------------------------------------------
-        # TRAILING STOP
-        # --------------------------------------------------------------
-
-        if (
-            rule.trailing_stop_pct
-            and pnl_pct > 0
-        ):
-
-            drop_from_peak = (
-                (
-                    peak_price
-                    - current_price
-                )
-                / peak_price
-                * 100
-                if peak_price > 0
-                else 0
+        if pnl_pct <= -abs(settings.hard_stop_loss_pct):
+            logger.info(
+                "hard_stop_triggered",
+                extra={
+                    "mint": token.mint,
+                    "position_id": position.id,
+                    "pnl_pct": pnl_pct,
+                    "threshold": settings.hard_stop_loss_pct,
+                },
             )
+            await self._close_position(
+                position, token, current_price,
+                position.remaining_pct,
+                "hard stop -15%",
+                reconcile_wallet=False,
+            )
+            return
 
-            if (
-                drop_from_peak
-                >= rule.trailing_stop_pct
-            ):
+        peak_pnl_pct = self._pnl_pct(
+            position.entry_price_usd, peak_price
+        )
 
+        protected_pnl = None
+        if peak_pnl_pct >= settings.strong_profit_trigger_pct:
+            protected_pnl = settings.strong_profit_lock_pct
+        elif peak_pnl_pct >= settings.profit_lock_trigger_pct:
+            protected_pnl = settings.profit_lock_pct
+        elif peak_pnl_pct >= settings.breakeven_trigger_pct:
+            protected_pnl = settings.breakeven_lock_pct
+
+        if protected_pnl is not None and pnl_pct <= protected_pnl:
+            logger.info(
+                "profit_lock_triggered",
+                extra={
+                    "mint": token.mint,
+                    "position_id": position.id,
+                    "pnl_pct": pnl_pct,
+                    "peak_pnl_pct": peak_pnl_pct,
+                    "protected_pnl_pct": protected_pnl,
+                },
+            )
+            await self._close_position(
+                position, token, current_price,
+                position.remaining_pct,
+                f"profit lock {protected_pnl:+.1f}%",
+                reconcile_wallet=False,
+            )
+            return
+
+        if peak_pnl_pct >= 75.0:
+            trailing_pct = settings.adaptive_trailing_max_pct
+        elif peak_pnl_pct >= 40.0:
+            trailing_pct = settings.adaptive_trailing_strong_pct
+        elif peak_pnl_pct >= 20.0:
+            trailing_pct = settings.adaptive_trailing_mid_pct
+        elif peak_pnl_pct >= 10.0:
+            trailing_pct = settings.adaptive_trailing_min_pct
+        else:
+            trailing_pct = None
+
+        if trailing_pct is not None and peak_price > 0:
+            drop_from_peak = (
+                (peak_price - current_price)
+                / peak_price
+                * 100.0
+            )
+            if drop_from_peak >= trailing_pct:
                 logger.info(
-                    "trailing_stop_triggered",
+                    "adaptive_trailing_stop_triggered",
                     extra={
                         "mint": token.mint,
-                        "position_id": (
-                            position.id
-                        ),
+                        "position_id": position.id,
                         "pnl_pct": pnl_pct,
-                        "drop_from_peak": (
-                            drop_from_peak
-                        ),
-                        "trailing_stop_pct": (
-                            rule.trailing_stop_pct
-                        ),
+                        "peak_pnl_pct": peak_pnl_pct,
+                        "drop_from_peak": drop_from_peak,
+                        "trailing_stop_pct": trailing_pct,
                     },
                 )
-
                 await self._close_position(
-                    position,
-                    token,
-                    current_price,
+                    position, token, current_price,
                     position.remaining_pct,
-                    "trailing stop hit",
+                    f"adaptive trailing {trailing_pct:.1f}%",
                     reconcile_wallet=False,
                 )
-
                 return
 
         # --------------------------------------------------------------
@@ -1782,8 +1785,20 @@ class PositionManager:
             position.tp_hit_indexes or []
         )
 
+        # Pump.fun uses the launch-specific staged profit plan. It takes
+        # modest profits early, then leaves 30% of the original position as
+        # a runner for large moves. Other sources keep the exact user rule.
+        if token.source == "pumpfun":
+            take_profit_levels = [
+                TakeProfitLevel(gain_pct=20.0, sell_pct=20.0),
+                TakeProfitLevel(gain_pct=40.0, sell_pct=25.0),
+                TakeProfitLevel(gain_pct=75.0, sell_pct=25.0),
+            ]
+        else:
+            take_profit_levels = rule.take_profit_levels
+
         for idx, level in enumerate(
-            rule.take_profit_levels
+            take_profit_levels
         ):
 
             if idx in tp_hit_indexes:
