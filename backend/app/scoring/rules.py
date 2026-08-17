@@ -18,14 +18,14 @@ class TakeProfitLevel(BaseModel):
 class RuleParams(BaseModel):
     name: str = "default"
     max_buy_size_sol: float = 0.1
-    min_liquidity_usd: float = 1000.0
-    min_holders: int = 10
-    max_age_seconds: int = 600
+    min_liquidity_usd: float = 2000.0
+    min_holders: int = 25
+    max_age_seconds: int = 8
     creator_allowlist: List[str] = Field(default_factory=list)
     creator_denylist: List[str] = Field(default_factory=list)
     bonding_curve_phase: BondingCurvePhase = "any"
-    min_market_cap_usd: Optional[float] = None
-    max_market_cap_usd: Optional[float] = None
+    min_market_cap_usd: Optional[float] = 7000.0
+    max_market_cap_usd: Optional[float] = 55000.0
     max_slippage_pct: float = 5.0
     max_trades_per_hour: int = 5
     cooldown_seconds: int = 120
