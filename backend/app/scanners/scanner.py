@@ -163,6 +163,10 @@ class ScannerService:
             dict,
         ] = {}
 
+        # Short-window launch history for momentum scoring. This is tactical
+        # signal state and intentionally does not need database persistence.
+        self._momentum_history: dict[str, dict] = {}
+
         # Protect Helius/Pump.fun RPC from launch bursts.
         self._pumpfun_rpc_semaphore = asyncio.Semaphore(
             PUMPFUN_RPC_MAX_CONCURRENCY
@@ -1753,11 +1757,28 @@ class ScannerService:
             )
         )
 
+        # Attach a recent previous snapshot so the scorer can reward
+        # positive MC/liquidity/holder/volume acceleration.
+        now_mono = time.monotonic()
+        previous = self._momentum_history.get(token.mint)
+        if previous and now_mono - previous.get("timestamp", 0.0) <= 15.0:
+            token.raw_enrichment["momentum_previous"] = previous
+        else:
+            token.raw_enrichment.pop("momentum_previous", None)
+
         score_result = compute_score(
             token,
             rule_params,
             settings.creator_watchlist,
         )
+
+        self._momentum_history[token.mint] = {
+            "timestamp": now_mono,
+            "market_cap_usd": float(token.market_cap_usd or 0.0),
+            "liquidity_usd": float(token.liquidity_usd or 0.0),
+            "holders": int(token.holders or 0),
+            "volume_24h_usd": float(token.volume_24h_usd or 0.0),
+        }
 
         # ------------------------------------------------------------------
         # DETAILED RULE-EVALUATION TELEMETRY
@@ -1918,9 +1939,15 @@ class ScannerService:
 
             return False
 
+        # Pump.fun candidates just below the final threshold can still be
+        # worth a smart-money confirmation. Other sources retain the normal
+        # immediate score rejection.
         if (
-            score_result.score
-            < settings.qualify_score_threshold
+            score_result.score < settings.qualify_score_threshold
+            and (
+                token.source != SOURCE_PUMPFUN
+                or score_result.score < settings.smart_money_probe_score
+            )
         ):
             logger.info(
                 "rule_rejected_score",
@@ -1929,21 +1956,11 @@ class ScannerService:
                     "rule_id": rule.id,
                     "source": token.source,
                     "score": score_result.score,
-                    "threshold": (
-                        settings.qualify_score_threshold
-                    ),
-                    "market_cap_usd": getattr(
-                        token, "market_cap_usd", 0.0
-                    ),
-                    "liquidity_usd": getattr(
-                        token, "liquidity_usd", 0.0
-                    ),
-                    "holders": getattr(
-                        token, "holders", None
-                    ),
-                    "age_seconds": getattr(
-                        token, "age_seconds", 0.0
-                    ),
+                    "threshold": settings.qualify_score_threshold,
+                    "market_cap_usd": getattr(token, "market_cap_usd", 0.0),
+                    "liquidity_usd": getattr(token, "liquidity_usd", 0.0),
+                    "holders": getattr(token, "holders", None),
+                    "age_seconds": getattr(token, "age_seconds", 0.0),
                     "breakdown": score_result.breakdown,
                 },
             )
@@ -1973,10 +1990,8 @@ class ScannerService:
             },
         )
 
-        metrics.tokens_qualified += 1
-
         logger.info(
-            "token_qualified",
+            "token_qualified_candidate",
             extra={
                 "mint": token.mint,
                 "rule_id": rule.id,
@@ -1986,33 +2001,50 @@ class ScannerService:
         )
 
         # --------------------------------------------------------------
-        # Phase 1 Smart Money
-        #
-        # IMPORTANT:
-        # - Existing qualification has already passed.
-        # - Smart money is telemetry only in Phase 1.
-        # - It does NOT gate or alter the BUY decision.
-        # - It is only queried for Pump.fun.
+        # Smart-money confirmation
         # --------------------------------------------------------------
-        smart_money_signal = (
-            await self._get_smart_money_signal(
+        # Probe only promising Pump.fun candidates. A detected tracked-wallet
+        # buy adds a bonus; no signal or provider failure is neutral.
+        smart_money_signal = SmartMoneySignal(detected=False)
+        if (
+            token.source == SOURCE_PUMPFUN
+            and score_result.score >= settings.smart_money_probe_score
+        ):
+            smart_money_signal = await self._get_smart_money_signal(
                 token,
                 first_seen=token.created_on,
             )
-        )
+            if smart_money_signal.detected:
+                bonus = min(
+                    settings.smart_money_score_bonus,
+                    max(0.0, smart_money_signal.score / 10.0),
+                )
+                score_result.score = min(100.0, round(score_result.score + bonus, 2))
+                score_result.breakdown["smart_money_bonus"] = round(bonus, 2)
+
+        if score_result.score < settings.qualify_score_threshold:
+            logger.info(
+                "rule_rejected_score_after_smart_money",
+                extra={
+                    "mint": token.mint,
+                    "rule_id": rule.id,
+                    "score": score_result.score,
+                    "threshold": settings.qualify_score_threshold,
+                    "smart_money_detected": smart_money_signal.detected,
+                },
+            )
+            return False
+
+        metrics.tokens_qualified += 1
 
         await self._notifier.new_qualified_token(
             rule.created_by,
-            (
-                token.ticker_symbol
-                or token.mint[:8]
-            ),
+            token.ticker_symbol or token.mint[:8],
             token.mint,
             score_result.score,
             token.source,
         )
 
-        # Smart money remains telemetry-only: it does not gate or alter BUY.
         if smart_money_signal.detected:
             try:
                 await self._notifier.smart_money_signal(
@@ -2028,21 +2060,16 @@ class ScannerService:
                     "smart_money_notification_failed",
                     extra={"mint": token.mint},
                 )
+
         logger.info(
             "qualified_token_smart_money_summary",
             extra={
                 "mint": token.mint,
                 "rule_id": rule.id,
                 "rule_score": score_result.score,
-                "smart_money_detected": (
-                    smart_money_signal.detected
-                ),
-                "smart_money_score": (
-                    smart_money_signal.score
-                ),
-                "smart_money_wallet_count": (
-                    smart_money_signal.wallet_count
-                ),
+                "smart_money_detected": smart_money_signal.detected,
+                "smart_money_score": smart_money_signal.score,
+                "smart_money_wallet_count": smart_money_signal.wallet_count,
             },
         )
 
@@ -2319,29 +2346,36 @@ class ScannerService:
     async def run_forever(
         self,
     ):
+        """Run Pump.fun polling quickly without hammering Anoncoin."""
+        last_anoncoin_scan = 0.0
 
         while True:
-
             try:
+                active_rules = await repo.get_all_active_rules()
 
-                await self.scan_once()
+                await self._watch_wallets_for_new_mints()
+                await self._process_watched_wallet_pending(active_rules)
+
+                now = time.monotonic()
+                if now - last_anoncoin_scan >= settings.scan_interval_seconds:
+                    for token in await self._fetch_new_tokens():
+                        if await repo.token_already_seen(token.mint):
+                            continue
+                        await repo.save_token(token)
+                        metrics.tokens_scanned += 1
+                        token = await self._enrich_holders(token)
+                        for rule in active_rules:
+                            await self._screen_and_maybe_trade(
+                                token, rule, notify_on_fail=True
+                            )
+                    last_anoncoin_scan = now
 
             except Exception as exc:
-
                 metrics.error_count += 1
+                logger.exception("scan_cycle_failed")
+                await self._notifier.api_error("scanner", str(exc))
 
-                logger.exception(
-                    "scan_cycle_failed"
-                )
-
-                await self._notifier.api_error(
-                    "scanner",
-                    str(exc),
-                )
-
-            await asyncio.sleep(
-                settings.scan_interval_seconds
-            )
+            await asyncio.sleep(settings.pumpfun_scan_interval_seconds)
 
     # ------------------------------------------------------------------
     # Daily summary
