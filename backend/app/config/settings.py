@@ -190,7 +190,31 @@ class Settings(BaseSettings):
 
     paper_starting_balance_sol: float = 10.0
 
-    qualify_score_threshold: float = 50.0
+    # Live entry strategy. A candidate must score at least this much
+    # after hard filters before it can reach the BUY path.
+    qualify_score_threshold: float = 65.0
+
+    # Fast Pump.fun polling is intentionally separate from the slower
+    # Anoncoin API scan interval.
+    pumpfun_scan_interval_seconds: float = 1.0
+
+    # Risk management for live positions. These are deliberately tighter
+    # than the legacy rule defaults and are applied by PositionManager.
+    defensive_stop_loss_pct: float = 8.0
+    defensive_stop_sell_pct: float = 50.0
+    hard_stop_loss_pct: float = 15.0
+    breakeven_trigger_pct: float = 10.0
+    breakeven_lock_pct: float = -2.0
+    profit_lock_trigger_pct: float = 20.0
+    profit_lock_pct: float = 5.0
+    strong_profit_trigger_pct: float = 40.0
+    strong_profit_lock_pct: float = 10.0
+    adaptive_trailing_min_pct: float = 6.0
+    adaptive_trailing_mid_pct: float = 8.0
+    adaptive_trailing_strong_pct: float = 10.0
+    adaptive_trailing_max_pct: float = 12.0
+    smart_money_score_bonus: float = 10.0
+    smart_money_probe_score: float = 55.0
 
     # ------------------------------------------------------------------
     # Simulated feed
