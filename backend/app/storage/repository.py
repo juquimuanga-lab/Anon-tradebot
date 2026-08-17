@@ -519,6 +519,7 @@ async def create_position(
             peak_volume_24h_usd=(
                 entry_volume_24h_usd
             ),
+            defensive_exit_done=False,
         )
 
         session.add(position)
