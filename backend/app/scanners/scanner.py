@@ -23,6 +23,7 @@ The same Telegram/admin screening rules are applied to both sources.
 
 import asyncio
 import logging
+import json
 import time
 from datetime import datetime, timedelta, timezone
 
@@ -1835,8 +1836,22 @@ class ScannerService:
             "score_breakdown": score_result.breakdown,
         }
 
+        # IMPORTANT: Railway's current log formatter only renders the
+        # message text, not logging ``extra`` fields. Keep ``extra`` for
+        # structured logging, but also put the diagnostic fields directly
+        # into the message so they are visible in Railway logs.
+        evaluation_message = (
+            "rule_evaluation "
+            + json.dumps(
+                evaluation_log,
+                default=str,
+                separators=(",", ":"),
+                sort_keys=True,
+            )
+        )
+
         logger.info(
-            "rule_evaluation",
+            evaluation_message,
             extra=evaluation_log,
         )
 
@@ -1860,26 +1875,34 @@ class ScannerService:
 
         if not passed:
 
+            rejection_log = {
+                "mint": token.mint,
+                "rule_id": rule.id,
+                "source": token.source,
+                "market_cap_usd": getattr(
+                    token, "market_cap_usd", 0.0
+                ),
+                "liquidity_usd": getattr(
+                    token, "liquidity_usd", 0.0
+                ),
+                "holders": getattr(
+                    token, "holders", None
+                ),
+                "age_seconds": getattr(
+                    token, "age_seconds", 0.0
+                ),
+                "reasons": reasons,
+            }
+
             logger.info(
-                "rule_rejected_hard_filter",
-                extra={
-                    "mint": token.mint,
-                    "rule_id": rule.id,
-                    "source": token.source,
-                    "market_cap_usd": getattr(
-                        token, "market_cap_usd", 0.0
-                    ),
-                    "liquidity_usd": getattr(
-                        token, "liquidity_usd", 0.0
-                    ),
-                    "holders": getattr(
-                        token, "holders", None
-                    ),
-                    "age_seconds": getattr(
-                        token, "age_seconds", 0.0
-                    ),
-                    "reasons": reasons,
-                },
+                "rule_rejected_hard_filter "
+                + json.dumps(
+                    rejection_log,
+                    default=str,
+                    separators=(",", ":"),
+                    sort_keys=True,
+                ),
+                extra=rejection_log,
             )
 
             if notify_on_fail:
