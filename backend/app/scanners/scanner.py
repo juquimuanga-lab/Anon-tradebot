@@ -1758,6 +1758,88 @@ class ScannerService:
             settings.creator_watchlist,
         )
 
+        # ------------------------------------------------------------------
+        # DETAILED RULE-EVALUATION TELEMETRY
+        #
+        # Keep the trading logic unchanged. These logs make it possible to
+        # see exactly why every candidate was accepted/rejected and, most
+        # importantly for fast Pump.fun launches, which market-cap/liquidity/
+        # holder/age values the rule engine actually evaluated.
+        # ------------------------------------------------------------------
+        def _param(name, default=None):
+            return getattr(rule_params, name, default)
+
+        evaluation_log = {
+            "mint": token.mint,
+            "ticker": (
+                getattr(token, "ticker_symbol", None)
+                or token.mint[:8]
+            ),
+            "source": token.source,
+            "rule_id": rule.id,
+
+            # Actual token data seen by the rule engine.
+            "market_cap_usd": float(
+                getattr(token, "market_cap_usd", 0.0) or 0.0
+            ),
+            "liquidity_usd": float(
+                getattr(token, "liquidity_usd", 0.0) or 0.0
+            ),
+            "holders": getattr(token, "holders", None),
+            "price_usd": float(
+                getattr(token, "price_usd", 0.0) or 0.0
+            ),
+            "age_seconds": float(
+                getattr(token, "age_seconds", 0.0) or 0.0
+            ),
+            "created_on": getattr(token, "created_on", None),
+
+            # Rule values supplied by /setrule.
+            "rule_min_liquidity_usd": _param(
+                "min_liquidity_usd"
+            ),
+            "rule_min_holders": _param(
+                "min_holders"
+            ),
+            "rule_max_age_seconds": _param(
+                "max_age_seconds"
+            ),
+            "rule_min_market_cap_usd": _param(
+                "min_market_cap_usd"
+            ),
+            "rule_max_market_cap_usd": _param(
+                "max_market_cap_usd"
+            ),
+            "rule_bonding_curve_phase": _param(
+                "bonding_curve_phase"
+            ),
+            "rule_creator_allowlist": _param(
+                "creator_allowlist"
+            ),
+            "rule_creator_denylist": _param(
+                "creator_denylist"
+            ),
+
+            # Results of the two separate qualification layers.
+            "hard_filters_passed": passed,
+            "hard_filter_reasons": reasons,
+            "score": score_result.score,
+            "qualification_threshold": (
+                settings.qualify_score_threshold
+            ),
+            "score_passed": (
+                score_result.score
+                >= settings.qualify_score_threshold
+            ),
+            "creator_match": score_result.creator_match,
+            "score_breakdown": score_result.breakdown,
+        }
+
+        logger.info(
+            "rule_evaluation",
+            extra=evaluation_log,
+        )
+
         await repo.save_screening_result(
             token.mint,
             passed,
@@ -1778,6 +1860,28 @@ class ScannerService:
 
         if not passed:
 
+            logger.info(
+                "rule_rejected_hard_filter",
+                extra={
+                    "mint": token.mint,
+                    "rule_id": rule.id,
+                    "source": token.source,
+                    "market_cap_usd": getattr(
+                        token, "market_cap_usd", 0.0
+                    ),
+                    "liquidity_usd": getattr(
+                        token, "liquidity_usd", 0.0
+                    ),
+                    "holders": getattr(
+                        token, "holders", None
+                    ),
+                    "age_seconds": getattr(
+                        token, "age_seconds", 0.0
+                    ),
+                    "reasons": reasons,
+                },
+            )
+
             if notify_on_fail:
 
                 await self._notifier.rule_violation(
@@ -1795,7 +1899,56 @@ class ScannerService:
             score_result.score
             < settings.qualify_score_threshold
         ):
+            logger.info(
+                "rule_rejected_score",
+                extra={
+                    "mint": token.mint,
+                    "rule_id": rule.id,
+                    "source": token.source,
+                    "score": score_result.score,
+                    "threshold": (
+                        settings.qualify_score_threshold
+                    ),
+                    "market_cap_usd": getattr(
+                        token, "market_cap_usd", 0.0
+                    ),
+                    "liquidity_usd": getattr(
+                        token, "liquidity_usd", 0.0
+                    ),
+                    "holders": getattr(
+                        token, "holders", None
+                    ),
+                    "age_seconds": getattr(
+                        token, "age_seconds", 0.0
+                    ),
+                    "breakdown": score_result.breakdown,
+                },
+            )
             return False
+
+        logger.info(
+            "rule_passed",
+            extra={
+                "mint": token.mint,
+                "rule_id": rule.id,
+                "source": token.source,
+                "score": score_result.score,
+                "threshold": settings.qualify_score_threshold,
+                "market_cap_usd": getattr(
+                    token, "market_cap_usd", 0.0
+                ),
+                "liquidity_usd": getattr(
+                    token, "liquidity_usd", 0.0
+                ),
+                "holders": getattr(
+                    token, "holders", None
+                ),
+                "age_seconds": getattr(
+                    token, "age_seconds", 0.0
+                ),
+                "breakdown": score_result.breakdown,
+            },
+        )
 
         metrics.tokens_qualified += 1
 
