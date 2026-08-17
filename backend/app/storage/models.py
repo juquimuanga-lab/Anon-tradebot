@@ -151,17 +151,17 @@ class Rule(Base):
 
     min_liquidity_usd: Mapped[float] = mapped_column(
         Float,
-        default=1000.0,
+        default=2000.0,
     )
 
     min_holders: Mapped[int] = mapped_column(
         Integer,
-        default=10,
+        default=25,
     )
 
     max_age_seconds: Mapped[int] = mapped_column(
         Integer,
-        default=600,
+        default=8,
     )
 
     creator_allowlist: Mapped[list] = mapped_column(
@@ -441,6 +441,13 @@ class Position(Base):
     tp_hit_indexes: Mapped[list] = mapped_column(
         JSON,
         default=list,
+    )
+
+    # True once the one-time defensive partial exit (-8% by default)
+    # has successfully executed. Prevents repeated partial stop sells.
+    defensive_exit_done: Mapped[bool] = mapped_column(
+        Boolean,
+        default=False,
     )
 
     realized_pnl_usd: Mapped[float] = mapped_column(
