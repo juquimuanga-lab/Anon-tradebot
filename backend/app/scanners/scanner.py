@@ -23,6 +23,7 @@ The same Telegram/admin screening rules are applied to both sources.
 
 import asyncio
 import logging
+import time
 from datetime import datetime, timedelta, timezone
 
 from app.config.settings import settings
@@ -993,6 +994,228 @@ class ScannerService:
         return signal
 
     # ------------------------------------------------------------------
+    # Pump.fun pre-buy revalidation
+    # ------------------------------------------------------------------
+
+    async def _revalidate_pumpfun_before_buy(
+        self,
+        token,
+        rule_row,
+        previous_score_result,
+    ):
+        """Refresh Pump.fun market data immediately before a live buy.
+
+        The launch snapshot can become stale very quickly on Pump.fun.
+        Re-read the bonding curve immediately before execution and run the
+        same hard filters/qualification score against the fresh market-cap
+        and liquidity values. Holder data is retained from the already
+        completed enrichment step to avoid adding another expensive RPC call
+        in the critical execution path.
+        """
+        if token.source != SOURCE_PUMPFUN:
+            return token, previous_score_result, True
+
+        started = time.monotonic()
+
+        fresh_token = await self._build_pumpfun_snapshot(
+            token.mint,
+            {
+                "creator": getattr(
+                    token,
+                    "creator_wallet",
+                    "",
+                ),
+            },
+            getattr(
+                token,
+                "created_on",
+                datetime.now(timezone.utc),
+            ),
+        )
+
+        if fresh_token is None:
+            logger.warning(
+                "pumpfun_prebuy_revalidation_failed",
+                extra={
+                    "mint": token.mint,
+                    "reason": "fresh bonding curve snapshot unavailable",
+                },
+            )
+            return token, previous_score_result, False
+
+        fresh_token.holders = getattr(
+            token,
+            "holders",
+            0,
+        )
+        fresh_token.volume_24h_usd = getattr(
+            token,
+            "volume_24h_usd",
+            0.0,
+        )
+
+        rule_params = repo.rule_row_to_params(
+            rule_row
+        )
+
+        passed, reasons = evaluate_hard_filters(
+            fresh_token,
+            rule_params,
+        )
+
+        fresh_score_result = compute_score(
+            fresh_token,
+            rule_params,
+            settings.creator_watchlist,
+        )
+
+        (
+            quality_status,
+            quality_score,
+            quality_reasons,
+            quality_breakdown,
+        ) = self._pumpfun_quality_gate(
+            fresh_token
+        )
+
+        if quality_status != "pass":
+            reasons = list(reasons) + list(
+                quality_reasons
+            )
+
+        elapsed_ms = (
+            time.monotonic() - started
+        ) * 1000.0
+
+        initial_mc = float(
+            getattr(
+                token,
+                "market_cap_usd",
+                0.0,
+            )
+            or 0.0
+        )
+        fresh_mc = float(
+            getattr(
+                fresh_token,
+                "market_cap_usd",
+                0.0,
+            )
+            or 0.0
+        )
+        initial_liquidity = float(
+            getattr(
+                token,
+                "liquidity_usd",
+                0.0,
+            )
+            or 0.0
+        )
+        fresh_liquidity = float(
+            getattr(
+                fresh_token,
+                "liquidity_usd",
+                0.0,
+            )
+            or 0.0
+        )
+
+        mc_change_pct = (
+            (
+                (fresh_mc - initial_mc)
+                / initial_mc
+                * 100.0
+            )
+            if initial_mc > 0.0
+            else None
+        )
+
+        logger.info(
+            "pumpfun_prebuy_revalidation",
+            extra={
+                "mint": token.mint,
+                "rule_id": rule_row.id,
+                "initial_market_cap_usd": initial_mc,
+                "prebuy_market_cap_usd": fresh_mc,
+                "market_cap_change_pct": mc_change_pct,
+                "initial_liquidity_usd": initial_liquidity,
+                "prebuy_liquidity_usd": fresh_liquidity,
+                "initial_price_usd": getattr(
+                    token,
+                    "price_usd",
+                    0.0,
+                ),
+                "prebuy_price_usd": getattr(
+                    fresh_token,
+                    "price_usd",
+                    0.0,
+                ),
+                "hard_filters_passed": passed,
+                "quality_status": quality_status,
+                "quality_score": quality_score,
+                "score": fresh_score_result.score,
+                "elapsed_ms": elapsed_ms,
+                "reasons": reasons,
+            },
+        )
+
+        if not passed:
+            logger.info(
+                "pumpfun_prebuy_revalidation_rejected",
+                extra={
+                    "mint": token.mint,
+                    "rule_id": rule_row.id,
+                    "reasons": reasons,
+                    "prebuy_market_cap_usd": fresh_mc,
+                },
+            )
+            return fresh_token, fresh_score_result, False
+
+        if (
+            fresh_score_result.score
+            < settings.qualify_score_threshold
+        ):
+            logger.info(
+                "pumpfun_prebuy_revalidation_rejected",
+                extra={
+                    "mint": token.mint,
+                    "rule_id": rule_row.id,
+                    "reason": "qualification score fell below threshold",
+                    "score": fresh_score_result.score,
+                    "threshold": settings.qualify_score_threshold,
+                    "prebuy_market_cap_usd": fresh_mc,
+                },
+            )
+            return fresh_token, fresh_score_result, False
+
+        if quality_status != "pass":
+            logger.info(
+                "pumpfun_prebuy_revalidation_rejected",
+                extra={
+                    "mint": token.mint,
+                    "rule_id": rule_row.id,
+                    "reason": "Pump.fun quality gate no longer passes",
+                    "quality_status": quality_status,
+                    "quality_score": quality_score,
+                    "prebuy_market_cap_usd": fresh_mc,
+                },
+            )
+            return fresh_token, fresh_score_result, False
+
+        logger.info(
+            "pumpfun_prebuy_revalidation_passed",
+            extra={
+                "mint": token.mint,
+                "rule_id": rule_row.id,
+                "market_cap_usd": fresh_mc,
+                "score": fresh_score_result.score,
+                "elapsed_ms": elapsed_ms,
+            },
+        )
+
+        return fresh_token, fresh_score_result, True
+
+    # ------------------------------------------------------------------
     # Trade
     # ------------------------------------------------------------------
 
@@ -1119,6 +1342,35 @@ class ScannerService:
                 score_result.score,
             )
 
+            return False
+
+        # --------------------------------------------------------------
+        # FINAL PUMPFUN MARKET-CAP REVALIDATION
+        #
+        # The launch snapshot used for qualification may already be stale
+        # by the time the execution adapter is called. Refresh the bonding
+        # curve immediately before placing the order so a rule such as
+        # min_market_cap_usd=8000 cannot be satisfied by an old snapshot
+        # while the actual buy occurs materially below that level.
+        # --------------------------------------------------------------
+        (
+            token,
+            score_result,
+            prebuy_valid,
+        ) = await self._revalidate_pumpfun_before_buy(
+            token,
+            rule_row,
+            score_result,
+        )
+
+        if not prebuy_valid:
+            await repo.save_trade_decision(
+                token.mint,
+                rule_row.id,
+                "skip",
+                "Pump.fun pre-buy market data changed or no longer passed rules",
+                score_result.score,
+            )
             return False
 
         amount_sol = min(
