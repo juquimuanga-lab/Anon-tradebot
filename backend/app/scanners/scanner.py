@@ -192,14 +192,23 @@ class ScannerService:
             raw_coins = (
                 await self._anoncoin.get_coins(
                     sort_by="new",
-                    limit=20,
+                    limit=settings.anoncoin_discovery_limit,
                 )
             )
 
-            return [
+            tokens = [
                 from_anoncoin_coin(coin)
                 for coin in raw_coins
             ]
+            logger.info(
+                "anoncoin_discovery_batch",
+                extra={
+                    "returned": len(tokens),
+                    "limit": settings.anoncoin_discovery_limit,
+                    "source": SOURCE_ANONCOIN,
+                },
+            )
+            return tokens
 
         except AnoncoinAPIError as exc:
 
@@ -2206,7 +2215,16 @@ class ScannerService:
             if await repo.token_already_seen(
                 token.mint
             ):
+                logger.debug(
+                    "anoncoin_discovery_duplicate",
+                    extra={"mint": token.mint},
+                )
                 continue
+
+            logger.info(
+                "anoncoin_legacy_candidate_discovered",
+                extra={"mint": token.mint, "source": SOURCE_ANONCOIN},
+            )
 
             await repo.save_token(
                 token
@@ -2249,7 +2267,15 @@ class ScannerService:
                 if now - last_anoncoin_scan >= settings.scan_interval_seconds:
                     for token in await self._fetch_new_tokens():
                         if await repo.token_already_seen(token.mint):
+                            logger.debug(
+                                "anoncoin_discovery_duplicate",
+                                extra={"mint": token.mint},
+                            )
                             continue
+                        logger.info(
+                            "anoncoin_legacy_candidate_discovered",
+                            extra={"mint": token.mint, "source": SOURCE_ANONCOIN},
+                        )
                         await repo.save_token(token)
                         metrics.tokens_scanned += 1
                         token = await self._enrich_holders(token)
