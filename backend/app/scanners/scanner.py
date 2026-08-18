@@ -112,8 +112,10 @@ SOURCE_MOCK = "mock_simulated"
 # scanner can reject obviously weak launches without filtering out every
 # legitimate early launch. The normal rule engine still applies afterward.
 PUMPFUN_QUALITY_SCORE_THRESHOLD = 55.0
-PUMPFUN_RPC_MAX_CONCURRENCY = 6
-PUMPFUN_RPC_RETRY_DELAYS = (0.25, 0.5, 1.0)
+PUMPFUN_RPC_MAX_CONCURRENCY = 2
+PUMPFUN_RPC_RETRY_DELAYS = (0.35, 0.75, 1.5, 3.0)
+PUMPFUN_RPC_MIN_REQUEST_INTERVAL = 0.12
+PUMPFUN_RPC_RATE_LIMIT_COOLDOWN = 1.5
 
 
 
@@ -171,6 +173,12 @@ class ScannerService:
         self._pumpfun_rpc_semaphore = asyncio.Semaphore(
             PUMPFUN_RPC_MAX_CONCURRENCY
         )
+        # Helius throttles on request rate as well as concurrency.  The
+        # semaphore alone is not enough because get_pool_info() can issue
+        # multiple RPC calls per mint.  Space pool-read starts globally.
+        self._pumpfun_rpc_rate_lock = asyncio.Lock()
+        self._pumpfun_rpc_next_request_at = 0.0
+        self._pumpfun_rpc_cooldown_until = 0.0
 
 
         self._notified_fail: set[
@@ -502,6 +510,23 @@ class ScannerService:
 
             try:
                 async with self._pumpfun_rpc_semaphore:
+                    # Rate-limit request *starts* in addition to limiting
+                    # concurrent pool reads. This prevents a burst of
+                    # asyncio.gather() calls from exceeding Helius RPS.
+                    async with self._pumpfun_rpc_rate_lock:
+                        now = asyncio.get_running_loop().time()
+                        wait_for = max(
+                            self._pumpfun_rpc_next_request_at - now,
+                            self._pumpfun_rpc_cooldown_until - now,
+                            0.0,
+                        )
+                        if wait_for > 0:
+                            await asyncio.sleep(wait_for)
+                        self._pumpfun_rpc_next_request_at = (
+                            asyncio.get_running_loop().time()
+                            + PUMPFUN_RPC_MIN_REQUEST_INTERVAL
+                        )
+
                     return await pumpfun.get_pool_info(
                         mint,
                         settings.solana_rpc_url,
@@ -516,11 +541,23 @@ class ScannerService:
                 ):
                     raise
 
+                # Slow the entire Pump.fun RPC lane after a 429 rather than
+                # allowing all waiting candidates to immediately retry.
+                async with self._pumpfun_rpc_rate_lock:
+                    self._pumpfun_rpc_cooldown_until = max(
+                        self._pumpfun_rpc_cooldown_until,
+                        asyncio.get_running_loop().time()
+                        + PUMPFUN_RPC_RATE_LIMIT_COOLDOWN
+                        * attempt,
+                    )
+
                 logger.warning(
                     "pumpfun_rpc_rate_limited",
                     extra={
                         "mint": mint,
                         "attempt": attempt,
+                        "cooldown_seconds":
+                            PUMPFUN_RPC_RATE_LIMIT_COOLDOWN * attempt,
                     },
                 )
 
