@@ -38,6 +38,7 @@ async def get_or_create_bot_state() -> BotState:
                 trading_enabled=True,
                 anoncoin_trading_enabled=True,
                 pumpfun_trading_enabled=True,
+                fourmeme_trading_enabled=False,
                 paper_balance_sol=(
                     settings.paper_starting_balance_sol
                 ),
