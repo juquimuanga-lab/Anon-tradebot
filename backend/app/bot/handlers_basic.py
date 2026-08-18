@@ -29,6 +29,10 @@ HELP_TEXT = (
     "/disableanoncoin - pause Anoncoin trading only (confirm)\n"
     "/enablepumpfun - resume Pump.fun trading only\n"
     "/disablepumpfun - pause Pump.fun trading only (confirm)\n"
+    "/enablefourmeme - resume Four.meme/BSC trading only\n"
+    "/disablefourmeme - pause Four.meme/BSC trading only (confirm)\n"
+    "/connectbscwallet - register a BSC/EVM wallet for Four.meme live trading\n"
+    "/disconnectbscwallet - remove your stored BSC wallet (confirm)\n"
     "/paper - switch to paper mode (confirm)\n"
     "/live - switch to live mode (confirm)\n"
     "\nEach admin's rules run independently - activating or editing your rule "
@@ -61,6 +65,8 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
     wallet_key = await secrets_manager.get_wallet_private_key(update.effective_user.id)
     wallet_line = "connected (use /balance to check funds)" if wallet_key else "not connected (use /connectwallet for live trading)"
+    bsc_wallet_key = await secrets_manager.get_bsc_wallet_private_key(update.effective_user.id)
+    bsc_wallet_line = "connected" if bsc_wallet_key else "not connected (use /connectbscwallet)"
 
     rule_line = f"`{active_rule.name}` (id {active_rule.id})" if active_rule else "none - use /setrule"
     recent_lines = "\n".join(
@@ -70,10 +76,12 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     text = (
         f"*Mode:* {state.mode} | *Trading enabled:* {state.trading_enabled}\n"
         f"*Anoncoin trading:* {state.anoncoin_trading_enabled} | "
-        f"*Pump.fun trading:* {state.pumpfun_trading_enabled}\n"
+        f"*Pump.fun trading:* {state.pumpfun_trading_enabled} | "
+        f"*Four.meme trading:* {state.fourmeme_trading_enabled}\n"
         f"*Your active rule:* {rule_line}\n"
         f"*Connected APIs:* Anoncoin: {anoncoin_connected}, Helius: {helius_connected}\n"
-        f"*Your wallet:* {wallet_line}\n"
+        f"*Your Solana wallet:* {wallet_line}\n"
+        f"*Your BSC wallet:* {bsc_wallet_line}\n"
         f"*Paper balance:* {state.paper_balance_sol:.3f} SOL\n"
         f"*Open positions:* {len(positions)}\n"
         f"*Recent trades:*\n{recent_lines}"
