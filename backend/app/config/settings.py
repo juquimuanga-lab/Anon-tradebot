@@ -45,6 +45,9 @@ class Settings(BaseSettings):
 
     anoncoin_api_key: Optional[str] = None
 
+    # Number of newest legacy launches requested per discovery poll.
+    anoncoin_discovery_limit: int = 50
+
     anoncoin_trade_endpoint: Optional[str] = None
 
     # ------------------------------------------------------------------
@@ -244,7 +247,7 @@ class Settings(BaseSettings):
     # Timers
     # ------------------------------------------------------------------
 
-    scan_interval_seconds: int = 30
+    scan_interval_seconds: int = 10
 
     position_check_interval_seconds: int = 5
 
