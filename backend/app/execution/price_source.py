@@ -42,6 +42,7 @@ from app.execution.onchain.pumpfun import (
     PumpFunPoolNotFound,
 )
 from app.scanners import price_feed
+from app.connectors.fourmeme import fourmeme_client
 from app.scoring.rules import TokenSnapshot
 
 
@@ -830,6 +831,22 @@ async def get_current_price_usd(
             ),
             True,
         )
+
+    # -----------------------------------------------------------------------
+    # Four.meme / BSC live price
+    # -----------------------------------------------------------------------
+
+    if token.source == "fourmeme":
+        try:
+            market = await asyncio.wait_for(
+                fourmeme_client.market_snapshot(token.mint),
+                timeout=1.5,
+            )
+            if market.get("price_usd", 0) > 0:
+                return float(market["price_usd"]), False
+        except Exception as exc:
+            logger.warning("fourmeme_price_lookup_failed", extra={"mint":token.mint,"error":str(exc)})
+        return float(token.price_usd or 0.0), True
 
     # -----------------------------------------------------------------------
     # Simulated / paper source
