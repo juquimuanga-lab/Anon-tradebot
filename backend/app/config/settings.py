@@ -200,9 +200,9 @@ class Settings(BaseSettings):
 
     # Risk management for live positions. These are deliberately tighter
     # than the legacy rule defaults and are applied by PositionManager.
-    defensive_stop_loss_pct: float = 8.0
+    defensive_stop_loss_pct: float = 50.0
     defensive_stop_sell_pct: float = 50.0
-    hard_stop_loss_pct: float = 15.0
+    hard_stop_loss_pct: float = 65.0
     breakeven_trigger_pct: float = 10.0
     breakeven_lock_pct: float = -2.0
     profit_lock_trigger_pct: float = 20.0
