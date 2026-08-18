@@ -59,7 +59,7 @@ SOL_LAMPORTS_PER_SOL = 1_000_000_000
 
 # Avoid duplicate bonding-curve reads during rapid qualification passes.
 PUMPFUN_POOL_CACHE_SECONDS = 1.25
-PUMPFUN_DECIMALS_CACHE_SECONDS = 900.0
+PUMPFUN_TOKEN_DECIMALS = 6
 _pumpfun_pool_cache: dict[str, tuple[float, dict]] = {}
 _pumpfun_decimals_cache: dict[str, tuple[float, int]] = {}
 
@@ -432,17 +432,17 @@ def decode_bonding_curve(
 
 
 # ---------------------------------------------------------------------------
-# Token decimals
+# Token decimals (legacy helper retained for compatibility)
 # ---------------------------------------------------------------------------
 
 async def _get_token_decimals(
     client: AsyncClient,
     mint_pubkey: Pubkey,
 ) -> int:
-    """Read and cache SPL token decimals.
+    """Read SPL token decimals if explicitly needed elsewhere.
 
-    Token decimals are immutable for a mint, so repeatedly asking Helius for
-    them during rapid Pump.fun qualification passes is unnecessary RPC load.
+    The hot-path get_pool_info() no longer calls this RPC; Pump.fun launch
+    tokens use the fixed 6-decimal convention.
     """
     mint = str(mint_pubkey)
     now = asyncio.get_running_loop().time()
@@ -561,47 +561,19 @@ async def get_pool_info(
         rpc_url
     ) as client:
 
-        curve_task = asyncio.create_task(
-            client.get_account_info(
-                curve_address,
-                commitment=commitment,
-                encoding="base64",
-            )
+        # Pump.fun launch tokens use 6 decimals. The bonding-curve account
+        # already contains the token supply/reserve values needed for pricing,
+        # so do NOT make a second GetTokenSupply RPC call here. On a brand-new
+        # launch that extra request can be the first account to return
+        # "account not ready", causing an otherwise readable curve snapshot to
+        # be discarded and consuming another Helius request.
+        decimals = PUMPFUN_TOKEN_DECIMALS
+
+        account_response = await client.get_account_info(
+            curve_address,
+            commitment=commitment,
+            encoding="base64",
         )
-
-        decimals_task = asyncio.create_task(
-            _get_token_decimals(
-                client,
-                mint_pubkey,
-            )
-        )
-
-        try:
-
-            account_response, decimals = (
-                await asyncio.gather(
-                    curve_task,
-                    decimals_task,
-                )
-            )
-
-        except Exception:
-
-            for task in (
-                curve_task,
-                decimals_task,
-            ):
-
-                if not task.done():
-                    task.cancel()
-
-            await asyncio.gather(
-                curve_task,
-                decimals_task,
-                return_exceptions=True,
-            )
-
-            raise
 
         account = (
             account_response.value
