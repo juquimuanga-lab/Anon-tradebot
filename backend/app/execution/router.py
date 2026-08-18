@@ -320,7 +320,12 @@ class ExecutionRouter:
         if source == SOURCE_FOURMEME:
             if not settings.fourmeme_trading_enabled:
                 return NoWalletConnectedAdapter(
-                    "Four.meme live trading is disabled; set FOURMEME_TRADING_ENABLED=true."
+                    "Four.meme live trading is disabled at deployment level; set FOURMEME_TRADING_ENABLED=true."
+                )
+            state = await repo.get_or_create_bot_state()
+            if not state.fourmeme_trading_enabled:
+                return NoWalletConnectedAdapter(
+                    "Four.meme trading is paused. Use /enablefourmeme to resume."
                 )
 
             raw_bsc_key = await secrets_manager.get_bsc_wallet_private_key(owner_user_id)
