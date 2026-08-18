@@ -17,6 +17,9 @@ ANONCOIN_API_KEY_NAME = "anoncoin_api_key"
 def _wallet_key_name(user_id: int) -> str:
     return f"wallet_privkey_{user_id}"
 
+def _bsc_wallet_key_name(user_id: int) -> str:
+    return f"bsc_wallet_privkey_{user_id}"
+
 
 class SecretsManager:
     def __init__(self):
@@ -89,6 +92,15 @@ class SecretsManager:
 
     async def delete_wallet_private_key(self, user_id: int) -> None:
         await self.delete_secret(_wallet_key_name(user_id))
+
+    async def set_bsc_wallet_private_key(self, user_id: int, raw_key: str) -> None:
+        await self.set_secret(_bsc_wallet_key_name(user_id), raw_key)
+
+    async def get_bsc_wallet_private_key(self, user_id: int) -> Optional[str]:
+        return await self.get_secret(_bsc_wallet_key_name(user_id))
+
+    async def delete_bsc_wallet_private_key(self, user_id: int) -> None:
+        await self.delete_secret(_bsc_wallet_key_name(user_id))
 
 
 secrets_manager = SecretsManager()
