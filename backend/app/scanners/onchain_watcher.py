@@ -8,7 +8,9 @@ This module contains two independent launch detectors:
 
 2. Pump.fun
    Watches the configured Pump.fun mint-authority address and identifies
-   actual Pump.fun `create` instructions.
+   actual Pump.fun creation instructions. Only legacy `create` launches
+   are forwarded to the trading pipeline; Token-2022 `create_v2` launches
+   are detected but skipped.
 
 The two paths intentionally remain separate because a Pump.fun launch
 starts on Pump.fun's bonding curve and must not be routed through the
@@ -99,6 +101,8 @@ PUMPFUN_CREATE_V2_DISCRIMINATOR = bytes(
     ]
 )
 
+# Keep both discriminators for transaction parsing/identification.
+# The trading pipeline below intentionally accepts ONLY legacy `create`.
 PUMPFUN_CREATE_DISCRIMINATORS = (
     PUMPFUN_CREATE_DISCRIMINATOR,
     PUMPFUN_CREATE_V2_DISCRIMINATOR,
@@ -1452,6 +1456,21 @@ def extract_pumpfun_create(
     )
 
 
+def _is_legacy_pumpfun_launch(
+    launch: Optional[dict],
+) -> bool:
+    """Return True only for the legacy Pump.fun `create` instruction.
+
+    Token-2022 launches use `create_v2`. They are intentionally excluded
+    from buying until Token-2022 execution is re-enabled.
+    """
+
+    return bool(
+        launch
+        and launch.get("instruction") == "create"
+    )
+
+
 # ---------------------------------------------------------------------------
 # Pump.fun streaming discovery
 # ---------------------------------------------------------------------------
@@ -1810,6 +1829,51 @@ async def _pumpfun_stream_worker(
                         launch = _extract_pumpfun_event_from_logs(logs)
                         if not launch:
                             continue
+
+                        # CreateEvent is identical for legacy `create` and
+                        # Token-2022 `create_v2`, so the event alone cannot
+                        # safely tell us which token program was used.
+                        # Verify the actual transaction before allowing the
+                        # launch into the trading pipeline. Fail closed:
+                        # if verification cannot prove legacy `create`, skip it.
+                        verified_launch = None
+                        try:
+                            async with AsyncClient(rpc_url) as verify_client:
+                                verify_resp = await verify_client.get_transaction(
+                                    Signature.from_string(signature),
+                                    encoding="jsonParsed",
+                                    max_supported_transaction_version=0,
+                                )
+                            verify_tx = verify_resp.value
+                            if verify_tx:
+                                verified_launch = extract_pumpfun_create(verify_tx)
+                        except Exception as exc:
+                            logger.warning(
+                                "pumpfun_launch_version_verification_failed",
+                                extra={
+                                    "signature": signature,
+                                    "error": f"{type(exc).__name__}: {exc}",
+                                },
+                            )
+
+                        if not _is_legacy_pumpfun_launch(verified_launch):
+                            logger.info(
+                                "pumpfun_token2022_launch_skipped",
+                                extra={
+                                    "signature": signature,
+                                    "mint": launch.get("mint"),
+                                    "instruction": (
+                                        verified_launch.get("instruction")
+                                        if verified_launch
+                                        else None
+                                    ),
+                                },
+                            )
+                            continue
+
+                        # Use the transaction-derived launch metadata because
+                        # it includes the authoritative instruction version.
+                        launch = verified_launch
 
                         now = asyncio.get_running_loop().time()
                         state["events_seen"] = int(state.get("events_seen", 0)) + 1
@@ -2266,6 +2330,22 @@ async def poll_new_pumpfun_mints(
             continue
 
         if not launch:
+            continue
+
+        # Recovery has the full transaction, so the instruction version is
+        # authoritative. Only legacy Pump.fun `create` is allowed to proceed.
+        if not _is_legacy_pumpfun_launch(launch):
+            logger.info(
+                "pumpfun_token2022_launch_skipped",
+                extra={
+                    "signature": signature,
+                    "mint": launch.get("mint"),
+                    "instruction": launch.get("instruction"),
+                    "discovery": "rpc_recovery",
+                },
+            )
+            seen_signatures.add(signature)
+            watermarks.set(watermark_key, signature)
             continue
 
         launch["tx_signature"] = signature
