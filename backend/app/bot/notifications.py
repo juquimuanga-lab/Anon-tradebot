@@ -75,7 +75,7 @@ class Notifier:
         await self._send_to(recipient_id, f"*Skipped* `{ticker}`\n- " + "\n- ".join(reasons[:5]))
 
     async def buy_placed(self, recipient_id: int, ticker: str, amount_sol: float, mode: str) -> None:
-        await self._send_to(recipient_id, f"*Buy placed* `{ticker}` for {amount_sol:.3f} SOL ({mode} mode)")
+        await self._send_to(recipient_id, f"*Buy placed* `{ticker}` for {amount_sol:.3f} native units ({mode} mode)")
 
     async def buy_filled(self, recipient_id: int, ticker: str, price_usd: float, mode: str, tx_signature: str | None = None) -> None:
         link = f"\n[View on Solscan](https://solscan.io/tx/{tx_signature})" if tx_signature else ""
