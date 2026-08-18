@@ -39,6 +39,8 @@ from app.execution.onchain.wallet_keys import (
     load_keypair,
 )
 
+from app.execution.fourmeme_live import FourMemeExecutionAdapter
+
 from app.execution.paper import (
     PaperExecutionAdapter,
 )
@@ -72,6 +74,10 @@ SOURCE_ANONCOIN = (
 
 SOURCE_PUMPFUN = (
     "pumpfun"
+)
+
+SOURCE_FOURMEME = (
+    "fourmeme"
 )
 
 SOURCE_MOCK = (
@@ -220,6 +226,7 @@ class ExecutionRouter:
         if source not in {
             SOURCE_ANONCOIN,
             SOURCE_PUMPFUN,
+            SOURCE_FOURMEME,
             SOURCE_MOCK,
         }:
 
@@ -305,6 +312,35 @@ class ExecutionRouter:
                 )
             )
 
+
+        # --------------------------------------------------------------
+        # FOUR.MEME / BSC
+        # --------------------------------------------------------------
+
+        if source == SOURCE_FOURMEME:
+            if not settings.fourmeme_trading_enabled:
+                return NoWalletConnectedAdapter(
+                    "Four.meme live trading is disabled; set FOURMEME_TRADING_ENABLED=true."
+                )
+
+            raw_bsc_key = await secrets_manager.get_bsc_wallet_private_key(owner_user_id)
+            if not raw_bsc_key:
+                return NoWalletConnectedAdapter(
+                    "No BSC wallet connected. Use /connectbscwallet first."
+                )
+            from app.execution.onchain.bsc_wallet import load_bsc_account, InvalidBscWalletKeyError
+            try:
+                account = load_bsc_account(raw_bsc_key)
+            except InvalidBscWalletKeyError:
+                logger.error("stored_bsc_wallet_key_invalid", extra={"owner_user_id": owner_user_id})
+                return NoWalletConnectedAdapter("Stored BSC wallet is invalid. Reconnect it.")
+            return FourMemeExecutionAdapter(
+                account=account,
+                rpc_url=settings.bsc_rpc_url,
+                slippage_bps=settings.fourmeme_default_slippage_bps,
+                helper_address=settings.fourmeme_helper3_address,
+                token_manager_address=settings.fourmeme_token_manager2_address,
+            )
 
         # --------------------------------------------------------------
         # PUMP.FUN
