@@ -51,6 +51,48 @@ class Settings(BaseSettings):
     anoncoin_trade_endpoint: Optional[str] = None
 
     # ------------------------------------------------------------------
+    # Four.meme / BSC
+    # ------------------------------------------------------------------
+
+    bitquery_api_token: Optional[str] = Field(
+        default=None,
+        validation_alias="BITQUERY_API_TOKEN",
+    )
+
+    # Backward-compatible alias for deployments that call the Bitquery
+    # credential an API key. V2 streaming still uses Bearer authentication.
+    bitquery_api_key: Optional[str] = Field(
+        default=None,
+        validation_alias="BITQUERY_API_KEY",
+    )
+
+    bsc_rpc_url: Optional[str] = Field(
+        default=None,
+        validation_alias="BSC_RPC_URL",
+    )
+
+    fourmeme_trading_enabled: bool = Field(
+        default=False,
+        validation_alias="FOURMEME_TRADING_ENABLED",
+    )
+
+    fourmeme_exchange_address: str = (
+        "0x5c952063c7fc8610ffdb798152d69f0b9550762b"
+    )
+
+    fourmeme_helper3_address: str = (
+        "0xF251F83e40a78868FcfA3FA4599Dad6494E46034"
+    )
+
+    fourmeme_token_manager2_address: str = (
+        "0x5c952063c7fc8610FFDB798152D69F0B9550762b"
+    )
+
+    fourmeme_scan_interval_seconds: float = 0.5
+    fourmeme_max_event_queue: int = 1000
+    fourmeme_default_slippage_bps: int = 500
+
+    # ------------------------------------------------------------------
     # Solscan
     # ------------------------------------------------------------------
 
@@ -264,6 +306,12 @@ class Settings(BaseSettings):
     # ------------------------------------------------------------------
     # Solana RPC configuration
     # ------------------------------------------------------------------
+
+    @model_validator(mode="after")
+    def configure_bsc_rpc(self):
+        if not self.bsc_rpc_url:
+            self.bsc_rpc_url = "https://bsc-dataseed.binance.org"
+        return self
 
     @model_validator(mode="after")
     def configure_solana_rpc(self):
