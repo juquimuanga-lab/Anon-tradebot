@@ -33,8 +33,9 @@ from app.connectors.anoncoin import (
     AnoncoinClient,
 )
 
-from app.connectors.helius import (
-    HeliusAPIError,
+from app.connectors.fourmeme import fourmeme_client
+
+from app.connectors.helius import (    HeliusAPIError,
     HeliusClient,
 )
 
@@ -100,6 +101,7 @@ logger = logging.getLogger(
 
 SOURCE_ANONCOIN = "anoncoin_onchain"
 SOURCE_PUMPFUN = "pumpfun"
+SOURCE_FOURMEME = "fourmeme"
 SOURCE_MOCK = "mock_simulated"
 
 # Pump.fun launch-quality gate.
@@ -146,8 +148,9 @@ class ScannerService:
         self._holders_client = holders_client
         self._execution_router = execution_router
 
-        self._watermarks = (
-            onchain_watcher.WatermarkStore()
+        self._fourmeme = fourmeme_client
+
+        self._watermarks = (            onchain_watcher.WatermarkStore()
         )
 
         self._pending_watch: dict[
@@ -363,6 +366,54 @@ class ScannerService:
             )
 
     # ------------------------------------------------------------------
+    # Four.meme / BSC watcher
+    # ------------------------------------------------------------------
+
+    async def _watch_fourmeme_for_new_mints(self):
+        """Drain Bitquery's Four.meme mempool TokenCreate stream."""
+        if not self._fourmeme.enabled:
+            return
+        await self._fourmeme.start()
+        for item in await self._fourmeme.drain():
+            mint = item["mint"]
+            if mint in self._pending_watch:
+                continue
+            if await repo.token_already_seen(mint):
+                continue
+            self._pending_watch[mint] = {
+                "first_seen": item.get("created_on") or datetime.now(timezone.utc),
+                "source": SOURCE_FOURMEME,
+                "metadata": item,
+            }
+            metrics.tokens_scanned += 1
+            logger.info("fourmeme_new_token_queued", extra={"mint":mint,"creator":item.get("creator"),"tx_signature":item.get("tx_signature")})
+
+    async def _build_fourmeme_snapshot(self, mint, metadata, first_seen):
+        try:
+            market = await self._fourmeme.market_snapshot(mint)
+        except Exception as exc:
+            logger.info("fourmeme_snapshot_not_ready", extra={"mint":mint,"error":str(exc)})
+            return None
+        if market["price_usd"] <= 0:
+            return None
+        return TokenSnapshot(
+            mint=mint,
+            ticker_name=metadata.get("ticker_name", ""),
+            ticker_symbol=metadata.get("ticker_symbol", ""),
+            creator_wallet=metadata.get("creator", ""),
+            created_on=first_seen,
+            price_usd=market["price_usd"],
+            market_cap_usd=market["market_cap_usd"],
+            liquidity_usd=market.get("liquidity_usd", 0.0),
+            holders=market["holders"],
+            volume_24h_usd=market["volume_24h_usd"],
+            is_migrated=bool(market.get("liquidity_added", False)),
+            decimals=18,
+            source=SOURCE_FOURMEME,
+            raw_enrichment={"fourmeme": market, "tx_signature": metadata.get("tx_signature")},
+        )
+
+    # ------------------------------------------------------------------
     # Watch all on-chain sources
     # ------------------------------------------------------------------
 
@@ -374,6 +425,8 @@ class ScannerService:
         await self._watch_anoncoin_for_new_mints()
 
         await self._watch_pumpfun_for_new_mints()
+
+        await self._watch_fourmeme_for_new_mints()
 
     # ------------------------------------------------------------------
     # Anoncoin / Meteora snapshot
@@ -716,6 +769,11 @@ class ScannerService:
                 )
             )
 
+        if source == SOURCE_FOURMEME:
+            return await self._build_fourmeme_snapshot(
+                mint, metadata, first_seen
+            )
+
         logger.warning(
             "unknown_onchain_source",
             extra={
@@ -734,6 +792,12 @@ class ScannerService:
         self,
         token,
     ):
+
+        # Four.meme is BSC/EVM. Never send its 0x token address to the
+        # Solana/Helius holder enrichment path. Bitquery already supplies
+        # the BSC holder count in the Four.meme snapshot.
+        if token.source == SOURCE_FOURMEME:
+            return token
 
         now = datetime.now(
             timezone.utc
@@ -1213,6 +1277,13 @@ class ScannerService:
                 score_result.score,
             )
 
+            return True
+
+        if token.source == SOURCE_FOURMEME and not settings.fourmeme_trading_enabled:
+            await repo.save_trade_decision(
+                token.mint, rule_row.id, "skip",
+                "Four.meme trading is disabled", score_result.score
+            )
             return True
 
         if (
