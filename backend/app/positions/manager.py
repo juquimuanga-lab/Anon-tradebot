@@ -271,6 +271,10 @@ class PositionManager:
         self,
         position,
     ) -> bool:
+        if position.source == "fourmeme":
+            # BSC positions are reconciled by the Four.meme adapter on sell;
+            # the Solana SPL balance reconciler must never touch an EVM token.
+            return False
         """Reconcile a live position against the actual wallet balance.
 
         Returns:
@@ -553,6 +557,7 @@ class PositionManager:
         if (
             position.mode != "live"
             or not result.tx_signature
+            or position.source == "fourmeme"
         ):
             return None
 
