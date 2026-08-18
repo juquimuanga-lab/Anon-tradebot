@@ -58,8 +58,10 @@ BONDING_CURVE_SEED = b"bonding-curve"
 SOL_LAMPORTS_PER_SOL = 1_000_000_000
 
 # Avoid duplicate bonding-curve reads during rapid qualification passes.
-PUMPFUN_POOL_CACHE_SECONDS = 0.75
+PUMPFUN_POOL_CACHE_SECONDS = 1.25
+PUMPFUN_DECIMALS_CACHE_SECONDS = 900.0
 _pumpfun_pool_cache: dict[str, tuple[float, dict]] = {}
+_pumpfun_decimals_cache: dict[str, tuple[float, int]] = {}
 
 
 # ---------------------------------------------------------------------------
@@ -437,7 +439,16 @@ async def _get_token_decimals(
     client: AsyncClient,
     mint_pubkey: Pubkey,
 ) -> int:
-    """Read SPL token decimals."""
+    """Read and cache SPL token decimals.
+
+    Token decimals are immutable for a mint, so repeatedly asking Helius for
+    them during rapid Pump.fun qualification passes is unnecessary RPC load.
+    """
+    mint = str(mint_pubkey)
+    now = asyncio.get_running_loop().time()
+    cached = _pumpfun_decimals_cache.get(mint)
+    if cached and (now - cached[0]) < PUMPFUN_DECIMALS_CACHE_SECONDS:
+        return cached[1]
 
     response = (
         await client.get_token_supply(
@@ -463,6 +474,7 @@ async def _get_token_decimals(
             f"invalid token decimals: {decimals}"
         )
 
+    _pumpfun_decimals_cache[mint] = (now, decimals)
     return decimals
 
 
