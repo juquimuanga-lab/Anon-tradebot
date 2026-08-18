@@ -17,3 +17,4 @@ solders
 solana
 base58
 websockets>=15,<16
+web3>=7,<8
