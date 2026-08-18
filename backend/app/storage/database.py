@@ -258,6 +258,21 @@ def _migrate_add_missing_columns(
                 )
             )
 
+        if (
+            "fourmeme_trading_enabled"
+            not in existing_bot_state_columns
+        ):
+
+            conn.execute(
+                text(
+                    """
+                    ALTER TABLE bot_state
+                    ADD COLUMN fourmeme_trading_enabled BOOLEAN
+                    DEFAULT 0
+                    """
+                )
+            )
+
 
 @asynccontextmanager
 async def async_session_scope(
