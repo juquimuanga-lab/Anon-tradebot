@@ -35,6 +35,7 @@ def build_application() -> Application:
     application.add_handler(CommandHandler("paper", handlers_admin.paper_cmd))
     application.add_handler(CommandHandler("live", handlers_admin.live_cmd))
     application.add_handler(CommandHandler("disconnectwallet", handlers_wallet.disconnectwallet_cmd))
+    application.add_handler(CommandHandler("disconnectbscwallet", handlers_wallet.disconnectbscwallet_cmd))
 
     connect_conv = ConversationHandler(
         entry_points=[CommandHandler("connect", handlers_admin.connect_start)],
@@ -47,6 +48,18 @@ def build_application() -> Application:
         name="connect_conversation",
     )
     application.add_handler(connect_conv)
+
+    connectbscwallet_conv = ConversationHandler(
+        entry_points=[CommandHandler("connectbscwallet", handlers_wallet.connectbscwallet_start)],
+        states={
+            handlers_wallet.BSC_CONNECT_WALLET_WAITING: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND | filters.Regex("^/cancel$"), handlers_wallet.connectbscwallet_receive)
+            ]
+        },
+        fallbacks=[CommandHandler("cancel", handlers_wallet.connectbscwallet_receive)],
+        name="connect_bsc_wallet_conversation",
+    )
+    application.add_handler(connectbscwallet_conv)
 
     connectwallet_conv = ConversationHandler(
         entry_points=[CommandHandler("connectwallet", handlers_wallet.connectwallet_start)],
