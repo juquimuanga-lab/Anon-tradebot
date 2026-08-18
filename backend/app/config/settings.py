@@ -192,7 +192,7 @@ class Settings(BaseSettings):
 
     # Live entry strategy. A candidate must score at least this much
     # after hard filters before it can reach the BUY path.
-    qualify_score_threshold: float = 65.0
+    qualify_score_threshold: float = 52.0
 
     # Fast Pump.fun polling is intentionally separate from the slower
     # Anoncoin API scan interval.
