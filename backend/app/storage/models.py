@@ -500,6 +500,11 @@ class BotState(Base):
         default=True,
     )
 
+    fourmeme_trading_enabled: Mapped[bool] = mapped_column(
+        Boolean,
+        default=False,
+    )
+
     paper_balance_sol: Mapped[float] = mapped_column(
         Float,
         default=10.0,
