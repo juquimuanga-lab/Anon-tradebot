@@ -28,11 +28,6 @@ import time
 from datetime import datetime, timedelta, timezone
 
 from app.config.settings import settings
-from app.connectors.solana_tracker import (
-    SolanaTrackerClient,
-    SmartMoneySignal,
-)
-
 from app.connectors.anoncoin import (
     AnoncoinAPIError,
     AnoncoinClient,
@@ -150,11 +145,6 @@ class ScannerService:
         self._anoncoin = anoncoin
         self._holders_client = holders_client
         self._execution_router = execution_router
-
-        # Phase 1 smart-money telemetry. This is intentionally read-only
-        # and is queried only after the existing qualification threshold
-        # is passed. It never gates the existing trade decision.
-        self._smart_money = SolanaTrackerClient()
 
         self._watermarks = (
             onchain_watcher.WatermarkStore()
@@ -956,84 +946,6 @@ class ScannerService:
         )
 
         return status, score, reasons, breakdown
-
-    # ------------------------------------------------------------------
-    # Phase 1 smart-money telemetry
-    # ------------------------------------------------------------------
-
-    async def _get_smart_money_signal(
-        self,
-        token,
-        first_seen: datetime | None = None,
-    ) -> SmartMoneySignal:
-        """Inspect tracked-wallet activity for an already-qualified token.
-
-        This is deliberately called AFTER hard filters and the qualification
-        score pass. A failure here returns an empty signal and never changes
-        the existing trading path.
-        """
-        if token.source != SOURCE_PUMPFUN:
-            return SmartMoneySignal(detected=False)
-
-        if not settings.smart_money_enabled:
-            return SmartMoneySignal(detected=False)
-
-        if not self._smart_money.enabled:
-            logger.info(
-                "smart_money_disabled_or_unconfigured",
-                extra={"mint": token.mint},
-            )
-            return SmartMoneySignal(detected=False)
-
-        observed_at = (
-            first_seen
-            or getattr(token, "created_on", None)
-            or datetime.now(timezone.utc)
-        )
-
-        try:
-            signal = await self._smart_money.find_smart_money(
-                token.mint,
-                first_seen_timestamp=observed_at.timestamp(),
-            )
-        except Exception as exc:
-            logger.exception(
-                "smart_money_check_failed",
-                extra={
-                    "mint": token.mint,
-                    "error": str(exc),
-                },
-            )
-            return SmartMoneySignal(detected=False)
-
-        if signal.detected:
-            logger.info(
-                "smart_money_signal_detected",
-                extra={
-                    "mint": token.mint,
-                    "score": signal.score,
-                    "wallet_count": signal.wallet_count,
-                    "wallets": [
-                        trade.wallet
-                        for trade in signal.trades[:5]
-                    ],
-                    "buys_usd": [
-                        trade.amount_usd
-                        for trade in signal.trades[:5]
-                    ],
-                    "latencies_seconds": [
-                        trade.seconds_after_seen
-                        for trade in signal.trades[:5]
-                    ],
-                },
-            )
-        else:
-            logger.info(
-                "smart_money_no_signal",
-                extra={"mint": token.mint},
-            )
-
-        return signal
 
     # ------------------------------------------------------------------
     # Pump.fun pre-buy revalidation
@@ -1976,16 +1888,10 @@ class ScannerService:
 
             return False
 
-        # Pump.fun candidates just below the final threshold can still be
-        # worth a smart-money confirmation. Other sources retain the normal
-        # immediate score rejection.
-        if (
-            score_result.score < settings.qualify_score_threshold
-            and (
-                token.source != SOURCE_PUMPFUN
-                or score_result.score < settings.smart_money_probe_score
-            )
-        ):
+        # The final qualification threshold is authoritative.
+        # Smart-money confirmation is currently disabled, so a candidate
+        # below the configured score threshold must not proceed to trading.
+        if score_result.score < settings.qualify_score_threshold:
             logger.info(
                 "rule_rejected_score",
                 extra={
@@ -2038,41 +1944,15 @@ class ScannerService:
         )
 
         # --------------------------------------------------------------
-        # Smart-money confirmation
+        # Smart-money filter DISABLED
         # --------------------------------------------------------------
-        # Probe only promising Pump.fun candidates. A detected tracked-wallet
-        # buy adds a bonus; no signal or provider failure is neutral.
-        smart_money_signal = SmartMoneySignal(detected=False)
-        if (
-            token.source == SOURCE_PUMPFUN
-            and score_result.score >= settings.smart_money_probe_score
-        ):
-            smart_money_signal = await self._get_smart_money_signal(
-                token,
-                first_seen=token.created_on,
-            )
-            if smart_money_signal.detected:
-                bonus = min(
-                    settings.smart_money_score_bonus,
-                    max(0.0, smart_money_signal.score / 10.0),
-                )
-                score_result.score = min(100.0, round(score_result.score + bonus, 2))
-                score_result.breakdown["smart_money_bonus"] = round(bonus, 2)
-
-        if score_result.score < settings.qualify_score_threshold:
-            logger.info(
-                "rule_rejected_score_after_smart_money",
-                extra={
-                    "mint": token.mint,
-                    "rule_id": rule.id,
-                    "score": score_result.score,
-                    "threshold": settings.qualify_score_threshold,
-                    "smart_money_detected": smart_money_signal.detected,
-                },
-            )
-            return False
-
+        # Smart-money addresses have not been configured yet. Do not query
+        # Solana Tracker, do not require a smart-money signal, and do not
+        # modify the score. Once the normal hard filters and score threshold
+        # pass, the token proceeds directly to qualification and trading.
+        # --------------------------------------------------------------
         metrics.tokens_qualified += 1
+
 
         await self._notifier.new_qualified_token(
             rule.created_by,
@@ -2080,34 +1960,6 @@ class ScannerService:
             token.mint,
             score_result.score,
             token.source,
-        )
-
-        if smart_money_signal.detected:
-            try:
-                await self._notifier.smart_money_signal(
-                    rule.created_by,
-                    token.ticker_symbol or token.mint[:8],
-                    token.mint,
-                    smart_money_signal.score,
-                    smart_money_signal.wallet_count,
-                    smart_money_signal.trades,
-                )
-            except Exception:
-                logger.exception(
-                    "smart_money_notification_failed",
-                    extra={"mint": token.mint},
-                )
-
-        logger.info(
-            "qualified_token_smart_money_summary",
-            extra={
-                "mint": token.mint,
-                "rule_id": rule.id,
-                "rule_score": score_result.score,
-                "smart_money_detected": smart_money_signal.detected,
-                "smart_money_score": smart_money_signal.score,
-                "smart_money_wallet_count": smart_money_signal.wallet_count,
-            },
         )
 
         return await self._maybe_trade(
