@@ -59,6 +59,11 @@ logger = logging.getLogger(
 # do not treat tiny RPC/token-account differences as an external sale.
 WALLET_RECONCILIATION_TOLERANCE_PCT = 0.5
 
+# Flag stop-loss fills that execute materially worse than the price that
+# triggered the exit. This is diagnostic only: once a transaction is
+# submitted, the manager cannot undo an on-chain fill.
+CATASTROPHIC_STOP_EXECUTION_GAP_PCT = 20.0
+
 
 class PositionManager:
     def __init__(
@@ -912,6 +917,49 @@ class PositionManager:
                     )
                 )
 
+                # ------------------------------------------------------
+                # Catastrophic execution diagnostic.
+                #
+                # The stop is triggered from the live price feed, but the
+                # blockchain fill can be materially worse because of rapid
+                # price movement, liquidity loss, or execution/quote issues.
+                # Do not silently treat that as an ordinary stop. Record the
+                # exact gap so we can distinguish a bad trigger from a bad
+                # execution. We deliberately do NOT attempt a second sell or
+                # alter the already-confirmed transaction here.
+                # ------------------------------------------------------
+                if actual_execution:
+                    trigger_vs_execution_pct = actual_execution.get(
+                        "trigger_vs_execution_pct"
+                    )
+                    if (
+                        reason.startswith("defensive stop")
+                        or reason.startswith("hard stop")
+                        or reason == "stop loss hit"
+                    ) and (
+                        trigger_vs_execution_pct is not None
+                        and trigger_vs_execution_pct
+                        <= -CATASTROPHIC_STOP_EXECUTION_GAP_PCT
+                    ):
+                        logger.error(
+                            "catastrophic_stop_execution_gap",
+                            extra={
+                                "mint": token.mint,
+                                "position_id": position.id,
+                                "reason": reason,
+                                "entry_price_usd": position.entry_price_usd,
+                                "trigger_price_usd": current_price,
+                                "actual_execution_price_usd": actual_execution.get(
+                                    "actual_execution_price_usd"
+                                ),
+                                "trigger_vs_execution_pct": trigger_vs_execution_pct,
+                                "gap_threshold_pct": CATASTROPHIC_STOP_EXECUTION_GAP_PCT,
+                                "tokens_sold": actual_execution.get("tokens_sold"),
+                                "sol_received": actual_execution.get("sol_received"),
+                                "tx_signature": result.tx_signature,
+                            },
+                        )
+
             # ----------------------------------------------------------
             # Determine exit price.
             # ----------------------------------------------------------
@@ -1618,7 +1666,7 @@ class PositionManager:
             sell_success = await self._close_position(
                 position, token, current_price,
                 settings.defensive_stop_sell_pct,
-                "defensive stop -8% partial",
+                f"defensive stop -{settings.defensive_stop_loss_pct:g}% partial",
                 reconcile_wallet=False,
             )
             if sell_success:
@@ -1641,7 +1689,7 @@ class PositionManager:
             await self._close_position(
                 position, token, current_price,
                 position.remaining_pct,
-                "hard stop -15%",
+                f"hard stop -{settings.hard_stop_loss_pct:g}%",
                 reconcile_wallet=False,
             )
             return
