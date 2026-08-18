@@ -1279,10 +1279,17 @@ class ScannerService:
 
             return True
 
-        if token.source == SOURCE_FOURMEME and not settings.fourmeme_trading_enabled:
+        if (
+            token.source == SOURCE_FOURMEME
+            and (
+                not settings.fourmeme_trading_enabled
+                or not state.fourmeme_trading_enabled
+            )
+        ):
             await repo.save_trade_decision(
                 token.mint, rule_row.id, "skip",
-                "Four.meme trading is disabled", score_result.score
+                "Four.meme trading is disabled (/enablefourmeme to resume)",
+                score_result.score,
             )
             return True
 
