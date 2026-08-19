@@ -35,6 +35,14 @@ const {
 
 const pumpSdkModule = require("@pump-fun/pump-sdk");
 
+let pumpSdkPackageVersion = "unknown";
+try {
+  pumpSdkPackageVersion =
+    require("@pump-fun/pump-sdk/package.json").version || "unknown";
+} catch (_) {
+  // Some package exports block package.json access; keep unknown.
+}
+
 const {
   PumpSdk,
   OnlinePumpSdk,
@@ -640,7 +648,9 @@ async function main() {
 
 
   console.error(
-    `Pump.fun SDK selected: ${sdkInfo.onlineName}`
+    `Pump.fun SDK selected: ${sdkInfo.onlineName}; ` +
+    `instruction=${sdkInfo.instructionName || "unknown"}; ` +
+    `version=${pumpSdkPackageVersion}`
   );
 
 
@@ -657,8 +667,16 @@ async function main() {
     );
   }
 
-  const global =
-    await online.fetchGlobal();
+  let global;
+  try {
+    global = await online.fetchGlobal();
+  } catch (error) {
+    throw new Error(
+      `pumpfun_stage_fetchGlobal_failed: ${
+        error?.message || error
+      }`
+    );
+  }
 
 
   if (!global) {
