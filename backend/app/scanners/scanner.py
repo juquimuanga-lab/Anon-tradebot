@@ -360,18 +360,17 @@ class ScannerService:
 
             metrics.tokens_scanned += 1
 
-            logger.debug(
-                "pumpfun_new_mint_detected",
-                extra={
-                    "mint": mint,
-                    "creator": item.get(
-                        "creator"
-                    ),
-                    "source": SOURCE_PUMPFUN,
-                    "tx_signature": item.get(
-                        "tx_signature"
-                    ),
-                },
+            discovery_log = {
+                "mint": mint,
+                "creator": item.get("creator"),
+                "source": SOURCE_PUMPFUN,
+                "tx_signature": item.get("tx_signature"),
+            }
+            logger.info(
+                "pumpfun_candidate_discovered " + json.dumps(
+                    discovery_log, default=str, separators=(",", ":"), sort_keys=True
+                ),
+                extra=discovery_log,
             )
 
     # ------------------------------------------------------------------
@@ -394,13 +393,34 @@ class ScannerService:
                 "metadata": item,
             }
             metrics.tokens_scanned += 1
-            logger.info("fourmeme_new_token_queued", extra={"mint":mint,"creator":item.get("creator"),"tx_signature":item.get("tx_signature")})
+            queue_log = {
+                "mint": mint,
+                "creator": item.get("creator"),
+                "source": SOURCE_FOURMEME,
+                "tx_signature": item.get("tx_signature"),
+            }
+            logger.info(
+                "fourmeme_candidate_queued " + json.dumps(
+                    queue_log, default=str, separators=(",", ":"), sort_keys=True
+                ),
+                extra=queue_log,
+            )
 
     async def _build_fourmeme_snapshot(self, mint, metadata, first_seen):
         try:
             market = await self._fourmeme.market_snapshot(mint)
         except Exception as exc:
-            logger.info("fourmeme_snapshot_not_ready", extra={"mint":mint,"error":str(exc)})
+            snapshot_log = {
+                "mint": mint,
+                "source": SOURCE_FOURMEME,
+                "error": str(exc),
+            }
+            logger.warning(
+                "fourmeme_snapshot_not_ready " + json.dumps(
+                    snapshot_log, default=str, separators=(",", ":"), sort_keys=True
+                ),
+                extra=snapshot_log,
+            )
             return None
         if market["price_usd"] <= 0:
             return None
@@ -1994,45 +2014,43 @@ class ScannerService:
         # Smart-money confirmation is currently disabled, so a candidate
         # below the configured score threshold must not proceed to trading.
         if score_result.score < rule_params.qualify_score_threshold:
-            logger.info(
-                "rule_rejected_score",
-                extra={
-                    "mint": token.mint,
-                    "rule_id": rule.id,
-                    "source": token.source,
-                    "score": score_result.score,
-                    "threshold": rule_params.qualify_score_threshold,
-                    "market_cap_usd": getattr(token, "market_cap_usd", 0.0),
-                    "liquidity_usd": getattr(token, "liquidity_usd", 0.0),
-                    "holders": getattr(token, "holders", None),
-                    "age_seconds": getattr(token, "age_seconds", 0.0),
-                    "breakdown": score_result.breakdown,
-                },
-            )
-            return False
-
-        logger.info(
-            "rule_passed",
-            extra={
+            score_rejection = {
                 "mint": token.mint,
                 "rule_id": rule.id,
                 "source": token.source,
                 "score": score_result.score,
                 "threshold": rule_params.qualify_score_threshold,
-                "market_cap_usd": getattr(
-                    token, "market_cap_usd", 0.0
-                ),
-                "liquidity_usd": getattr(
-                    token, "liquidity_usd", 0.0
-                ),
-                "holders": getattr(
-                    token, "holders", None
-                ),
-                "age_seconds": getattr(
-                    token, "age_seconds", 0.0
-                ),
+                "market_cap_usd": getattr(token, "market_cap_usd", 0.0),
+                "liquidity_usd": getattr(token, "liquidity_usd", 0.0),
+                "holders": getattr(token, "holders", None),
+                "age_seconds": getattr(token, "age_seconds", 0.0),
                 "breakdown": score_result.breakdown,
-            },
+            }
+            logger.info(
+                "rule_rejected_score " + json.dumps(
+                    score_rejection, default=str, separators=(",", ":"), sort_keys=True
+                ),
+                extra=score_rejection,
+            )
+            return False
+
+        passed_log = {
+            "mint": token.mint,
+            "rule_id": rule.id,
+            "source": token.source,
+            "score": score_result.score,
+            "threshold": rule_params.qualify_score_threshold,
+            "market_cap_usd": getattr(token, "market_cap_usd", 0.0),
+            "liquidity_usd": getattr(token, "liquidity_usd", 0.0),
+            "holders": getattr(token, "holders", None),
+            "age_seconds": getattr(token, "age_seconds", 0.0),
+            "breakdown": score_result.breakdown,
+        }
+        logger.info(
+            "rule_passed " + json.dumps(
+                passed_log, default=str, separators=(",", ":"), sort_keys=True
+            ),
+            extra=passed_log,
         )
 
         logger.info(
@@ -2062,6 +2080,21 @@ class ScannerService:
             token.mint,
             score_result.score,
             token.source,
+        )
+
+        execution_log = {
+            "mint": token.mint,
+            "rule_id": rule.id,
+            "source": token.source,
+            "score": score_result.score,
+            "threshold": rule_params.qualify_score_threshold,
+            "action": "buy_dispatch",
+        }
+        logger.info(
+            "qualified_buy_dispatch " + json.dumps(
+                execution_log, default=str, separators=(",", ":"), sort_keys=True
+            ),
+            extra=execution_log,
         )
 
         return await self._maybe_trade(
