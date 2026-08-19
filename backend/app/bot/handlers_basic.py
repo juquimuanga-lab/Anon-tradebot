@@ -21,18 +21,15 @@ HELP_TEXT = (
     "/connect - register your Anoncoin API key\n"
     "/connectwallet - register a wallet for live on-chain trading (base58 or JSON key)\n"
     "/disconnectwallet - remove your stored wallet key (confirm)\n"
-    "/setrule - create a rule set step by step\n"
-    "/activaterule <id> - switch which of your own rules is active (see /listrules for IDs)\n"
+    "/setrule - create a SOLANA rule set (Anoncoin + Pump.fun)\n"
+    "/setrulefourmeme - create a separate FOUR.MEME / BSC rule set\n"
+    "/activaterule <id> - activate a rule; activation is isolated by platform\n"
     "/enable - resume automated trading\n"
     "/disable - pause automated trading (confirm)\n"
     "/enableanoncoin - resume Anoncoin trading only\n"
     "/disableanoncoin - pause Anoncoin trading only (confirm)\n"
     "/enablepumpfun - resume Pump.fun trading only\n"
     "/disablepumpfun - pause Pump.fun trading only (confirm)\n"
-    "/enablefourmeme - resume Four.meme/BSC trading only\n"
-    "/disablefourmeme - pause Four.meme/BSC trading only (confirm)\n"
-    "/connectbscwallet - register a BSC/EVM wallet for Four.meme live trading\n"
-    "/disconnectbscwallet - remove your stored BSC wallet (confirm)\n"
     "/paper - switch to paper mode (confirm)\n"
     "/live - switch to live mode (confirm)\n"
     "\nEach admin's rules run independently - activating or editing your rule "
@@ -55,7 +52,8 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 async def status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     state = await repo.get_or_create_bot_state()
-    active_rule = await repo.get_active_rule_for(update.effective_user.id)
+    active_rule = await repo.get_active_rule_for(update.effective_user.id, "solana")
+    fourmeme_rule = await repo.get_active_rule_for(update.effective_user.id, "fourmeme")
     positions = await repo.get_open_positions()
     orders = await repo.get_recent_orders(3)
 
@@ -65,10 +63,9 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
     wallet_key = await secrets_manager.get_wallet_private_key(update.effective_user.id)
     wallet_line = "connected (use /balance to check funds)" if wallet_key else "not connected (use /connectwallet for live trading)"
-    bsc_wallet_key = await secrets_manager.get_bsc_wallet_private_key(update.effective_user.id)
-    bsc_wallet_line = "connected" if bsc_wallet_key else "not connected (use /connectbscwallet)"
 
     rule_line = f"`{active_rule.name}` (id {active_rule.id})" if active_rule else "none - use /setrule"
+    fourmeme_rule_line = f"`{fourmeme_rule.name}` (id {fourmeme_rule.id})" if fourmeme_rule else "none - use /setrulefourmeme"
     recent_lines = "\n".join(
         f"  - {o.side} {o.mint[:6]}... [{o.status}]" for o in orders
     ) or "  - none yet"
@@ -77,11 +74,11 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         f"*Mode:* {state.mode} | *Trading enabled:* {state.trading_enabled}\n"
         f"*Anoncoin trading:* {state.anoncoin_trading_enabled} | "
         f"*Pump.fun trading:* {state.pumpfun_trading_enabled} | "
-        f"*Four.meme trading:* {state.fourmeme_trading_enabled}\n"
-        f"*Your active rule:* {rule_line}\n"
+        f"*Four.meme trading:* {state.fourmeme_trading_enabled and settings.fourmeme_trading_enabled}\n"
+        f"*Solana rule:* {rule_line}\n"
+        f"*Four.meme rule:* {fourmeme_rule_line}\n"
         f"*Connected APIs:* Anoncoin: {anoncoin_connected}, Helius: {helius_connected}\n"
-        f"*Your Solana wallet:* {wallet_line}\n"
-        f"*Your BSC wallet:* {bsc_wallet_line}\n"
+        f"*Your wallet:* {wallet_line}\n"
         f"*Paper balance:* {state.paper_balance_sol:.3f} SOL\n"
         f"*Open positions:* {len(positions)}\n"
         f"*Recent trades:*\n{recent_lines}"
@@ -90,31 +87,26 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def rules(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    active_rule = await repo.get_active_rule_for(update.effective_user.id)
-    if not active_rule:
-        await update.message.reply_text("No active rule set yet. Use /setrule to create one.")
-        return
+    sol_rule = await repo.get_active_rule_for(update.effective_user.id, "solana")
+    fm_rule = await repo.get_active_rule_for(update.effective_user.id, "fourmeme")
     from app.storage.repository import rule_row_to_params
 
-    p = rule_row_to_params(active_rule)
-    text = (
-        f"*Your active rule: {p.name}* (id {active_rule.id})\n"
-        f"Max buy: {p.max_buy_size_sol} SOL\n"
-        f"Min liquidity: ${p.min_liquidity_usd:,.0f}\n"
-        f"Min holders: {p.min_holders}\n"
-        f"Max age: {p.max_age_seconds}s\n"
-        f"Creator allowlist: {p.creator_allowlist or 'none'}\n"
-        f"Creator denylist: {p.creator_denylist or 'none'}\n"
-        f"Bonding curve phase: {p.bonding_curve_phase}\n"
-        f"Market cap range: {p.min_market_cap_usd or 0} - {p.max_market_cap_usd or '∞'}\n"
-        f"Max slippage: {p.max_slippage_pct}%\n"
-        f"Max trades/hr: {p.max_trades_per_hour} | Cooldown: {p.cooldown_seconds}s\n"
-        f"Take profit: {[(l.gain_pct, l.sell_pct) for l in p.take_profit_levels] or 'none'}\n"
-        f"Stop loss: {p.stop_loss_pct}% | Trailing stop: {p.trailing_stop_pct or 'none'}\n"
-        f"Sell on volume drop: {p.sell_on_volume_drop_pct or 'none'}\n"
-        f"Time-based exit: {p.time_based_exit_seconds or 'none'}"
+    def render(rule, label):
+        if not rule:
+            return f"*{label}:* none"
+        p = rule_row_to_params(rule)
+        buy = p.max_buy_size_bnb if p.platform == "fourmeme" else p.max_buy_size_sol
+        unit = "BNB" if p.platform == "fourmeme" else "SOL"
+        return (
+            f"*{label}: {p.name}* (id {rule.id})\n"
+            f"Max buy: {buy} {unit} | Min liquidity: ${p.min_liquidity_usd:,.0f} | Holders: {p.min_holders} | Age: {p.max_age_seconds}s\n"
+            f"Market cap: ${p.min_market_cap_usd or 0:,.0f} - ${p.max_market_cap_usd or 0:,.0f} | Score: {p.qualify_score_threshold} | SL: {p.stop_loss_pct}% | Trail: {p.trailing_stop_pct or 'none'}"
+        )
+
+    await update.message.reply_text(
+        render(sol_rule, "SOLANA (Anoncoin + Pump.fun)") + "\n\n" + render(fm_rule, "FOUR.MEME / BSC"),
+        parse_mode="Markdown",
     )
-    await update.message.reply_text(text, parse_mode="Markdown")
 
 
 async def listrules(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -122,7 +114,7 @@ async def listrules(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not my_rules:
         await update.message.reply_text("You haven't saved any rule sets yet. Use /setrule to create one.")
         return
-    lines = [f"- {'[ACTIVE] ' if r.is_active else ''}{r.name} (id {r.id})" for r in my_rules]
+    lines = [f"- {'[ACTIVE] ' if r.is_active else ''}{r.name} (id {r.id}) [{getattr(r, 'platform', 'solana')}]" for r in my_rules]
     await update.message.reply_text(
         "*Your saved rule sets:*\n" + "\n".join(lines) + "\n\nSwitch with `/activaterule <id>`.",
         parse_mode="Markdown",
