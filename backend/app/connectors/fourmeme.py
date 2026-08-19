@@ -4,6 +4,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import re
 import time
 from collections import deque
 from datetime import datetime, timezone
@@ -203,6 +204,23 @@ class FourMemeClient:
                                   .get("EVM", {}).get("Events", []))
                         self._events_received += len(events)
                         for event in events:
+                            logger.info(
+                                "fourmeme_raw_event_received " + json.dumps(
+                                    {
+                                        "argument_names": [
+                                            str(arg.get("Name") or "")
+                                            for arg in (event.get("Arguments", []) or [])
+                                            if isinstance(arg, dict)
+                                        ],
+                                        "tx_hash": (event.get("Transaction") or {}).get("Hash"),
+                                        "tx_from": (event.get("Transaction") or {}).get("From"),
+                                        "tx_to": (event.get("Transaction") or {}).get("To"),
+                                    },
+                                    default=str,
+                                    separators=(",", ":"),
+                                    sort_keys=True,
+                                )
+                            )
                             item = self._normalize_event(event)
                             if item:
                                 tx = item.get("tx_hash", "")
@@ -254,36 +272,142 @@ class FourMemeClient:
                 return value[key]
         return None
 
+    @staticmethod
+    def _is_evm_address(value: Any) -> bool:
+        return isinstance(value, str) and bool(
+            re.fullmatch(r"0x[a-fA-F0-9]{40}", value)
+        )
+
     def _normalize_event(self, event: dict) -> Optional[dict]:
-        args = {}
-        for arg in event.get("Arguments", []) or []:
-            name = str(arg.get("Name") or "").lower()
-            args[name] = self._value(arg.get("Value") or {})
-        token = (args.get("token") or args.get("tokenaddress") or args.get("base") or args.get("meme"))
-        if not isinstance(token, str) or not token.startswith("0x") or token.lower() == FOURMEME_PROXY:
-            # If Bitquery changes argument labels, keep an address candidate
-            # that is not the known Four.meme proxy.
-            for value in args.values():
-                if isinstance(value, str) and value.startswith("0x") and value.lower() != FOURMEME_PROXY:
-                    token = value
-                    break
-        if not token:
-            return None
+        """Normalize a Bitquery Four.meme TokenCreate event safely.
+
+        Prefer documented semantic argument names, then conservatively fall
+        back to an address candidate that is not the Four.meme proxy, creator,
+        sender, or destination. Diagnostic logs expose argument names and
+        transaction metadata, never the API token.
+        """
+        arguments = event.get("Arguments", []) or []
+        args: dict[str, Any] = {}
+        named_values: list[tuple[str, Any]] = []
+
+        for arg in arguments:
+            if not isinstance(arg, dict):
+                continue
+            name = str(arg.get("Name") or "").strip().lower()
+            value = self._value(arg.get("Value") or {})
+            named_values.append((name, value))
+            if name:
+                args[name] = value
+
         tx = event.get("Transaction") or {}
-        creator = args.get("creator") or args.get("owner") or tx.get("From")
-        launch_time = args.get("launchtime") or args.get("launch_time")
+        tx_from = tx.get("From")
+        tx_to = tx.get("To")
+
+        token = None
+        semantic_keys = (
+            "token", "tokenaddress", "token_address", "tokencontract",
+            "token_contract", "smartcontract", "contract", "meme", "base",
+        )
+        for key in semantic_keys:
+            candidate = args.get(key)
+            if self._is_evm_address(candidate) and candidate.lower() != FOURMEME_PROXY:
+                token = candidate
+                break
+
+        creator = (
+            args.get("creator")
+            or args.get("owner")
+            or args.get("deployer")
+            or args.get("user")
+            or tx_from
+            or ""
+        )
+
+        if token is None:
+            excluded = {
+                FOURMEME_PROXY.lower(),
+                str(creator).lower() if self._is_evm_address(creator) else "",
+                str(tx_from).lower() if self._is_evm_address(tx_from) else "",
+                str(tx_to).lower() if self._is_evm_address(tx_to) else "",
+            }
+            candidates = [
+                value for _, value in named_values
+                if self._is_evm_address(value) and value.lower() not in excluded
+            ]
+            if candidates:
+                token = candidates[0]
+
+        if token is None:
+            logger.warning(
+                "fourmeme_event_normalization_failed " + json.dumps(
+                    {
+                        "reason": "no_token_address_found",
+                        "argument_names": [name for name, _ in named_values],
+                        "address_candidates": [
+                            value for _, value in named_values
+                            if self._is_evm_address(value)
+                        ],
+                        "tx_hash": tx.get("Hash"),
+                        "tx_from": tx_from,
+                        "tx_to": tx_to,
+                        "events_received": self._events_received,
+                    },
+                    default=str,
+                    separators=(",", ":"),
+                    sort_keys=True,
+                )
+            )
+            return None
+
+        token_source = next(
+            (
+                name for name, value in named_values
+                if value == token and name in semantic_keys
+            ),
+            "address_fallback",
+        )
+        logger.info(
+            "fourmeme_event_normalized " + json.dumps(
+                {
+                    "token": token,
+                    "token_source": token_source,
+                    "creator": creator,
+                    "argument_names": [name for name, _ in named_values],
+                    "tx_hash": tx.get("Hash"),
+                },
+                default=str,
+                separators=(",", ":"),
+                sort_keys=True,
+            )
+        )
+
+        launch_time = (
+            args.get("launchtime")
+            or args.get("launch_time")
+            or args.get("launch")
+        )
         created = datetime.now(timezone.utc)
         if isinstance(launch_time, (int, float, str)):
             try:
                 created = datetime.fromtimestamp(float(launch_time), tz=timezone.utc)
             except Exception:
                 pass
+
         return {
             "mint": token,
             "creator": creator or "",
-            "ticker_name": args.get("name") or "",
-            "ticker_symbol": args.get("symbol") or args.get("shortname") or "",
-            "total_supply": args.get("totalsupply") or 1000000000,
+            "ticker_name": args.get("name") or args.get("tokenname") or "",
+            "ticker_symbol": (
+                args.get("symbol")
+                or args.get("shortname")
+                or args.get("tokensymbol")
+                or ""
+            ),
+            "total_supply": (
+                args.get("totalsupply")
+                or args.get("total_supply")
+                or 1000000000
+            ),
             "created_on": created,
             "tx_signature": tx.get("Hash"),
             "raw": event,
