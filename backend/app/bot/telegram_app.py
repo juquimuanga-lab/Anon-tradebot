@@ -9,7 +9,7 @@ from telegram.ext import (
 )
 
 from app.bot import handlers_admin, handlers_basic, handlers_wallet
-from app.bot.setrule_wizard import COLLECTING, setrule_collect, setrule_start
+from app.bot.setrule_wizard import COLLECTING, setrule_collect, setrule_start, setrule_fourmeme_start
 from app.config.settings import settings
 
 
@@ -106,6 +106,18 @@ def build_application() -> Application:
         name="rent_recovery_conversation",
     )
     application.add_handler(rent_recovery_conv)
+
+    setrule_fourmeme_conv = ConversationHandler(
+        entry_points=[CommandHandler("setrulefourmeme", setrule_fourmeme_start)],
+        states={
+            COLLECTING: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND | filters.Regex("^/(skip|cancel)$"), setrule_collect)
+            ]
+        },
+        fallbacks=[CommandHandler("cancel", setrule_collect)],
+        name="setrule_fourmeme_conversation",
+    )
+    application.add_handler(setrule_fourmeme_conv)
 
     setrule_conv = ConversationHandler(
         entry_points=[CommandHandler("setrule", setrule_start)],
