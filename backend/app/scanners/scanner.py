@@ -1569,7 +1569,7 @@ class ScannerService:
             )
 
             amount_tokens = None
-            actual_amount_sol = amount_sol
+            actual_amount_sol = amount_native
 
             if (
                 token.source == SOURCE_PUMPFUN
@@ -1647,7 +1647,7 @@ class ScannerService:
                             extra={
                                 "mint": token.mint,
                                 "tx_signature": result.tx_signature,
-                                "requested_amount_sol": amount_sol,
+                                "requested_amount_sol": amount_native,
                                 "actual_amount_sol": actual_amount_sol,
                                 "actual_amount_tokens": amount_tokens,
                                 "actual_fill_price_usd": fill_price,
@@ -1685,7 +1685,7 @@ class ScannerService:
                     return False
 
                 amount_tokens = (
-                    amount_sol
+                    amount_native
                     * sol_price
                     / max(
                         fill_price,
