@@ -1,8 +1,7 @@
-"""Step-by-step /setrule wizard. A small generic engine avoids repeating
-near-identical handler code for each of the ~18 rule parameters."""
+"""Platform-scoped /setrule wizards for Solana and Four.meme."""
 import logging
 from dataclasses import dataclass
-from typing import Any, Callable, Optional
+from typing import Any, Callable
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import ContextTypes, ConversationHandler, MessageHandler, filters
@@ -11,12 +10,9 @@ from app.bot.confirmations import confirmation_store
 from app.bot.validation import parse_float, parse_int, parse_wallet_list, sanitize_text
 from app.scoring.rules import RuleParams, TakeProfitLevel
 from app.security.allowlist import admin_required
-from app.storage import repository as repo
 
 logger = logging.getLogger("app.bot.setrule")
-
 COLLECTING = 1
-
 
 @dataclass
 class Step:
@@ -45,33 +41,50 @@ def _parse_take_profit(raw: str) -> list[TakeProfitLevel]:
     return levels
 
 
-STEPS = [
-    Step("name", "Step 1/18 - Name this rule set (e.g. `sniper-default`):", sanitize_text, default="default"),
-    Step("max_buy_size_sol", "Step 2/18 - Max buy size per trade, in SOL (e.g. `0.1`):", lambda r: parse_float(r, 0.001, 1000)),
-    Step("min_liquidity_usd", "Step 3/18 - Minimum liquidity in USD (e.g. `1000`):", lambda r: parse_float(r, 0, 1e9)),
-    Step("min_holders", "Step 4/18 - Minimum holder count (e.g. `10`):", lambda r: parse_int(r, 0, 1_000_000)),
-    Step("max_age_seconds", "Step 5/18 - Max token age since creation, in seconds (e.g. `600`):", lambda r: parse_int(r, 1, 86400 * 30)),
-    Step("creator_allowlist", "Step 6/18 - Creator wallet ALLOWLIST, comma separated, or /skip for none:", parse_wallet_list, default=[], optional=True),
-    Step("creator_denylist", "Step 7/18 - Creator wallet DENYLIST, comma separated, or /skip for none:", parse_wallet_list, default=[], optional=True),
-    Step("bonding_curve_phase", "Step 8/18 - Bonding curve phase requirement: `any`, `pre_graduation` or `post_graduation`:", _parse_phase, default="any"),
-    Step("min_market_cap_usd", "Step 9/18 - Min market cap in USD, or /skip for none:", lambda r: parse_float(r, 0, 1e12), default=None, optional=True),
-    Step("max_market_cap_usd", "Step 10/18 - Max market cap in USD, or /skip for none:", lambda r: parse_float(r, 0, 1e12), default=None, optional=True),
-    Step("max_slippage_pct", "Step 11/18 - Max slippage percent (e.g. `5`):", lambda r: parse_float(r, 0, 100)),
-    Step("max_trades_per_hour", "Step 12/18 - Max trades per hour (e.g. `5`):", lambda r: parse_int(r, 1, 1000)),
-    Step("cooldown_seconds", "Step 13/18 - Cooldown between buys, in seconds (e.g. `120`):", lambda r: parse_int(r, 0, 86400)),
-    Step("take_profit_levels", "Step 14/18 - Take profit levels as `gain:sell%,gain:sell%` (e.g. `50:50,100:50`), or /skip:", _parse_take_profit, default=[], optional=True),
-    Step("stop_loss_pct", "Step 15/18 - Stop loss percent (e.g. `20`):", lambda r: parse_float(r, 0, 100)),
-    Step("trailing_stop_pct", "Step 16/18 - Trailing stop percent, or /skip for none:", lambda r: parse_float(r, 0, 100), default=None, optional=True),
-    Step("sell_on_volume_drop_pct", "Step 17/18 - Sell on volume drop percent, or /skip for none:", lambda r: parse_float(r, 0, 100), default=None, optional=True),
-    Step("time_based_exit_seconds", "Step 18/18 - Time-based exit, in seconds, or /skip for none:", lambda r: parse_int(r, 1, 86400 * 30), default=None, optional=True),
-]
+def _steps(platform: str) -> list[Step]:
+    buy_key = "max_buy_size_bnb" if platform == "fourmeme" else "max_buy_size_sol"
+    buy_unit = "BNB" if platform == "fourmeme" else "SOL"
+    buy_default = 0.01 if platform == "fourmeme" else 0.1
+    return [
+        Step("name", "Step 1/18 - Name this rule set (e.g. `sniper-default`):", sanitize_text, default="default"),
+        Step(buy_key, f"Step 2/18 - Max buy size per trade, in {buy_unit} (e.g. `0.01`):", lambda r: parse_float(r, 0.000001, 1000), default=buy_default),
+        Step("min_liquidity_usd", "Step 3/18 - Minimum liquidity in USD (e.g. `1000`):", lambda r: parse_float(r, 0, 1e9)),
+        Step("min_holders", "Step 4/18 - Minimum holder count (e.g. `10`):", lambda r: parse_int(r, 0, 1_000_000)),
+        Step("max_age_seconds", "Step 5/18 - Max token age since creation, in seconds (e.g. `600`):", lambda r: parse_int(r, 1, 86400 * 30)),
+        Step("creator_allowlist", "Step 6/18 - Creator wallet ALLOWLIST, comma separated, or /skip for none:", parse_wallet_list, default=[], optional=True),
+        Step("creator_denylist", "Step 7/18 - Creator wallet DENYLIST, comma separated, or /skip for none:", parse_wallet_list, default=[], optional=True),
+        Step("bonding_curve_phase", "Step 8/18 - Bonding curve phase requirement: `any`, `pre_graduation` or `post_graduation`:", _parse_phase, default="any"),
+        Step("min_market_cap_usd", "Step 9/18 - Min market cap in USD, or /skip for none:", lambda r: parse_float(r, 0, 1e12), default=None, optional=True),
+        Step("max_market_cap_usd", "Step 10/18 - Max market cap in USD, or /skip for none:", lambda r: parse_float(r, 0, 1e12), default=None, optional=True),
+        Step("max_slippage_pct", "Step 11/19 - Max slippage percent (e.g. `5`):", lambda r: parse_float(r, 0, 100)),
+        Step("qualify_score_threshold", "Step 12/19 - Minimum qualification score (0-100, e.g. `50`):", lambda r: parse_float(r, 0, 100), default=52.0),
+        Step("max_trades_per_hour", "Step 13/19 - Max trades per hour (e.g. `5`):", lambda r: parse_int(r, 1, 1000)),
+        Step("cooldown_seconds", "Step 14/19 - Cooldown between buys, in seconds (e.g. `120`):", lambda r: parse_int(r, 0, 86400)),
+        Step("take_profit_levels", "Step 15/19 - Take profit levels as `gain:sell%,gain:sell%` (e.g. `50:50,100:50`), or /skip:", _parse_take_profit, default=[], optional=True),
+        Step("stop_loss_pct", "Step 16/19 - Stop loss percent (e.g. `20`):", lambda r: parse_float(r, 0, 100)),
+        Step("trailing_stop_pct", "Step 17/19 - Trailing stop percent, or /skip for none:", lambda r: parse_float(r, 0, 100), default=None, optional=True),
+        Step("sell_on_volume_drop_pct", "Step 18/19 - Sell on volume drop percent, or /skip for none:", lambda r: parse_float(r, 0, 100), default=None, optional=True),
+        Step("time_based_exit_seconds", "Step 19/19 - Time-based exit, in seconds, or /skip for none:", lambda r: parse_int(r, 1, 86400 * 30), default=None, optional=True),
+    ]
 
 
 @admin_required
 async def setrule_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    context.user_data["setrule"] = {"index": 0, "answers": {}}
+    return await _start(update, context, "solana")
+
+
+@admin_required
+async def setrule_fourmeme_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    return await _start(update, context, "fourmeme")
+
+
+async def _start(update: Update, context: ContextTypes.DEFAULT_TYPE, platform: str) -> int:
+    context.user_data["setrule"] = {"index": 0, "answers": {}, "platform": platform}
+    label = "FOUR.MEME / BSC" if platform == "fourmeme" else "SOLANA (Anoncoin + Pump.fun)"
     await update.message.reply_text(
-        "Let's build a new rule set. Send /cancel anytime to stop.\n\n" + STEPS[0].prompt
+        f"Let's build a new *{label}* rule set. Send /cancel anytime to stop.\n\n"
+        + _steps(platform)[0].prompt,
+        parse_mode="Markdown",
     )
     return COLLECTING
 
@@ -81,13 +94,15 @@ async def setrule_collect(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     if not state:
         return ConversationHandler.END
 
+    platform = state.get("platform", "solana")
+    steps = _steps(platform)
     text = (update.message.text or "").strip()
     if text == "/cancel":
         context.user_data.pop("setrule", None)
         await update.message.reply_text("Rule creation cancelled.")
         return ConversationHandler.END
 
-    step = STEPS[state["index"]]
+    step = steps[state["index"]]
     if text == "/skip":
         if not step.optional:
             await update.message.reply_text(f"This field is required.\n\n{step.prompt}")
@@ -101,23 +116,36 @@ async def setrule_collect(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             return COLLECTING
 
     state["index"] += 1
-    if state["index"] >= len(STEPS):
+    if state["index"] >= len(steps):
         return await _finish_wizard(update, context)
 
-    await update.message.reply_text(STEPS[state["index"]].prompt)
+    await update.message.reply_text(steps[state["index"]].prompt)
     return COLLECTING
 
 
 async def _finish_wizard(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    answers = context.user_data.pop("setrule")["answers"]
+    state = context.user_data.pop("setrule")
+    answers = state["answers"]
+    platform = state.get("platform", "solana")
+    answers["platform"] = platform
+    # Ensure the unused currency field remains valid for the shared model/storage.
+    if platform == "fourmeme":
+        answers.setdefault("max_buy_size_sol", 0.1)
+    else:
+        answers.setdefault("max_buy_size_bnb", 0.01)
+
     params = RuleParams(**answers)
     token = confirmation_store.create("save_rule", {"params": params.model_dump(), "user_id": update.effective_user.id})
+    unit = "BNB" if platform == "fourmeme" else "SOL"
+    label = "FOUR.MEME" if platform == "fourmeme" else "SOLANA"
+    buy = params.max_buy_size_bnb if platform == "fourmeme" else params.max_buy_size_sol
     summary = (
-        f"*Rule '{params.name}' ready*\n"
-        f"Max buy: {params.max_buy_size_sol} SOL | Min liq: ${params.min_liquidity_usd:,.0f} | "
+        f"*{label} rule '{params.name}' ready*\n"
+        f"Max buy: {buy} {unit} | Min liq: ${params.min_liquidity_usd:,.0f} | "
         f"Min holders: {params.min_holders} | Max age: {params.max_age_seconds}s\n"
-        f"SL: {params.stop_loss_pct}% | TP levels: {len(params.take_profit_levels)} | "
-        f"Max trades/hr: {params.max_trades_per_hour}\n\nActivate this rule set now?"
+        f"Market cap: ${params.min_market_cap_usd or 0:,.0f} - ${params.max_market_cap_usd:,.0f} | "
+        f"SL: {params.stop_loss_pct}% | TP levels: {len(params.take_profit_levels)}\n\n"
+        f"Activate this *{label}* rule set now?"
     )
     keyboard = InlineKeyboardMarkup(
         [[InlineKeyboardButton("Save & Activate", callback_data=f"confirm:{token}:activate"),
