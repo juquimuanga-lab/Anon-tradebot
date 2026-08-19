@@ -108,6 +108,10 @@ def _migrate_add_missing_columns(
         positions.source
         bot_state.anoncoin_trading_enabled
         bot_state.pumpfun_trading_enabled
+        bot_state.fourmeme_trading_enabled
+        rules.platform
+        rules.max_buy_size_bnb
+        rules.qualify_score_threshold
     """
 
     inspector = inspect(
@@ -205,6 +209,31 @@ def _migrate_add_missing_columns(
                     """
                 )
             )
+
+    # ---------------------------------------------------------------
+    # Rules
+    # ---------------------------------------------------------------
+
+    if "rules" in tables:
+        existing_rule_columns = {
+            column["name"]
+            for column in inspector.get_columns("rules")
+        }
+
+        if "platform" not in existing_rule_columns:
+            conn.execute(text(
+                """ALTER TABLE rules ADD COLUMN platform VARCHAR DEFAULT 'solana'"""
+            ))
+
+        if "max_buy_size_bnb" not in existing_rule_columns:
+            conn.execute(text(
+                """ALTER TABLE rules ADD COLUMN max_buy_size_bnb FLOAT DEFAULT 0.01"""
+            ))
+
+        if "qualify_score_threshold" not in existing_rule_columns:
+            conn.execute(text(
+                """ALTER TABLE rules ADD COLUMN qualify_score_threshold FLOAT DEFAULT 52.0"""
+            ))
 
     # ---------------------------------------------------------------
     # Bot state
