@@ -382,7 +382,6 @@ class ScannerService:
         """Drain Bitquery's Four.meme mempool TokenCreate stream."""
         if not self._fourmeme.enabled:
             return
-        await self._fourmeme.start()
         for item in await self._fourmeme.drain():
             mint = item["mint"]
             if mint in self._pending_watch:
