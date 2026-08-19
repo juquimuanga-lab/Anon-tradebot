@@ -22,6 +22,7 @@ once a token is trading on an AMM.
 """
 
 import logging
+import json
 from typing import Optional
 
 from app.config.settings import settings
@@ -319,6 +320,16 @@ class ExecutionRouter:
 
         if source == SOURCE_FOURMEME:
             if not settings.fourmeme_trading_enabled:
+                block_log = {
+                    "source": SOURCE_FOURMEME,
+                    "reason": "deployment_trading_disabled",
+                }
+                logger.warning(
+                    "fourmeme_execution_blocked " + json.dumps(
+                        block_log, default=str, separators=(",", ":"), sort_keys=True
+                    ),
+                    extra=block_log,
+                )
                 return NoWalletConnectedAdapter(
                     "Four.meme live trading is disabled at deployment level; set FOURMEME_TRADING_ENABLED=true."
                 )
@@ -339,6 +350,18 @@ class ExecutionRouter:
             except InvalidBscWalletKeyError:
                 logger.error("stored_bsc_wallet_key_invalid", extra={"owner_user_id": owner_user_id})
                 return NoWalletConnectedAdapter("Stored BSC wallet is invalid. Reconnect it.")
+            adapter_log = {
+                "source": SOURCE_FOURMEME,
+                "owner_user_id": owner_user_id,
+                "rpc_configured": bool(settings.bsc_rpc_url),
+                "bsc_wallet_connected": True,
+            }
+            logger.info(
+                "fourmeme_execution_adapter_selected " + json.dumps(
+                    adapter_log, default=str, separators=(",", ":"), sort_keys=True
+                ),
+                extra=adapter_log,
+            )
             return FourMemeExecutionAdapter(
                 account=account,
                 rpc_url=settings.bsc_rpc_url,
