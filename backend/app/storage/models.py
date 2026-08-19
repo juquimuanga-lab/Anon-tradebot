@@ -139,6 +139,14 @@ class Rule(Base):
         default="default",
     )
 
+    # Rule scope: existing rules default to Solana so current Anoncoin/Pump.fun
+    # behaviour is preserved. Four.meme rules are isolated to BSC/Four.meme.
+    platform: Mapped[str] = mapped_column(
+        String,
+        default="solana",
+        index=True,
+    )
+
     is_active: Mapped[bool] = mapped_column(
         Boolean,
         default=False,
@@ -147,6 +155,11 @@ class Rule(Base):
     max_buy_size_sol: Mapped[float] = mapped_column(
         Float,
         default=0.1,
+    )
+
+    max_buy_size_bnb: Mapped[float] = mapped_column(
+        Float,
+        default=0.01,
     )
 
     min_liquidity_usd: Mapped[float] = mapped_column(
@@ -192,6 +205,11 @@ class Rule(Base):
     max_slippage_pct: Mapped[float] = mapped_column(
         Float,
         default=5.0,
+    )
+
+    qualify_score_threshold: Mapped[float] = mapped_column(
+        Float,
+        default=52.0,
     )
 
     max_trades_per_hour: Mapped[int] = mapped_column(
