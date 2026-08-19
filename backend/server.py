@@ -13,6 +13,7 @@ from app.bot.telegram_app import build_application
 from app.config.settings import settings
 from app.connectors.anoncoin import AnoncoinClient
 from app.connectors.helius import HeliusClient
+from app.connectors.fourmeme import fourmeme_client
 from app.execution.onchain.jupiter import JupiterClient
 from app.execution.router import ExecutionRouter
 from app.metrics import metrics
@@ -49,6 +50,16 @@ async def lifespan(app: FastAPI):
 
     telegram_app.bot_data["position_manager"] = position_manager
 
+    await fourmeme_client.start()
+    logger.info(
+        "fourmeme_discovery_startup",
+        extra={
+            "bitquery_configured": fourmeme_client.enabled,
+            "trading_enabled": settings.fourmeme_trading_enabled,
+            "mempool": True,
+        },
+    )
+
     _background_tasks.append(asyncio.create_task(scanner_service.run_forever()))
     _background_tasks.append(asyncio.create_task(position_manager.run_forever()))
     _background_tasks.append(asyncio.create_task(scanner_service.daily_summary_loop()))
@@ -60,6 +71,7 @@ async def lifespan(app: FastAPI):
     try:
         yield
     finally:
+        await fourmeme_client.stop()
         for task in _background_tasks:
             task.cancel()
         await telegram_app.updater.stop()
