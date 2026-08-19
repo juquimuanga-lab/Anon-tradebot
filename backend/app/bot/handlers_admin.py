@@ -114,13 +114,12 @@ async def enablepumpfun_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) 
 async def enablefourmeme_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not settings.fourmeme_trading_enabled:
         await update.message.reply_text(
-            "Four.meme trading is not enabled at the deployment level. "
-            "Set FOURMEME_TRADING_ENABLED=true in Railway first, then run /enablefourmeme."
+            "Four.meme is disabled at deployment level. Set FOURMEME_TRADING_ENABLED=true in Railway first, then run /enablefourmeme."
         )
         return
     await repo.update_bot_state(fourmeme_trading_enabled=True)
     await repo.write_audit_log(str(update.effective_user.id), "enable_fourmeme", {})
-    await update.message.reply_text("Four.meme trading resumed. Other networks are unaffected.")
+    await update.message.reply_text("Four.meme trading resumed. Pump.fun and Anoncoin are unaffected.")
 
 
 @admin_required
@@ -131,8 +130,7 @@ async def disablefourmeme_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE
           InlineKeyboardButton("Cancel", callback_data=f"confirm:{token}:no")]]
     )
     await update.message.reply_text(
-        "This pauses new Four.meme buys only. Existing Four.meme positions keep their automated "
-        "exit management. Confirm?",
+        "This pauses new Four.meme buys only. Pump.fun and Anoncoin keep trading, and existing Four.meme positions keep their automated exits. Confirm?",
         reply_markup=keyboard,
     )
 
@@ -211,12 +209,12 @@ async def confirmation_callback(update: Update, context: ContextTypes.DEFAULT_TY
     elif entry.action == "disable_pumpfun":
         await repo.update_bot_state(pumpfun_trading_enabled=False)
         await repo.write_audit_log(str(update.effective_user.id), "disable_pumpfun_confirmed", {})
-        await query.edit_message_text("Pump.fun trading paused. Anoncoin is unaffected.")
+        await query.edit_message_text("Pump.fun trading paused. Anoncoin and Four.meme are unaffected.")
 
     elif entry.action == "disable_fourmeme":
         await repo.update_bot_state(fourmeme_trading_enabled=False)
         await repo.write_audit_log(str(update.effective_user.id), "disable_fourmeme_confirmed", {})
-        await query.edit_message_text("Four.meme trading paused. Other networks are unaffected.")
+        await query.edit_message_text("Four.meme trading paused. Pump.fun and Anoncoin are unaffected.")
 
     elif entry.action == "switch_mode":
         mode = entry.payload["mode"]
