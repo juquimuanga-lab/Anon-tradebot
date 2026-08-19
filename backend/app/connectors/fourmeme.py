@@ -97,25 +97,49 @@ class FourMemeClient:
         self._w3 = Web3(Web3.HTTPProvider(settings.bsc_rpc_url, request_kwargs={"timeout": 2}))
         self._helper = self._w3.eth.contract(address=Web3.to_checksum_address(settings.fourmeme_helper3_address), abi=HELPER_ABI)
         self._stopped = False
+        self._events_received = 0
+        self._tokens_queued = 0
+        self._last_event_at = None
+        self._heartbeat_task: Optional[asyncio.Task] = None
 
     @property
     def enabled(self) -> bool:
         return bool(self.token)
 
     async def start(self) -> None:
-        if not self.enabled or self._task and not self._task.done():
+        if not self.enabled:
+            logger.warning("fourmeme_discovery_not_configured", extra={"bitquery_configured": False})
+            return
+        if self._task and not self._task.done():
             return
         self._stopped = False
+        logger.info("fourmeme_discovery_starting", extra={"bitquery_configured": True, "mempool": True})
         self._task = asyncio.create_task(self._run(), name="fourmeme-bitquery")
+        self._heartbeat_task = asyncio.create_task(self._heartbeat(), name="fourmeme-heartbeat")
 
     async def stop(self) -> None:
         self._stopped = True
-        if self._task:
-            self._task.cancel()
-            try:
-                await self._task
-            except asyncio.CancelledError:
-                pass
+        for task in (self._task, self._heartbeat_task):
+            if task:
+                task.cancel()
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    pass
+        self._task = None
+        self._heartbeat_task = None
+
+    async def _heartbeat(self) -> None:
+        while not self._stopped:
+            await asyncio.sleep(60)
+            logger.info("fourmeme_bitquery_heartbeat", extra={
+                "configured": self.enabled,
+                "connected": bool(self._task and not self._task.done()),
+                "events_received": self._events_received,
+                "tokens_queued": self._tokens_queued,
+                "queue_depth": len(self._queue),
+                "last_event_at": self._last_event_at,
+            })
 
     async def _run(self) -> None:
         delay = 1.0
@@ -151,6 +175,7 @@ class FourMemeClient:
                             continue
                         events = (message.get("payload", {}).get("data", {})
                                   .get("EVM", {}).get("Events", []))
+                        self._events_received += len(events)
                         for event in events:
                             item = self._normalize_event(event)
                             if item:
@@ -160,6 +185,8 @@ class FourMemeClient:
                                 if tx:
                                     self._seen.add(tx)
                                 self._queue.append(item)
+                                self._tokens_queued += 1
+                                self._last_event_at = time.time()
                                 logger.info("fourmeme_token_create_detected", extra={
                                     "token": item.get("mint"),
                                     "creator": item.get("creator"),
