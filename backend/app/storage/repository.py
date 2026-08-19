@@ -87,6 +87,7 @@ async def update_bot_state(
 
 async def get_active_rule_for(
     admin_id: int,
+    platform: str = "solana",
 ) -> Optional[Rule]:
 
     async with async_session_scope() as session:
@@ -97,27 +98,35 @@ async def get_active_rule_for(
                 .where(
                     Rule.is_active.is_(True),
                     Rule.created_by == admin_id,
+                    Rule.platform == platform,
                 )
-                .order_by(
-                    Rule.id.desc()
-                )
+                .order_by(Rule.id.desc())
             )
         ).scalars().first()
 
 
 async def get_all_active_rules() -> list[Rule]:
-    """Return the active rule for every admin who has one."""
-
+    """Return all active rules across platforms."""
     async with async_session_scope() as session:
+        rows = (
+            await session.execute(
+                select(Rule).where(Rule.is_active.is_(True))
+            )
+        ).scalars().all()
+        return list(rows)
 
+
+async def get_active_rules_for_platform(platform: str) -> list[Rule]:
+    """Return active rules scoped to one platform."""
+    async with async_session_scope() as session:
         rows = (
             await session.execute(
                 select(Rule).where(
-                    Rule.is_active.is_(True)
+                    Rule.is_active.is_(True),
+                    Rule.platform == platform,
                 )
             )
         ).scalars().all()
-
         return list(rows)
 
 
@@ -168,6 +177,7 @@ async def activate_rule_for_admin(
             .where(
                 Rule.is_active.is_(True),
                 Rule.created_by == admin_id,
+                Rule.platform == target.platform,
             )
             .values(
                 is_active=False
@@ -645,8 +655,12 @@ def rule_row_to_params(
 
     return RuleParams(
         name=rule.name,
+        platform=getattr(rule, "platform", "solana") or "solana",
         max_buy_size_sol=(
             rule.max_buy_size_sol
+        ),
+        max_buy_size_bnb=(
+            getattr(rule, "max_buy_size_bnb", 0.01) or 0.01
         ),
         min_liquidity_usd=(
             rule.min_liquidity_usd
@@ -674,6 +688,9 @@ def rule_row_to_params(
         ),
         max_slippage_pct=(
             rule.max_slippage_pct
+        ),
+        qualify_score_threshold=(
+            getattr(rule, "qualify_score_threshold", 52.0) or 52.0
         ),
         max_trades_per_hour=(
             rule.max_trades_per_hour
@@ -721,6 +738,7 @@ async def create_rule(
                 .where(
                     Rule.is_active.is_(True),
                     Rule.created_by == created_by,
+                    Rule.platform == params.platform,
                 )
                 .values(
                     is_active=False
@@ -729,9 +747,13 @@ async def create_rule(
 
         rule = Rule(
             name=params.name,
+            platform=params.platform,
             is_active=activate,
             max_buy_size_sol=(
                 params.max_buy_size_sol
+            ),
+            max_buy_size_bnb=(
+                params.max_buy_size_bnb
             ),
             min_liquidity_usd=(
                 params.min_liquidity_usd
@@ -759,6 +781,9 @@ async def create_rule(
             ),
             max_slippage_pct=(
                 params.max_slippage_pct
+            ),
+            qualify_score_threshold=(
+                params.qualify_score_threshold
             ),
             max_trades_per_hour=(
                 params.max_trades_per_hour
