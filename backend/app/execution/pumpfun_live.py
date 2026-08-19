@@ -519,6 +519,8 @@ class PumpFunExecutionAdapter(
                             attempt + 1
                         ),
                         "error": str(exc),
+                        "error_type": type(exc).__name__,
+                        "execution_stage": "build_or_sign_or_broadcast",
                     },
                 )
 
@@ -536,6 +538,8 @@ class PumpFunExecutionAdapter(
                     "pumpfun_buy_unexpected_error",
                     extra={
                         "mint": token.mint,
+                        "error_type": type(exc).__name__,
+                        "execution_stage": "build_or_sign_or_broadcast",
                     },
                 )
 
