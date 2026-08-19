@@ -113,7 +113,17 @@ class FourMemeClient:
         if self._task and not self._task.done():
             return
         self._stopped = False
-        logger.info("fourmeme_discovery_starting", extra={"bitquery_configured": True, "mempool": True})
+        startup_log = {
+            "bitquery_configured": True,
+            "mempool": True,
+            "queue_limit": settings.fourmeme_max_event_queue,
+        }
+        logger.info(
+            "fourmeme_discovery_starting " + json.dumps(
+                startup_log, default=str, separators=(",", ":"), sort_keys=True
+            ),
+            extra=startup_log,
+        )
         self._task = asyncio.create_task(self._run(), name="fourmeme-bitquery")
         self._heartbeat_task = asyncio.create_task(self._heartbeat(), name="fourmeme-heartbeat")
 
@@ -132,14 +142,20 @@ class FourMemeClient:
     async def _heartbeat(self) -> None:
         while not self._stopped:
             await asyncio.sleep(60)
-            logger.info("fourmeme_bitquery_heartbeat", extra={
+            heartbeat_log = {
                 "configured": self.enabled,
                 "connected": bool(self._task and not self._task.done()),
                 "events_received": self._events_received,
                 "tokens_queued": self._tokens_queued,
                 "queue_depth": len(self._queue),
                 "last_event_at": self._last_event_at,
-            })
+            }
+            logger.info(
+                "fourmeme_bitquery_heartbeat " + json.dumps(
+                    heartbeat_log, default=str, separators=(",", ":"), sort_keys=True
+                ),
+                extra=heartbeat_log,
+            )
 
     async def _run(self) -> None:
         delay = 1.0
@@ -164,7 +180,17 @@ class FourMemeClient:
                         "id": "fourmeme-token-create",
                         "payload": {"query": TOKEN_CREATE_QUERY, "variables": {}},
                     }))
-                    logger.info("fourmeme_bitquery_connected", extra={"mempool": True})
+                    connection_log = {
+                        "mempool": True,
+                        "endpoint": FOURMEME_WS,
+                        "factory": FOURMEME_PROXY,
+                    }
+                    logger.info(
+                        "fourmeme_bitquery_connected " + json.dumps(
+                            connection_log, default=str, separators=(",", ":"), sort_keys=True
+                        ),
+                        extra=connection_log,
+                    )
                     delay = 1.0
                     while not self._stopped:
                         raw = await ws.recv()
@@ -187,16 +213,35 @@ class FourMemeClient:
                                 self._queue.append(item)
                                 self._tokens_queued += 1
                                 self._last_event_at = time.time()
-                                logger.info("fourmeme_token_create_detected", extra={
+                                detection_log = {
                                     "token": item.get("mint"),
                                     "creator": item.get("creator"),
                                     "tx_hash": tx,
                                     "mempool": True,
-                                })
+                                    "events_received": self._events_received,
+                                    "queue_depth": len(self._queue),
+                                }
+                                logger.info(
+                                    "fourmeme_token_create_detected " + json.dumps(
+                                        detection_log, default=str, separators=(",", ":"), sort_keys=True
+                                    ),
+                                    extra=detection_log,
+                                )
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
-                logger.warning("fourmeme_bitquery_stream_error", extra={"error": str(exc), "retry_seconds": delay})
+                error_log = {
+                    "error": str(exc),
+                    "retry_seconds": delay,
+                    "events_received": self._events_received,
+                    "tokens_queued": self._tokens_queued,
+                }
+                logger.warning(
+                    "fourmeme_bitquery_stream_error " + json.dumps(
+                        error_log, default=str, separators=(",", ":"), sort_keys=True
+                    ),
+                    extra=error_log,
+                )
                 await asyncio.sleep(delay)
                 delay = min(delay * 2, 15.0)
 
