@@ -128,6 +128,15 @@ def _is_anoncoin_source(source: str) -> bool:
     return bool(source) and source.startswith("anoncoin")
 
 
+def _rule_platform_for_source(source: str) -> str:
+    """Map a launch source to its isolated rule namespace."""
+    return "fourmeme" if source == SOURCE_FOURMEME else "solana"
+
+
+def _rule_matches_source(rule, source: str) -> bool:
+    return (getattr(rule, "platform", "solana") or "solana") == _rule_platform_for_source(source)
+
+
 # ---------------------------------------------------------------------------
 # Scanner service
 # ---------------------------------------------------------------------------
@@ -1200,7 +1209,7 @@ class ScannerService:
 
         if (
             fresh_score_result.score
-            < settings.qualify_score_threshold
+            < rule_params.qualify_score_threshold
         ):
             logger.info(
                 "pumpfun_prebuy_revalidation_rejected",
@@ -1209,7 +1218,7 @@ class ScannerService:
                     "rule_id": rule_row.id,
                     "reason": "qualification score fell below threshold",
                     "score": fresh_score_result.score,
-                    "threshold": settings.qualify_score_threshold,
+                    "threshold": rule_params.qualify_score_threshold,
                     "prebuy_market_cap_usd": fresh_mc,
                 },
             )
@@ -1279,17 +1288,13 @@ class ScannerService:
 
             return True
 
-        if (
-            token.source == SOURCE_FOURMEME
-            and (
-                not settings.fourmeme_trading_enabled
-                or not state.fourmeme_trading_enabled
-            )
+        if token.source == SOURCE_FOURMEME and (
+            not state.fourmeme_trading_enabled
+            or not settings.fourmeme_trading_enabled
         ):
             await repo.save_trade_decision(
                 token.mint, rule_row.id, "skip",
-                "Four.meme trading is disabled (/enablefourmeme to resume)",
-                score_result.score,
+                "Four.meme trading is disabled", score_result.score
             )
             return True
 
@@ -1414,14 +1419,24 @@ class ScannerService:
             )
             return False
 
-        amount_sol = min(
-            rule_row.max_buy_size_sol,
-            (
-                state.paper_balance_sol
-                if state.mode == "paper"
-                else rule_row.max_buy_size_sol
-            ),
-        )
+        if token.source == SOURCE_FOURMEME:
+            # Four.meme rules use BNB. The legacy order column remains named
+            # requested_amount_sol for DB compatibility, but stores the native
+            # amount used by the selected execution adapter.
+            amount_native = float(
+                getattr(rule_row, "max_buy_size_bnb", 0.01) or 0.01
+            )
+            amount_unit = "BNB"
+        else:
+            amount_native = min(
+                rule_row.max_buy_size_sol,
+                (
+                    state.paper_balance_sol
+                    if state.mode == "paper"
+                    else rule_row.max_buy_size_sol
+                ),
+            )
+            amount_unit = "SOL"
 
         # --------------------------------------------------------------
         # IMPORTANT:
@@ -1450,7 +1465,7 @@ class ScannerService:
                 "buy",
                 state.mode,
                 "pending",
-                amount_sol,
+                amount_native,
                 token.price_usd,
                 rule_id=rule_row.id,
                 owner_user_id=(
@@ -1464,7 +1479,8 @@ class ScannerService:
             extra={
                 "mint": token.mint,
                 "rule_id": rule_row.id,
-                "amount_sol": amount_sol,
+                "amount_native": amount_native,
+                "amount_unit": amount_unit,
                 "mode": state.mode,
                 "source": token.source,
             },
@@ -1476,7 +1492,7 @@ class ScannerService:
                 token.ticker_symbol
                 or token.mint[:8]
             ),
-            amount_sol,
+            amount_native,
             state.mode,
         )
 
@@ -1485,7 +1501,7 @@ class ScannerService:
             result = await asyncio.wait_for(
                 adapter.buy(
                     token,
-                    amount_sol,
+                    amount_native,
                 ),
                 timeout=(
                     settings.execution_timeout_seconds
@@ -1883,11 +1899,11 @@ class ScannerService:
             "hard_filter_reasons": reasons,
             "score": score_result.score,
             "qualification_threshold": (
-                settings.qualify_score_threshold
+                rule_params.qualify_score_threshold
             ),
             "score_passed": (
                 score_result.score
-                >= settings.qualify_score_threshold
+                >= rule_params.qualify_score_threshold
             ),
             "creator_match": score_result.creator_match,
             "score_breakdown": score_result.breakdown,
@@ -1978,7 +1994,7 @@ class ScannerService:
         # The final qualification threshold is authoritative.
         # Smart-money confirmation is currently disabled, so a candidate
         # below the configured score threshold must not proceed to trading.
-        if score_result.score < settings.qualify_score_threshold:
+        if score_result.score < rule_params.qualify_score_threshold:
             logger.info(
                 "rule_rejected_score",
                 extra={
@@ -1986,7 +2002,7 @@ class ScannerService:
                     "rule_id": rule.id,
                     "source": token.source,
                     "score": score_result.score,
-                    "threshold": settings.qualify_score_threshold,
+                    "threshold": rule_params.qualify_score_threshold,
                     "market_cap_usd": getattr(token, "market_cap_usd", 0.0),
                     "liquidity_usd": getattr(token, "liquidity_usd", 0.0),
                     "holders": getattr(token, "holders", None),
@@ -2003,7 +2019,7 @@ class ScannerService:
                 "rule_id": rule.id,
                 "source": token.source,
                 "score": score_result.score,
-                "threshold": settings.qualify_score_threshold,
+                "threshold": rule_params.qualify_score_threshold,
                 "market_cap_usd": getattr(
                     token, "market_cap_usd", 0.0
                 ),
@@ -2114,8 +2130,8 @@ class ScannerService:
             due_rules = [
                 rule
                 for rule in active_rules
-                if age_seconds
-                <= rule.max_age_seconds
+                if _rule_matches_source(rule, source)
+                and age_seconds <= rule.max_age_seconds
             ]
 
             if not due_rules:
@@ -2317,7 +2333,8 @@ class ScannerService:
             )
 
             for rule in active_rules:
-
+                if not _rule_matches_source(rule, token.source):
+                    continue
                 await self._screen_and_maybe_trade(
                     token,
                     rule,
@@ -2358,6 +2375,8 @@ class ScannerService:
                         metrics.tokens_scanned += 1
                         token = await self._enrich_holders(token)
                         for rule in active_rules:
+                            if not _rule_matches_source(rule, token.source):
+                                continue
                             await self._screen_and_maybe_trade(
                                 token, rule, notify_on_fail=True
                             )
