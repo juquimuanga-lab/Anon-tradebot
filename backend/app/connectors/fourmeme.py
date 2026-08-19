@@ -278,140 +278,205 @@ class FourMemeClient:
             re.fullmatch(r"0x[a-fA-F0-9]{40}", value)
         )
 
-    def _normalize_event(self, event: dict) -> Optional[dict]:
-        """Normalize a Bitquery Four.meme TokenCreate event safely.
+    @staticmethod
+    def _walk_event_values(value, path="root"):
+        """Yield (path, value) pairs from nested Bitquery argument objects.
 
-        Prefer documented semantic argument names, then conservatively fall
-        back to an address candidate that is not the Four.meme proxy, creator,
-        sender, or destination. Diagnostic logs expose argument names and
-        transaction metadata, never the API token.
+        Four.meme TokenCreate arguments have changed shape across Bitquery
+        responses. Do not depend on one semantic argument name; recursively
+        inspect dictionaries/lists so a valid EVM address is not discarded.
         """
-        arguments = event.get("Arguments", []) or []
-        args: dict[str, Any] = {}
-        named_values: list[tuple[str, Any]] = []
+        yield path, value
 
-        for arg in arguments:
-            if not isinstance(arg, dict):
-                continue
-            name = str(arg.get("Name") or "").strip().lower()
-            value = self._value(arg.get("Value") or {})
-            named_values.append((name, value))
-            if name:
-                args[name] = value
-
-        tx = event.get("Transaction") or {}
-        tx_from = tx.get("From")
-        tx_to = tx.get("To")
-
-        token = None
-        semantic_keys = (
-            "token", "tokenaddress", "token_address", "tokencontract",
-            "token_contract", "smartcontract", "contract", "meme", "base",
-        )
-        for key in semantic_keys:
-            candidate = args.get(key)
-            if self._is_evm_address(candidate) and candidate.lower() != FOURMEME_PROXY:
-                token = candidate
-                break
-
-        creator = (
-            args.get("creator")
-            or args.get("owner")
-            or args.get("deployer")
-            or args.get("user")
-            or tx_from
-            or ""
-        )
-
-        if token is None:
-            excluded = {
-                FOURMEME_PROXY.lower(),
-                str(creator).lower() if self._is_evm_address(creator) else "",
-                str(tx_from).lower() if self._is_evm_address(tx_from) else "",
-                str(tx_to).lower() if self._is_evm_address(tx_to) else "",
-            }
-            candidates = [
-                value for _, value in named_values
-                if self._is_evm_address(value) and value.lower() not in excluded
-            ]
-            if candidates:
-                token = candidates[0]
-
-        if token is None:
-            logger.warning(
-                "fourmeme_event_normalization_failed " + json.dumps(
-                    {
-                        "reason": "no_token_address_found",
-                        "argument_names": [name for name, _ in named_values],
-                        "address_candidates": [
-                            value for _, value in named_values
-                            if self._is_evm_address(value)
-                        ],
-                        "tx_hash": tx.get("Hash"),
-                        "tx_from": tx_from,
-                        "tx_to": tx_to,
-                        "events_received": self._events_received,
-                    },
-                    default=str,
-                    separators=(",", ":"),
-                    sort_keys=True,
+        if isinstance(value, dict):
+            for key, child in value.items():
+                yield from FourMemeClient._walk_event_values(
+                    child,
+                    f"{path}.{key}",
                 )
+        elif isinstance(value, (list, tuple)):
+            for index, child in enumerate(value):
+                yield from FourMemeClient._walk_event_values(
+                    child,
+                    f"{path}[{index}]",
+                )
+
+    @staticmethod
+    def _looks_like_evm_address(value):
+        if not isinstance(value, str):
+            return False
+        value = value.strip()
+        if not re.fullmatch(r"0x[a-fA-F0-9]{40}", value):
+            return False
+        return value.lower() not in {
+            "0x0000000000000000000000000000000000000000",
+        }
+
+    def _normalize_event(self, event):
+        """Normalize a Bitquery Four.meme TokenCreate event.
+
+        Prefer explicit token-like argument names, then recursively inspect
+        all typed argument values. This makes the parser tolerant of the
+        exact Arguments/Value shape returned by Bitquery.
+        """
+        try:
+            if not isinstance(event, dict):
+                return None
+
+            tx_hash = (
+                event.get("Transaction", {}).get("Hash")
+                or event.get("transaction", {}).get("hash")
+                or event.get("txHash")
+                or event.get("hash")
+            )
+            block_height = (
+                event.get("Block", {}).get("Height")
+                or event.get("block", {}).get("height")
+                or event.get("blockHeight")
+            )
+
+            arguments = (
+                event.get("Arguments")
+                or event.get("arguments")
+                or event.get("Event", {}).get("Arguments")
+                or event.get("event", {}).get("Arguments")
+                or []
+            )
+
+            if isinstance(arguments, dict):
+                arguments = [arguments]
+            if not isinstance(arguments, list):
+                arguments = []
+
+            explicit_names = {
+                "token", "tokenaddress", "token_address",
+                "tokencontract", "token_contract", "meme",
+                "base", "basetoken", "base_token", "contract",
+                "token0", "address", "tokenaddr", "token_addr",
+            }
+
+            candidates = []
+
+            for index, argument in enumerate(arguments):
+                if not isinstance(argument, dict):
+                    continue
+
+                name = str(
+                    argument.get("Name")
+                    or argument.get("name")
+                    or argument.get("Argument")
+                    or argument.get("argument")
+                    or ""
+                ).strip()
+
+                normalized_name = re.sub(
+                    r"[^a-z0-9]",
+                    "",
+                    name.lower(),
+                )
+
+                # Bitquery may expose typed values as Value, Value.Address,
+                # Value.Address.Value, etc. Walk all of them.
+                values = (
+                    argument.get("Value")
+                    if "Value" in argument
+                    else argument.get("value")
+                )
+
+                for path, value in self._walk_event_values(
+                    values,
+                    f"Arguments[{index}].Value",
+                ):
+                    if self._looks_like_evm_address(value):
+                        score = 0
+                        if normalized_name in explicit_names:
+                            score += 100
+                        if "token" in normalized_name or "meme" in normalized_name:
+                            score += 50
+                        candidates.append((score, path, value, name))
+
+                # Some Bitquery payloads put the address directly in the
+                # argument object rather than under Value.
+                for path, value in self._walk_event_values(
+                    argument,
+                    f"Arguments[{index}]",
+                ):
+                    if self._looks_like_evm_address(value):
+                        score = 0
+                        if normalized_name in explicit_names:
+                            score += 100
+                        if "token" in normalized_name or "meme" in normalized_name:
+                            score += 50
+                        candidates.append((score, path, value, name))
+
+            # Also inspect the complete event as a final fallback.
+            for path, value in self._walk_event_values(event):
+                if self._looks_like_evm_address(value):
+                    candidates.append((1, path, value, ""))
+
+            if not candidates:
+                logger.warning(
+                    "fourmeme_event_normalization_failed",
+                    extra={
+                        "tx_hash": tx_hash,
+                        "block_height": block_height,
+                        "argument_names": [
+                            str(
+                                a.get("Name")
+                                or a.get("name")
+                                or ""
+                            )
+                            for a in arguments
+                            if isinstance(a, dict)
+                        ],
+                    },
+                )
+                return None
+
+            # Highest semantic score wins; preserve first occurrence on ties.
+            candidates.sort(key=lambda item: item[0], reverse=True)
+            _, token_path, token_address, token_argument_name = candidates[0]
+
+            now = datetime.now(timezone.utc)
+
+            normalized = {
+                "mint": token_address,
+                "token": token_address,
+                "token_address": token_address,
+                "tx_hash": tx_hash,
+                "block_height": block_height,
+                "creator": (
+                    event.get("Transaction", {}).get("From")
+                    or event.get("transaction", {}).get("from")
+                    or event.get("From")
+                    or event.get("from")
+                    or ""
+                ),
+                "created_at": now,
+                "raw_event": event,
+            }
+
+            logger.info(
+                "fourmeme_event_normalized",
+                extra={
+                    "mint": token_address,
+                    "tx_hash": tx_hash,
+                    "block_height": block_height,
+                    "token_path": token_path,
+                    "token_argument_name": token_argument_name,
+                },
+            )
+
+            return normalized
+
+        except Exception as exc:
+            logger.exception(
+                "fourmeme_event_normalization_exception",
+                extra={
+                    "error": str(exc),
+                },
             )
             return None
-
-        token_source = next(
-            (
-                name for name, value in named_values
-                if value == token and name in semantic_keys
-            ),
-            "address_fallback",
-        )
-        logger.info(
-            "fourmeme_event_normalized " + json.dumps(
-                {
-                    "token": token,
-                    "token_source": token_source,
-                    "creator": creator,
-                    "argument_names": [name for name, _ in named_values],
-                    "tx_hash": tx.get("Hash"),
-                },
-                default=str,
-                separators=(",", ":"),
-                sort_keys=True,
-            )
-        )
-
-        launch_time = (
-            args.get("launchtime")
-            or args.get("launch_time")
-            or args.get("launch")
-        )
-        created = datetime.now(timezone.utc)
-        if isinstance(launch_time, (int, float, str)):
-            try:
-                created = datetime.fromtimestamp(float(launch_time), tz=timezone.utc)
-            except Exception:
-                pass
-
-        return {
-            "mint": token,
-            "creator": creator or "",
-            "ticker_name": args.get("name") or args.get("tokenname") or "",
-            "ticker_symbol": (
-                args.get("symbol")
-                or args.get("shortname")
-                or args.get("tokensymbol")
-                or ""
-            ),
-            "total_supply": (
-                args.get("totalsupply")
-                or args.get("total_supply")
-                or 1000000000
-            ),
-            "created_on": created,
-            "tx_signature": tx.get("Hash"),
-            "raw": event,
-        }
 
     async def drain(self, limit: int = 100) -> list[dict]:
         result=[]
