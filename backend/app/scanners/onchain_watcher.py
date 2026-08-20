@@ -123,6 +123,13 @@ ALCHEMY_HEALTHCHECK_TIMEOUT_SECONDS = 8.0
 PUMPFUN_FALLBACK_SIGNATURE_LIMIT = 10
 PUMPFUN_EVENT_QUEUE_MAXSIZE = 500
 
+# Low-latency launch discovery. `processed` is intentionally used for the
+# websocket feed so the trading pipeline can see a launch as soon as the RPC
+# provider observes it. HTTP recovery remains `confirmed` and is the
+# reconciliation path. The execution layer must still perform its own safety
+# checks before signing a live trade.
+PUMPFUN_WS_COMMITMENT = "processed"
+
 # One stream task per watched mint-authority address.
 _pumpfun_streams: dict[str, dict] = {}
 
@@ -1462,18 +1469,27 @@ def _is_supported_pumpfun_launch(
     """Return True for both supported Pump.fun launch instruction versions.
 
     Legacy Pump.fun launches use `create` and Token-2022 launches use
-    `create_v2`. Both are valid Pump.fun bonding-curve launches and are
-    forwarded to the common trading pipeline. The execution builder resolves
-    the actual mint owner at buy time so it can construct the correct
+    `create_v2`. The websocket CreateEvent path uses `create_event` because
+    the event layout is shared by both versions. That event is accepted as a
+    discovery signal without waiting for getTransaction; HTTP recovery remains
+    authoritative when reconciling missed launches. The execution builder
+    resolves the actual mint owner at buy time so it can construct the correct
     Token/Token-2022 instructions.
     """
 
     return bool(
         launch
-        and launch.get("instruction") in {
-            "create",
-            "create_v2",
-        }
+        and (
+            launch.get("instruction") in {
+                "create",
+                "create_v2",
+            }
+            or (
+                launch.get("instruction") == "create_event"
+                and launch.get("discovery") == "websocket_create_event"
+                and launch.get("verification_pending") is True
+            )
+        )
     )
 
 
@@ -1735,7 +1751,7 @@ async def _pumpfun_stream_worker(
                         "method": "logsSubscribe",
                         "params": [
                             {"mentions": [mint_authority]},
-                            {"commitment": "confirmed"},
+                            {"commitment": PUMPFUN_WS_COMMITMENT},
                         ],
                     }
 
@@ -1836,50 +1852,21 @@ async def _pumpfun_stream_worker(
                         if not launch:
                             continue
 
-                        # CreateEvent is identical for legacy `create` and
-                        # Token-2022 `create_v2`, so the event alone cannot
-                        # safely tell us which token program was used.
-                        # Verify the actual transaction before allowing the
-                        # launch into the trading pipeline. Fail closed:
-                        # if verification cannot prove a supported Pump.fun create version, skip it.
-                        verified_launch = None
-                        try:
-                            async with AsyncClient(rpc_url) as verify_client:
-                                verify_resp = await verify_client.get_transaction(
-                                    Signature.from_string(signature),
-                                    encoding="jsonParsed",
-                                    max_supported_transaction_version=0,
-                                )
-                            verify_tx = verify_resp.value
-                            if verify_tx:
-                                verified_launch = extract_pumpfun_create(verify_tx)
-                        except Exception as exc:
-                            logger.warning(
-                                "pumpfun_launch_version_verification_failed",
-                                extra={
-                                    "signature": signature,
-                                    "error": f"{type(exc).__name__}: {exc}",
-                                },
-                            )
-
-                        if not _is_supported_pumpfun_launch(verified_launch):
-                            logger.info(
-                                "pumpfun_unsupported_launch_skipped",
-                                extra={
-                                    "signature": signature,
-                                    "mint": launch.get("mint"),
-                                    "instruction": (
-                                        verified_launch.get("instruction")
-                                        if verified_launch
-                                        else None
-                                    ),
-                                },
-                            )
-                            continue
-
-                        # Use the transaction-derived launch metadata because
-                        # it includes the authoritative instruction version.
-                        launch = verified_launch
+                        # LOW-LATENCY PATH:
+                        # CreateEvent already contains the mint + creator and is
+                        # emitted by Pump.fun for both legacy `create` and
+                        # Token-2022 `create_v2`. Do NOT call getTransaction here.
+                        # That extra RPC round-trip was on the critical path and
+                        # could add hundreds of milliseconds (or seconds during
+                        # RPC pressure), defeating first-seconds sniping.
+                        #
+                        # Recovery still performs authoritative transaction
+                        # parsing below, so the stream is treated as a discovery
+                        # signal rather than a final transaction classification.
+                        launch["tx_signature"] = signature
+                        launch["instruction"] = "create_event"
+                        launch["verification_pending"] = True
+                        launch["block_time"] = None
 
                         now = asyncio.get_running_loop().time()
                         state["events_seen"] = int(state.get("events_seen", 0)) + 1
@@ -1913,16 +1900,17 @@ async def _pumpfun_stream_worker(
                                 },
                             )
 
-                        launch["tx_signature"] = signature
-                        launch["block_time"] = None
                         launch["watched_wallet"] = mint_authority
                         launch["discovery"] = "websocket_create_event"
                         launch["rpc_transport"] = "primary"
-                        launch["token_standard"] = (
-                            "token2022"
-                            if launch.get("instruction") == "create_v2"
-                            else "legacy"
-                        )
+                        # The CreateEvent layout is shared by legacy and
+                        # Token-2022 launches, so leave the standard unresolved.
+                        # The execution builder already resolves the actual mint
+                        # owner when constructing the buy transaction.
+                        launch["token_standard"] = "unknown"
+
+                        launch["discovery_received_at"] = now
+                        launch["discovery_latency_ms"] = 0.0
 
                         try:
                             queue.put_nowait(launch)
