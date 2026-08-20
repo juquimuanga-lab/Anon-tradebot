@@ -81,6 +81,7 @@ from app.scanners.normalize import (
 from app.scoring.rules import (
     TokenSnapshot,
     evaluate_hard_filters,
+    evaluate_late_entry,
 )
 
 from app.scoring.scorer import (
@@ -1112,6 +1113,16 @@ class ScannerService:
         rule_params = repo.rule_row_to_params(
             rule_row
         )
+        rule_params = self._apply_late_entry_settings(rule_params)
+
+        # Carry the scanner's observed launch history into the fresh pre-buy
+        # snapshot so the final RPC read cannot bypass the anti-chase gate.
+        fresh_token.raw_enrichment["late_entry_history"] = (
+            self._momentum_history.get(token.mint) or {}
+        )
+        fresh_token.raw_enrichment["momentum_previous"] = (
+            self._momentum_history.get(token.mint) or {}
+        )
 
         passed, reasons = evaluate_hard_filters(
             fresh_token,
@@ -1137,6 +1148,13 @@ class ScannerService:
             reasons = list(reasons) + list(
                 quality_reasons
             )
+
+        late_passed, late_reasons, late_breakdown = evaluate_late_entry(
+            fresh_token,
+            rule_params,
+        )
+        if not late_passed:
+            reasons = list(reasons) + list(late_reasons)
 
         elapsed_ms = (
             time.monotonic() - started
@@ -1252,6 +1270,20 @@ class ScannerService:
                     "reason": "Pump.fun quality gate no longer passes",
                     "quality_status": quality_status,
                     "quality_score": quality_score,
+                    "prebuy_market_cap_usd": fresh_mc,
+                },
+            )
+            return fresh_token, fresh_score_result, False
+
+        if not late_passed:
+            logger.info(
+                "pumpfun_prebuy_revalidation_rejected",
+                extra={
+                    "mint": token.mint,
+                    "rule_id": rule_row.id,
+                    "reason": "anti-late-entry gate rejected the fresh price",
+                    "late_entry_reasons": late_reasons,
+                    "late_entry_breakdown": late_breakdown,
                     "prebuy_market_cap_usd": fresh_mc,
                 },
             )
@@ -1814,6 +1846,57 @@ class ScannerService:
 
         return False
 
+    def _update_late_entry_history(self, token) -> dict:
+        """Maintain a tiny per-mint price history for anti-chase checks."""
+        now = time.monotonic()
+        current_price = float(getattr(token, "price_usd", 0.0) or 0.0)
+        current_mc = float(getattr(token, "market_cap_usd", 0.0) or 0.0)
+        state = self._momentum_history.get(token.mint) or {}
+        previous = {
+            "timestamp": state.get("timestamp", 0.0),
+            "price_usd": state.get("price_usd", 0.0),
+            "market_cap_usd": state.get("market_cap_usd", 0.0),
+        }
+        first_price = float(state.get("first_price_usd", 0.0) or 0.0)
+        first_mc = float(state.get("first_market_cap_usd", 0.0) or 0.0)
+        if first_price <= 0 and current_price > 0:
+            first_price = current_price
+        if first_mc <= 0 and current_mc > 0:
+            first_mc = current_mc
+        peak_price = max(
+            float(state.get("peak_price_usd", 0.0) or 0.0),
+            current_price,
+        )
+        history = {
+            "timestamp": now,
+            "previous": previous,
+            "price_usd": current_price,
+            "market_cap_usd": current_mc,
+            "first_price_usd": first_price,
+            "first_market_cap_usd": first_mc,
+            "peak_price_usd": peak_price,
+        }
+        self._momentum_history[token.mint] = {
+            **state,
+            **history,
+            "liquidity_usd": float(getattr(token, "liquidity_usd", 0.0) or 0.0),
+            "holders": int(getattr(token, "holders", 0) or 0),
+            "volume_24h_usd": float(getattr(token, "volume_24h_usd", 0.0) or 0.0),
+        }
+        return history
+
+    def _apply_late_entry_settings(self, rule_params):
+        """Apply deployment-level anti-late-entry overrides to a rule."""
+        rule_params.late_entry_enabled = settings.late_entry_enabled
+        rule_params.late_entry_max_age_seconds = settings.late_entry_max_age_seconds
+        rule_params.late_entry_soft_market_cap_usd = settings.late_entry_soft_market_cap_usd
+        rule_params.late_entry_hard_market_cap_usd = settings.late_entry_hard_market_cap_usd
+        rule_params.late_entry_near_high_pct = settings.late_entry_near_high_pct
+        rule_params.late_entry_required_pullback_pct = settings.late_entry_required_pullback_pct
+        rule_params.late_entry_max_short_runup_pct = settings.late_entry_max_short_runup_pct
+        rule_params.late_entry_max_runup_from_first_pct = settings.late_entry_max_runup_from_first_pct
+        return rule_params
+
     # ------------------------------------------------------------------
     # Screening
     # ------------------------------------------------------------------
@@ -1837,19 +1920,16 @@ class ScannerService:
                 rule
             )
         )
+        rule_params = self._apply_late_entry_settings(rule_params)
 
-        passed, reasons = (
-            evaluate_hard_filters(
-                token,
-                rule_params,
-            )
-        )
+        late_history = self._update_late_entry_history(token)
+        token.raw_enrichment["late_entry_history"] = late_history
 
-        # Attach a recent previous snapshot so the scorer can reward
-        # positive MC/liquidity/holder/volume acceleration.
-        now_mono = time.monotonic()
-        previous = self._momentum_history.get(token.mint)
-        if previous and now_mono - previous.get("timestamp", 0.0) <= 15.0:
+        # Attach the PREVIOUS snapshot so the scorer measures acceleration
+        # rather than comparing the token with itself.
+        previous = late_history.get("previous") or {}
+        previous_timestamp = float(previous.get("timestamp", 0.0) or 0.0)
+        if previous and previous_timestamp and time.monotonic() - previous_timestamp <= 15.0:
             token.raw_enrichment["momentum_previous"] = previous
         else:
             token.raw_enrichment.pop("momentum_previous", None)
@@ -1860,13 +1940,12 @@ class ScannerService:
             settings.creator_watchlist,
         )
 
-        self._momentum_history[token.mint] = {
-            "timestamp": now_mono,
-            "market_cap_usd": float(token.market_cap_usd or 0.0),
-            "liquidity_usd": float(token.liquidity_usd or 0.0),
-            "holders": int(token.holders or 0),
-            "volume_24h_usd": float(token.volume_24h_usd or 0.0),
-        }
+        late_passed, late_reasons, late_breakdown = evaluate_late_entry(
+            token,
+            rule_params,
+        )
+        if not late_passed:
+            reasons.extend(late_reasons)
 
         # ------------------------------------------------------------------
         # DETAILED RULE-EVALUATION TELEMETRY
@@ -1943,6 +2022,9 @@ class ScannerService:
             ),
             "creator_match": score_result.creator_match,
             "score_breakdown": score_result.breakdown,
+            "late_entry_passed": late_passed,
+            "late_entry_reasons": late_reasons,
+            "late_entry_breakdown": late_breakdown,
         }
 
         # IMPORTANT: Railway's current log formatter only renders the
@@ -2025,6 +2107,26 @@ class ScannerService:
                     reasons,
                 )
 
+            return False
+
+        if not late_passed:
+            logger.info(
+                "rule_rejected_late_entry "
+                + json.dumps({
+                    "mint": token.mint,
+                    "rule_id": rule.id,
+                    "source": token.source,
+                    "reasons": late_reasons,
+                    "late_entry": late_breakdown,
+                }, default=str, separators=(",", ":"), sort_keys=True),
+                extra={
+                    "mint": token.mint,
+                    "rule_id": rule.id,
+                    "source": token.source,
+                    "reasons": late_reasons,
+                    "late_entry": late_breakdown,
+                },
+            )
             return False
 
         # The final qualification threshold is authoritative.
