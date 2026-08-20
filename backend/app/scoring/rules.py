@@ -8,6 +8,7 @@ from typing import List, Literal, Optional
 from pydantic import BaseModel, Field
 
 BondingCurvePhase = Literal["any", "pre_graduation", "post_graduation"]
+SniperStrategy = Literal["smart", "fast"]
 
 
 class TakeProfitLevel(BaseModel):
@@ -19,6 +20,8 @@ class RuleParams(BaseModel):
     name: str = "default"
     # Platform-specific rules: existing rules default to Solana (Anoncoin/Pump.fun).
     platform: Literal["solana", "fourmeme"] = "solana"
+    # Pump.fun strategy lane. Existing rules default to Smart for compatibility.
+    strategy: SniperStrategy = "smart"
     max_buy_size_sol: float = 0.1
     max_buy_size_bnb: float = 0.01
     min_liquidity_usd: float = 2500.0
@@ -115,6 +118,64 @@ def evaluate_hard_filters(token: TokenSnapshot, rule: RuleParams) -> tuple[bool,
 
     return (len(reasons) == 0, reasons)
 
+
+
+def evaluate_fast_sniper_filters(token: TokenSnapshot, rule: RuleParams) -> tuple[bool, list[str]]:
+    """Very small pre-trade safety gate for the Pump.fun Fast Sniper lane.
+
+    This intentionally avoids holder counts and the full quality score. Those
+    are lagging signals for a sub-second launch strategy. Only launch-time
+    safety and price/liquidity bounds are enforced here.
+    """
+    reasons: list[str] = []
+    if token.source != "pumpfun":
+        return False, ["fast sniper is only available for Pump.fun"]
+
+    if token.creator_wallet and token.creator_wallet in rule.creator_denylist:
+        reasons.append("creator is denylisted")
+    if rule.creator_allowlist and token.creator_wallet not in rule.creator_allowlist:
+        reasons.append("creator not in allowlist")
+
+    # Fast lane is intentionally capped at two seconds even if an admin's
+    # generic rule was accidentally configured with a much larger age.
+    fast_age_limit = min(float(rule.max_age_seconds), 2.0)
+    if token.age_seconds > fast_age_limit:
+        reasons.append(f"fast entry window expired ({token.age_seconds:.2f}s > {fast_age_limit:.2f}s)")
+
+    if token.liquidity_usd < rule.min_liquidity_usd:
+        reasons.append(f"liquidity ${token.liquidity_usd:,.0f} below min ${rule.min_liquidity_usd:,.0f}")
+
+    if rule.min_market_cap_usd is not None and token.market_cap_usd < rule.min_market_cap_usd:
+        reasons.append(f"market cap ${token.market_cap_usd:,.0f} below min ${rule.min_market_cap_usd:,.0f}")
+    if rule.max_market_cap_usd is not None and token.market_cap_usd > rule.max_market_cap_usd:
+        reasons.append(f"market cap ${token.market_cap_usd:,.0f} above max ${rule.max_market_cap_usd:,.0f}")
+
+    if rule.bonding_curve_phase != "any" and token.bonding_curve_phase != rule.bonding_curve_phase:
+        reasons.append(f"bonding curve phase {token.bonding_curve_phase} != required {rule.bonding_curve_phase}")
+
+    # Reuse the observed launch history for a lightweight anti-chase guard.
+    history = (getattr(token, "raw_enrichment", {}) or {}).get("late_entry_history") or {}
+    first_price = float(history.get("first_price_usd", 0.0) or 0.0)
+    current_price = float(token.price_usd or 0.0)
+    previous = history.get("previous") or {}
+    previous_price = float(previous.get("price_usd", 0.0) or 0.0)
+    previous_ts = float(previous.get("timestamp", 0.0) or 0.0)
+    now_ts = float(history.get("timestamp", 0.0) or 0.0)
+
+    if first_price > 0 and current_price > 0:
+        runup = (current_price - first_price) / first_price * 100.0
+        # Do not chase a launch that has already moved +60% in the tiny fast window.
+        if runup >= 60.0:
+            reasons.append(f"fast anti-chase: +{runup:.0f}% from first observed price")
+
+    if previous_price > 0 and current_price > 0 and now_ts and previous_ts:
+        dt = now_ts - previous_ts
+        if 0 <= dt <= 1.5:
+            short_runup = (current_price - previous_price) / previous_price * 100.0
+            if short_runup >= 30.0:
+                reasons.append(f"fast anti-chase: +{short_runup:.0f}% in {dt:.2f}s")
+
+    return len(reasons) == 0, reasons
 
 def evaluate_late_entry(token: TokenSnapshot, rule: RuleParams) -> tuple[bool, list[str], dict]:
     """Reject Pump.fun entries that are already in a vertical/late phase.
