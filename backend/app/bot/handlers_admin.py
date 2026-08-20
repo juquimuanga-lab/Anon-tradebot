@@ -60,7 +60,7 @@ async def connect_receive(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
 @admin_required
 async def enable_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await repo.update_bot_state(trading_enabled=True)
+    await repo.update_bot_state(update.effective_user.id, trading_enabled=True)
     await repo.write_audit_log(str(update.effective_user.id), "enable_trading", {})
     await update.message.reply_text("Automated trading resumed.")
 
@@ -83,7 +83,7 @@ async def disable_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
 @admin_required
 async def enableanoncoin_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await repo.update_bot_state(anoncoin_trading_enabled=True)
+    await repo.update_bot_state(update.effective_user.id, anoncoin_trading_enabled=True)
     await repo.write_audit_log(str(update.effective_user.id), "enable_anoncoin", {})
     await update.message.reply_text("Anoncoin trading resumed (Pump.fun unaffected).")
 
@@ -105,7 +105,7 @@ async def disableanoncoin_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE
 
 @admin_required
 async def enablepumpfun_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await repo.update_bot_state(pumpfun_trading_enabled=True)
+    await repo.update_bot_state(update.effective_user.id, pumpfun_trading_enabled=True)
     await repo.write_audit_log(str(update.effective_user.id), "enable_pumpfun", {})
     await update.message.reply_text("Pump.fun trading resumed (Anoncoin unaffected).")
 
@@ -117,7 +117,7 @@ async def enablefourmeme_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE)
             "Four.meme is disabled at deployment level. Set FOURMEME_TRADING_ENABLED=true in Railway first, then run /enablefourmeme."
         )
         return
-    await repo.update_bot_state(fourmeme_trading_enabled=True)
+    await repo.update_bot_state(update.effective_user.id, fourmeme_trading_enabled=True)
     await repo.write_audit_log(str(update.effective_user.id), "enable_fourmeme", {})
     await update.message.reply_text("Four.meme trading resumed. Pump.fun and Anoncoin are unaffected.")
 
@@ -197,28 +197,28 @@ async def confirmation_callback(update: Update, context: ContextTypes.DEFAULT_TY
         return
 
     if entry.action == "disable_all":
-        await repo.update_bot_state(trading_enabled=False)
+        await repo.update_bot_state(update.effective_user.id, trading_enabled=False)
         await repo.write_audit_log(str(update.effective_user.id), "disable_all_confirmed", {})
         await query.edit_message_text("All automated trading has been paused.")
 
     elif entry.action == "disable_anoncoin":
-        await repo.update_bot_state(anoncoin_trading_enabled=False)
+        await repo.update_bot_state(update.effective_user.id, anoncoin_trading_enabled=False)
         await repo.write_audit_log(str(update.effective_user.id), "disable_anoncoin_confirmed", {})
         await query.edit_message_text("Anoncoin trading paused. Pump.fun is unaffected.")
 
     elif entry.action == "disable_pumpfun":
-        await repo.update_bot_state(pumpfun_trading_enabled=False)
+        await repo.update_bot_state(update.effective_user.id, pumpfun_trading_enabled=False)
         await repo.write_audit_log(str(update.effective_user.id), "disable_pumpfun_confirmed", {})
         await query.edit_message_text("Pump.fun trading paused. Anoncoin and Four.meme are unaffected.")
 
     elif entry.action == "disable_fourmeme":
-        await repo.update_bot_state(fourmeme_trading_enabled=False)
+        await repo.update_bot_state(update.effective_user.id, fourmeme_trading_enabled=False)
         await repo.write_audit_log(str(update.effective_user.id), "disable_fourmeme_confirmed", {})
         await query.edit_message_text("Four.meme trading paused. Pump.fun and Anoncoin are unaffected.")
 
     elif entry.action == "switch_mode":
         mode = entry.payload["mode"]
-        await repo.update_bot_state(mode=mode)
+        await repo.update_bot_state(update.effective_user.id, mode=mode)
         await repo.write_audit_log(str(update.effective_user.id), "switch_mode", {"mode": mode})
         await query.edit_message_text(f"Trading mode switched to {mode.upper()}.")
 
