@@ -1934,6 +1934,14 @@ class ScannerService:
         else:
             token.raw_enrichment.pop("momentum_previous", None)
 
+        # Evaluate the normal hard filters before scoring/late-entry checks.
+        # ``passed`` and ``reasons`` are used by the telemetry, persistence,
+        # and hard-filter rejection path below.
+        passed, reasons = evaluate_hard_filters(
+            token,
+            rule_params,
+        )
+
         score_result = compute_score(
             token,
             rule_params,
