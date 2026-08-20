@@ -96,6 +96,37 @@ def _momentum_score(token: TokenSnapshot) -> float:
     return WEIGHTS["momentum"] * normalized
 
 
+def _late_entry_risk(token: TokenSnapshot, rule: RuleParams) -> float:
+    """Return a 0-100 diagnostic risk score; the scanner owns rejection."""
+    if not rule.late_entry_enabled or token.source != "pumpfun":
+        return 0.0
+    history = (getattr(token, "raw_enrichment", {}) or {}).get("late_entry_history") or {}
+    mc = float(token.market_cap_usd or 0.0)
+    age = float(token.age_seconds or 0.0)
+    risk = 0.0
+    if mc >= rule.late_entry_soft_market_cap_usd:
+        risk += 25.0
+    if mc >= rule.late_entry_hard_market_cap_usd:
+        risk += 25.0
+    if age > rule.late_entry_max_age_seconds and mc >= rule.late_entry_soft_market_cap_usd:
+        risk += 20.0
+    peak = float(history.get("peak_price_usd", 0.0) or 0.0)
+    price = float(token.price_usd or 0.0)
+    if peak > 0 and price > 0:
+        distance = abs((price - peak) / peak * 100.0)
+        if distance <= rule.late_entry_near_high_pct:
+            risk += 20.0
+    prev = history.get("previous") or {}
+    prev_price = float(prev.get("price_usd", 0.0) or 0.0)
+    prev_ts = float(prev.get("timestamp", 0.0) or 0.0)
+    ts = float(history.get("timestamp", 0.0) or 0.0)
+    if prev_price > 0 and prev_ts and ts and 0 <= ts-prev_ts <= 3.0:
+        runup = (price-prev_price)/prev_price*100.0
+        if runup >= rule.late_entry_max_short_runup_pct:
+            risk += 20.0
+    return min(100.0, round(risk, 2))
+
+
 def compute_score(token: TokenSnapshot, rule: RuleParams, creator_watchlist: List[str]) -> ScoreResult:
     creator_match = bool(token.creator_wallet) and token.creator_wallet in creator_watchlist
     breakdown = {
@@ -105,8 +136,9 @@ def compute_score(token: TokenSnapshot, rule: RuleParams, creator_watchlist: Lis
         "volume": round(_volume_score(token), 2),
         "market_cap_fit": round(_market_cap_fit_score(token, rule), 2),
         "momentum": round(_momentum_score(token), 2),
+        "late_entry_risk": _late_entry_risk(token, rule),
     }
-    score = sum(breakdown.values())
+    score = sum(v for k, v in breakdown.items() if k != "late_entry_risk")
     if creator_match:
         breakdown["creator_watchlist_bonus"] = CREATOR_MATCH_BONUS
         score += CREATOR_MATCH_BONUS
