@@ -31,3 +31,4 @@ class ExecutionAdapter(ABC):
     @abstractmethod
     async def sell(self, token: TokenSnapshot, amount_tokens: float, sell_pct: float) -> OrderResult:
         ...
+
