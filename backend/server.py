@@ -107,6 +107,21 @@ async def get_metrics():
     wins = sum(1 for p in closed if p.realized_pnl_usd > 0)
     win_rate = (wins / len(closed) * 100) if closed else 0.0
     total_pnl = sum(p.realized_pnl_usd for p in closed)
+    winners = [p.realized_pnl_usd for p in closed if p.realized_pnl_usd > 0]
+    losers = [p.realized_pnl_usd for p in closed if p.realized_pnl_usd < 0]
+    gross_profit = sum(winners)
+    gross_loss = abs(sum(losers))
     data = metrics.as_dict()
-    data.update({"win_rate_pct": round(win_rate, 2), "total_pnl": round(total_pnl, 2)})
+    data.update({
+        "win_rate_pct": round(win_rate, 2),
+        "total_pnl": round(total_pnl, 2),
+        "average_winner_usd": round(gross_profit / len(winners), 6) if winners else 0.0,
+        "average_loser_usd": round(sum(losers) / len(losers), 6) if losers else 0.0,
+        "gross_profit_usd": round(gross_profit, 6),
+        "gross_loss_usd": round(gross_loss, 6),
+        "profit_factor": round(gross_profit / gross_loss, 4) if gross_loss > 0 else None,
+        "expectancy_per_trade_usd": round(total_pnl / len(closed), 6) if closed else 0.0,
+        "total_fees_usd": round(sum(float(getattr(p, "total_fees_usd", 0.0) or 0.0) for p in closed), 6),
+        "total_network_fees_usd": round(sum(float(getattr(p, "total_network_fee_usd", 0.0) or 0.0) for p in closed), 6),
+    })
     return data
