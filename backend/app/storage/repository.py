@@ -20,6 +20,7 @@ from app.storage.models import (
 
 
 _BOT_STATE_SCHEMA_READY = False
+_RULE_SCHEMA_READY = False
 
 
 async def _ensure_bot_state_schema(session) -> None:
@@ -31,6 +32,8 @@ async def _ensure_bot_state_schema(session) -> None:
     # are ignored only when the column already exists.
     for ddl in (
         "ALTER TABLE bot_state ADD COLUMN owner_user_id INTEGER",
+        "ALTER TABLE bot_state ADD COLUMN pumpfun_fast_enabled BOOLEAN DEFAULT FALSE",
+        "ALTER TABLE bot_state ADD COLUMN pumpfun_smart_enabled BOOLEAN DEFAULT TRUE",
         "ALTER TABLE positions ADD COLUMN entry_cost_usd FLOAT DEFAULT 0",
         "ALTER TABLE positions ADD COLUMN remaining_cost_basis_usd FLOAT DEFAULT 0",
         "ALTER TABLE positions ADD COLUMN total_proceeds_usd FLOAT DEFAULT 0",
@@ -55,6 +58,27 @@ async def _ensure_bot_state_schema(session) -> None:
     _BOT_STATE_SCHEMA_READY = True
 
 
+async def _ensure_rule_schema(session) -> None:
+    """Lightweight migration for the independent Smart/Fast rule lanes."""
+    global _RULE_SCHEMA_READY
+    if _RULE_SCHEMA_READY:
+        return
+    for ddl in (
+        "ALTER TABLE rules ADD COLUMN strategy VARCHAR DEFAULT 'smart'",
+    ):
+        try:
+            await session.execute(text(ddl))
+            await session.commit()
+        except Exception:
+            await session.rollback()
+    try:
+        await session.execute(text("UPDATE rules SET strategy='smart' WHERE strategy IS NULL"))
+        await session.commit()
+    except Exception:
+        await session.rollback()
+    _RULE_SCHEMA_READY = True
+
+
 async def get_or_create_bot_state(owner_user_id: Optional[int] = None) -> BotState:
     async with async_session_scope() as session:
         await _ensure_bot_state_schema(session)
@@ -77,6 +101,8 @@ async def get_or_create_bot_state(owner_user_id: Optional[int] = None) -> BotSta
                     trading_enabled=legacy.trading_enabled,
                     anoncoin_trading_enabled=legacy.anoncoin_trading_enabled,
                     pumpfun_trading_enabled=legacy.pumpfun_trading_enabled,
+                    pumpfun_fast_enabled=getattr(legacy, "pumpfun_fast_enabled", False),
+                    pumpfun_smart_enabled=getattr(legacy, "pumpfun_smart_enabled", True),
                     fourmeme_trading_enabled=legacy.fourmeme_trading_enabled,
                     paper_balance_sol=legacy.paper_balance_sol,
                 )
@@ -113,6 +139,7 @@ async def get_active_rule_for(
 ) -> Optional[Rule]:
 
     async with async_session_scope() as session:
+        await _ensure_rule_schema(session)
 
         return (
             await session.execute(
@@ -130,6 +157,7 @@ async def get_active_rule_for(
 async def get_all_active_rules() -> list[Rule]:
     """Return all active rules across platforms."""
     async with async_session_scope() as session:
+        await _ensure_rule_schema(session)
         rows = (
             await session.execute(
                 select(Rule).where(Rule.is_active.is_(True))
@@ -141,6 +169,7 @@ async def get_all_active_rules() -> list[Rule]:
 async def get_active_rules_for_platform(platform: str) -> list[Rule]:
     """Return active rules scoped to one platform."""
     async with async_session_scope() as session:
+        await _ensure_rule_schema(session)
         rows = (
             await session.execute(
                 select(Rule).where(
@@ -157,6 +186,7 @@ async def get_rules_for_admin(
 ) -> list[Rule]:
 
     async with async_session_scope() as session:
+        await _ensure_rule_schema(session)
 
         rows = (
             await session.execute(
@@ -177,40 +207,36 @@ async def activate_rule_for_admin(
     rule_id: int,
     admin_id: int,
 ) -> Optional[Rule]:
-    """Activate one of an admin's own rules."""
+    """Activate one of an admin's own Smart rules (legacy command)."""
+    return await activate_rule_for_admin_strategy(rule_id, admin_id, "smart")
 
+
+async def activate_rule_for_admin_strategy(
+    rule_id: int,
+    admin_id: int,
+    strategy: str,
+) -> Optional[Rule]:
+    """Activate one rule per admin/platform/strategy lane."""
+    strategy = "fast" if strategy == "fast" else "smart"
     async with async_session_scope() as session:
-
-        target = (
-            await session.execute(
-                select(Rule).where(
-                    Rule.id == rule_id,
-                    Rule.created_by == admin_id,
-                )
-            )
-        ).scalars().first()
-
+        await _ensure_rule_schema(session)
+        target = (await session.execute(
+            select(Rule).where(Rule.id == rule_id, Rule.created_by == admin_id)
+        )).scalars().first()
         if not target:
             return None
-
         await session.execute(
-            Rule.__table__
-            .update()
-            .where(
+            Rule.__table__.update().where(
                 Rule.is_active.is_(True),
                 Rule.created_by == admin_id,
                 Rule.platform == target.platform,
-            )
-            .values(
-                is_active=False
-            )
+                Rule.strategy == strategy,
+            ).values(is_active=False)
         )
-
+        target.strategy = strategy
         target.is_active = True
-
         await session.commit()
         await session.refresh(target)
-
         return target
 
 
@@ -649,6 +675,7 @@ async def get_token(
 async def get_all_rules() -> list[Rule]:
 
     async with async_session_scope() as session:
+        await _ensure_rule_schema(session)
 
         rows = (
             await session.execute(
@@ -684,6 +711,7 @@ def rule_row_to_params(
     return RuleParams(
         name=rule.name,
         platform=getattr(rule, "platform", "solana") or "solana",
+        strategy=getattr(rule, "strategy", "smart") or "smart",
         max_buy_size_sol=(
             rule.max_buy_size_sol
         ),
@@ -757,6 +785,7 @@ async def create_rule(
 ) -> Rule:
 
     async with async_session_scope() as session:
+        await _ensure_rule_schema(session)
 
         if activate:
 
@@ -767,6 +796,7 @@ async def create_rule(
                     Rule.is_active.is_(True),
                     Rule.created_by == created_by,
                     Rule.platform == params.platform,
+                    Rule.strategy == params.strategy,
                 )
                 .values(
                     is_active=False
@@ -776,6 +806,7 @@ async def create_rule(
         rule = Rule(
             name=params.name,
             platform=params.platform,
+            strategy=params.strategy,
             is_active=activate,
             max_buy_size_sol=(
                 params.max_buy_size_sol
