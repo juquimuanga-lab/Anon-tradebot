@@ -177,6 +177,105 @@ async def live_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     )
 
 
+@admin_required
+async def pumpfun_snipers_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Show and control the per-admin Pump.fun Fast/Smart strategy lanes."""
+    owner_id = update.effective_user.id
+    state = await repo.get_or_create_bot_state(owner_id)
+    rules = [r for r in await repo.get_rules_for_admin(owner_id) if getattr(r, "platform", "solana") == "solana"]
+    fast_rule = next((r for r in rules if r.is_active and getattr(r, "strategy", "smart") == "fast"), None)
+    smart_rule = next((r for r in rules if r.is_active and getattr(r, "strategy", "smart") == "smart"), None)
+
+    text = (
+        "⚡ *Pump.fun Sniper Control*\n\n"
+        f"Master Pump.fun: {'ON' if state.pumpfun_trading_enabled else 'OFF'}\n"
+        f"⚡ Fast Sniper: {'ON' if getattr(state, 'pumpfun_fast_enabled', False) else 'OFF'}\n"
+        f"🧠 Smart Filter: {'ON' if getattr(state, 'pumpfun_smart_enabled', True) else 'OFF'}\n\n"
+        f"⚡ Fast rule: #{fast_rule.id} {fast_rule.name if fast_rule else 'none'}\n"
+        f"🧠 Smart rule: #{smart_rule.id} {smart_rule.name if smart_rule else 'none'}\n\n"
+        "Fast rules intentionally skip holder/score checks and use only the launch-time safety gate. "
+        "Smart rules use the full quality/score pipeline."
+    )
+    buttons = [
+        [InlineKeyboardButton(
+            f"⚡ Fast {'OFF' if getattr(state, 'pumpfun_fast_enabled', False) else 'ON'}",
+            callback_data=f"sniper:toggle:fast:{'off' if getattr(state, 'pumpfun_fast_enabled', False) else 'on'}"
+        ),
+         InlineKeyboardButton(
+            f"🧠 Smart {'OFF' if getattr(state, 'pumpfun_smart_enabled', True) else 'ON'}",
+            callback_data=f"sniper:toggle:smart:{'off' if getattr(state, 'pumpfun_smart_enabled', True) else 'on'}"
+        )]
+    ]
+    for rule in rules[:12]:
+        buttons.append([
+            InlineKeyboardButton(f"Use #{rule.id} as ⚡ Fast", callback_data=f"sniper:rule:fast:{rule.id}"),
+            InlineKeyboardButton(f"Use #{rule.id} as 🧠 Smart", callback_data=f"sniper:rule:smart:{rule.id}"),
+        ])
+    await update.message.reply_text(text, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(buttons))
+
+
+async def pumpfun_snipers_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await query.answer()
+    from app.security.allowlist import is_admin
+    if not is_admin(update.effective_user.id):
+        await query.edit_message_text("Restricted to admin.")
+        return
+    parts = query.data.split(":")
+    owner_id = update.effective_user.id
+    if len(parts) < 4:
+        await query.edit_message_text("Invalid sniper control.")
+        return
+    action = parts[1]
+    kind = parts[2]
+    value = parts[3]
+    if action == "toggle":
+        enabled = value == "on"
+        field = "pumpfun_fast_enabled" if kind == "fast" else "pumpfun_smart_enabled"
+        await repo.update_bot_state(owner_id, **{field: enabled})
+        await repo.write_audit_log(str(owner_id), f"pumpfun_{kind}_{value}", {})
+        await query.edit_message_text(f"Pump.fun {'Fast Sniper' if kind == 'fast' else 'Smart Filter'}: {'ON' if enabled else 'OFF'}")
+        return
+    if action == "rule":
+        try:
+            rule_id = int(value)
+        except ValueError:
+            await query.edit_message_text("Invalid rule ID.")
+            return
+        rule = await repo.activate_rule_for_admin_strategy(rule_id, owner_id, kind)
+        if not rule:
+            await query.edit_message_text("Rule not found or does not belong to you.")
+            return
+        await repo.write_audit_log(str(owner_id), f"activate_pumpfun_{kind}_rule", {"rule_id": rule.id})
+        await query.edit_message_text(f"Rule #{rule.id} ({rule.name}) is now the active Pump.fun {kind.title()} rule.")
+        return
+    await query.edit_message_text("Unknown sniper control.")
+
+
+@admin_required
+async def setfast_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """CLI shortcut: /setfast RULE_ID"""
+    if not context.args or not context.args[0].isdigit():
+        await update.message.reply_text("Usage: /setfast RULE_ID")
+        return
+    rule = await repo.activate_rule_for_admin_strategy(int(context.args[0]), update.effective_user.id, "fast")
+    await update.message.reply_text(
+        f"Rule #{rule.id} is now the active Pump.fun Fast Sniper rule." if rule else "Rule not found or it is not yours."
+    )
+
+
+@admin_required
+async def setsmart_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """CLI shortcut: /setsmart RULE_ID"""
+    if not context.args or not context.args[0].isdigit():
+        await update.message.reply_text("Usage: /setsmart RULE_ID")
+        return
+    rule = await repo.activate_rule_for_admin_strategy(int(context.args[0]), update.effective_user.id, "smart")
+    await update.message.reply_text(
+        f"Rule #{rule.id} is now the active Pump.fun Smart Filter rule." if rule else "Rule not found or it is not yours."
+    )
+
+
 async def confirmation_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
     await query.answer()
