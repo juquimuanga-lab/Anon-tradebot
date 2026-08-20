@@ -164,12 +164,12 @@ class Rule(Base):
 
     min_liquidity_usd: Mapped[float] = mapped_column(
         Float,
-        default=2000.0,
+        default=2500.0,
     )
 
     min_holders: Mapped[int] = mapped_column(
         Integer,
-        default=25,
+        default=30,
     )
 
     max_age_seconds: Mapped[int] = mapped_column(
@@ -204,7 +204,7 @@ class Rule(Base):
 
     max_slippage_pct: Mapped[float] = mapped_column(
         Float,
-        default=5.0,
+        default=2.0,
     )
 
     qualify_score_threshold: Mapped[float] = mapped_column(
@@ -473,6 +473,13 @@ class Position(Base):
         default=0.0,
     )
 
+    # Authoritative accounting ledger for live trades.
+    entry_cost_usd: Mapped[float] = mapped_column(Float, default=0.0)
+    remaining_cost_basis_usd: Mapped[float] = mapped_column(Float, default=0.0)
+    total_proceeds_usd: Mapped[float] = mapped_column(Float, default=0.0)
+    total_fees_usd: Mapped[float] = mapped_column(Float, default=0.0)
+    total_network_fee_usd: Mapped[float] = mapped_column(Float, default=0.0)
+
     opened_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
         default=now_utc,
@@ -495,7 +502,13 @@ class BotState(Base):
     id: Mapped[int] = mapped_column(
         Integer,
         primary_key=True,
-        default=1,
+        autoincrement=True,
+    )
+
+    owner_user_id: Mapped[int | None] = mapped_column(
+        Integer,
+        nullable=True,
+        index=True,
     )
 
     mode: Mapped[str] = mapped_column(
