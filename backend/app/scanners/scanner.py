@@ -1282,10 +1282,14 @@ class ScannerService:
     ) -> bool:
 
         state = (
-            await repo.get_or_create_bot_state()
+            await repo.get_or_create_bot_state(rule_row.created_by)
         )
 
         if not state.trading_enabled:
+            await repo.save_trade_decision(
+                token.mint, rule_row.id, "skip",
+                "global trading disabled for this admin", score_result.score
+            )
             return False
 
         if (
@@ -1570,6 +1574,8 @@ class ScannerService:
 
             amount_tokens = None
             actual_amount_sol = amount_native
+            execution = None
+            sol_price = 0.0
 
             if (
                 token.source == SOURCE_PUMPFUN
@@ -1702,6 +1708,17 @@ class ScannerService:
                 actual_amount_sol,
                 owner_user_id=(
                     rule_row.created_by
+                ),
+                entry_cost_usd=(
+                    actual_amount_sol * float(sol_price)
+                    + (
+                        execution["fee_lamports"] / 1_000_000_000 * float(sol_price)
+                        if token.source == SOURCE_PUMPFUN and execution else 0.0
+                    )
+                ),
+                entry_fee_usd=(
+                    execution["fee_lamports"] / 1_000_000_000 * float(sol_price)
+                    if token.source == SOURCE_PUMPFUN and execution else 0.0
                 ),
                 entry_volume_24h_usd=(
                     token.volume_24h_usd
