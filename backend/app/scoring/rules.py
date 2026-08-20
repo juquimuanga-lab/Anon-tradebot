@@ -21,16 +21,16 @@ class RuleParams(BaseModel):
     platform: Literal["solana", "fourmeme"] = "solana"
     max_buy_size_sol: float = 0.1
     max_buy_size_bnb: float = 0.01
-    min_liquidity_usd: float = 2000.0
-    min_holders: int = 25
+    min_liquidity_usd: float = 2500.0
+    min_holders: int = 30
     max_age_seconds: int = 8
     creator_allowlist: List[str] = Field(default_factory=list)
     creator_denylist: List[str] = Field(default_factory=list)
     bonding_curve_phase: BondingCurvePhase = "any"
     min_market_cap_usd: Optional[float] = 7000.0
-    max_market_cap_usd: Optional[float] = 55000.0
-    max_slippage_pct: float = 5.0
-    qualify_score_threshold: float = 48.0
+    max_market_cap_usd: Optional[float] = 35000.0
+    max_slippage_pct: float = 2.0
+    qualify_score_threshold: float = 55.0
     max_trades_per_hour: int = 5
     cooldown_seconds: int = 120
     take_profit_levels: List[TakeProfitLevel] = Field(default_factory=list)
