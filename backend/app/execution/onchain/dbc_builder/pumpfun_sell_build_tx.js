@@ -76,9 +76,10 @@ const bs58 = require("bs58");
 // Configuration
 // ---------------------------------------------------------------------------
 
-const PRIORITY_LEVEL = "High";
+const PRIORITY_LEVEL = process.env.PUMPFUN_PRIORITY_LEVEL || "Medium";
 
 const FALLBACK_PRIORITY_FEE_MICROLAMPORTS = 10_000;
+const MAX_PRIORITY_FEE_MICROLAMPORTS = Number(process.env.PUMPFUN_PRIORITY_FEE_CAP_MICROLAMPORTS || 10_000);
 
 
 // Pump.fun main bonding-curve program.
@@ -255,8 +256,9 @@ async function getPriorityFeeEstimate(
     );
   }
 
-  return Math.ceil(
-    Number(estimate)
+  return Math.min(
+    Math.ceil(Number(estimate)),
+    Math.max(0, MAX_PRIORITY_FEE_MICROLAMPORTS)
   );
 }
 
