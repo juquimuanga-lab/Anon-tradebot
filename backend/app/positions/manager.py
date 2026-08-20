@@ -991,12 +991,14 @@ class PositionManager:
             # Calculate portion of original investment being sold.
             # ----------------------------------------------------------
 
+            # Cost basis is allocated from the remaining ledger, not from
+            # the entry quote. This keeps partial-sell PNL correct.
+            remaining_basis = float(getattr(position, "remaining_cost_basis_usd", 0.0) or 0.0)
+            remaining_position_pct = max(float(position.remaining_pct or 100.0), 0.000001)
             invested_portion = (
-                position.amount_sol_invested
-                * (
-                    sell_pct
-                    / 100.0
-                )
+                remaining_basis * (sell_pct / remaining_position_pct)
+                if remaining_basis > 0
+                else position.amount_sol_invested * (sell_pct / 100.0)
             )
 
             pnl_amount = (
@@ -1011,85 +1013,16 @@ class PositionManager:
                 )
             )
 
-            # For a confirmed live sell, use actual SOL proceeds for
-            # settlement/PnL whenever transaction reconciliation succeeded.
-            #
-            # IMPORTANT:
-            # Stop-loss PnL is intentionally calculated from the entry/exit
-            # price instead of trusting raw SOL proceeds. The proceeds
-            # reconciliation can be polluted by an unrelated inbound SOL
-            # transfer in the same transaction/wallet, which can make a real
-            # stop-loss appear as a positive PnL in Telegram.
-            #
-            # Take-profit and other exits retain the existing settlement
-            # behavior.
-            if actual_execution:
-                actual_proceeds_usd = (
-                    actual_execution["sol_received"]
-                    * (
-                        actual_execution["sol_usd"]
-                        if actual_execution["sol_usd"] > 0
-                        else 0.0
-                    )
-                )
-
-                if actual_proceeds_usd > 0:
-                    if reason == "stop loss hit":
-                        # A stop-loss must reflect the price relationship:
-                        # below entry = loss. Do not allow wallet-level
-                        # proceeds anomalies to flip the sign.
-                        pnl_amount = (
-                            invested_portion
-                            * (
-                                exit_price
-                                - position.entry_price_usd
-                            )
-                            / max(
-                                position.entry_price_usd,
-                                1e-12,
-                            )
-                        )
-
-                        # Defensive guard: if this exit was explicitly
-                        # classified as a stop loss, its notification must
-                        # never claim a positive PnL.
-                        pnl_amount = min(
-                            0.0,
-                            pnl_amount,
-                        )
-
-                        logger.info(
-                            "stop_loss_pnl_price_based",
-                            extra={
-                                "mint": token.mint,
-                                "position_id": position.id,
-                                "entry_price_usd": (
-                                    position.entry_price_usd
-                                ),
-                                "exit_price_usd": exit_price,
-                                "pnl_amount_usd": pnl_amount,
-                                "actual_proceeds_usd": (
-                                    actual_proceeds_usd
-                                ),
-                            },
-                        )
-                    else:
-                        pnl_amount = (
-                            actual_proceeds_usd
-                            - invested_portion
-                        )
-
-                    proceeds = actual_proceeds_usd
-                else:
-                    proceeds = (
-                        invested_portion
-                        + pnl_amount
-                    )
+            # For live trades, confirmed wallet proceeds are authoritative.
+            # Net PNL = actual proceeds - allocated cost basis - transaction fee.
+            if actual_execution and actual_execution.get("sol_usd", 0) > 0:
+                actual_proceeds_usd = actual_execution["sol_received"] * actual_execution["sol_usd"]
+                sell_fee_usd = actual_execution.get("fee_sol", 0.0) * actual_execution["sol_usd"]
+                pnl_amount = actual_proceeds_usd - invested_portion - sell_fee_usd
+                proceeds = actual_proceeds_usd
             else:
-                proceeds = (
-                    invested_portion
-                    + pnl_amount
-                )
+                proceeds = invested_portion + pnl_amount
+                sell_fee_usd = 0.0
 
             # ----------------------------------------------------------
             # Record order attempt.
@@ -1211,13 +1144,11 @@ class PositionManager:
                         proceeds
                     )
 
-            realized_pnl = (
-                float(
-                    position.realized_pnl_usd
-                    or 0.0
-                )
-                + pnl_amount
-            )
+            realized_pnl = float(position.realized_pnl_usd or 0.0) + pnl_amount
+            new_remaining_basis = max(0.0, remaining_basis - invested_portion)
+            total_proceeds = float(getattr(position, "total_proceeds_usd", 0.0) or 0.0) + float(proceeds)
+            total_fees = float(getattr(position, "total_fees_usd", 0.0) or 0.0) + float(sell_fee_usd)
+            total_network_fees = float(getattr(position, "total_network_fee_usd", 0.0) or 0.0) + float(sell_fee_usd)
 
             if remaining_pct <= 0.01:
 
@@ -1229,9 +1160,11 @@ class PositionManager:
                         timezone.utc
                     ),
                     close_reason=reason,
-                    realized_pnl_usd=(
-                        realized_pnl
-                    ),
+                    realized_pnl_usd=realized_pnl,
+                    remaining_cost_basis_usd=0.0,
+                    total_proceeds_usd=total_proceeds,
+                    total_fees_usd=total_fees,
+                    total_network_fee_usd=total_network_fees,
                 )
 
                 position.remaining_pct = 0.0
@@ -1258,9 +1191,11 @@ class PositionManager:
                     remaining_pct=(
                         remaining_pct
                     ),
-                    realized_pnl_usd=(
-                        realized_pnl
-                    ),
+                    realized_pnl_usd=realized_pnl,
+                    remaining_cost_basis_usd=new_remaining_basis,
+                    total_proceeds_usd=total_proceeds,
+                    total_fees_usd=total_fees,
+                    total_network_fee_usd=total_network_fees,
                 )
 
                 position.remaining_pct = (
@@ -1378,7 +1313,7 @@ class PositionManager:
         # --------------------------------------------------------------
 
         bot_state = (
-            await repo.get_or_create_bot_state()
+            await repo.get_or_create_bot_state(position.owner_user_id)
         )
 
         if not bot_state.trading_enabled:
@@ -1843,9 +1778,11 @@ class PositionManager:
         # a runner for large moves. Other sources keep the exact user rule.
         if token.source == "pumpfun":
             take_profit_levels = [
-                TakeProfitLevel(gain_pct=20.0, sell_pct=20.0),
-                TakeProfitLevel(gain_pct=40.0, sell_pct=25.0),
-                TakeProfitLevel(gain_pct=75.0, sell_pct=25.0),
+                # Give Pump.fun winners room to develop. The final 30% is
+                # intentionally left as a runner for large moves.
+                TakeProfitLevel(gain_pct=30.0, sell_pct=20.0),
+                TakeProfitLevel(gain_pct=60.0, sell_pct=25.0),
+                TakeProfitLevel(gain_pct=100.0, sell_pct=25.0),
             ]
         else:
             take_profit_levels = rule.take_profit_levels
