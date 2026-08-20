@@ -144,3 +144,17 @@ def compute_score(token: TokenSnapshot, rule: RuleParams, creator_watchlist: Lis
         score += CREATOR_MATCH_BONUS
     score = min(100.0, round(score, 2))
     return ScoreResult(score=score, creator_match=creator_match, breakdown=breakdown)
+
+
+def compute_fast_sniper_score(token: TokenSnapshot, rule: RuleParams) -> float:
+    """Low-latency telemetry score; never gates Fast Sniper execution."""
+    liquidity = float(token.liquidity_usd or 0.0)
+    market_cap = float(token.market_cap_usd or 0.0)
+    score = 50.0
+    if rule.min_liquidity_usd > 0:
+        score += min(25.0, max(0.0, liquidity / rule.min_liquidity_usd * 25.0))
+    if market_cap > 0 and (rule.max_market_cap_usd is None or market_cap <= rule.max_market_cap_usd):
+        score += 15.0
+    if token.age_seconds <= min(float(rule.max_age_seconds), 2.0):
+        score += 10.0
+    return round(min(100.0, score), 2)
