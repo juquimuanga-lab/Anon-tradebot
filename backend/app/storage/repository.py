@@ -3,7 +3,7 @@
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 
-from sqlalchemy import select
+from sqlalchemy import select, text
 
 from app.scoring.rules import RuleParams, TakeProfitLevel
 from app.storage.database import async_session_scope
@@ -19,69 +19,91 @@ from app.storage.models import (
 )
 
 
-async def get_or_create_bot_state() -> BotState:
-    async with async_session_scope() as session:
-        state = (
-            await session.execute(
-                select(BotState).where(
-                    BotState.id == 1
-                )
-            )
-        ).scalar_one_or_none()
+_BOT_STATE_SCHEMA_READY = False
 
+
+async def _ensure_bot_state_schema(session) -> None:
+    global _BOT_STATE_SCHEMA_READY
+    if _BOT_STATE_SCHEMA_READY:
+        return
+    # Lightweight compatibility migration for existing Railway databases.
+    # PostgreSQL/SQLite both support adding nullable columns; failures here
+    # are ignored only when the column already exists.
+    for ddl in (
+        "ALTER TABLE bot_state ADD COLUMN owner_user_id INTEGER",
+        "ALTER TABLE positions ADD COLUMN entry_cost_usd FLOAT DEFAULT 0",
+        "ALTER TABLE positions ADD COLUMN remaining_cost_basis_usd FLOAT DEFAULT 0",
+        "ALTER TABLE positions ADD COLUMN total_proceeds_usd FLOAT DEFAULT 0",
+        "ALTER TABLE positions ADD COLUMN total_fees_usd FLOAT DEFAULT 0",
+        "ALTER TABLE positions ADD COLUMN total_network_fee_usd FLOAT DEFAULT 0",
+    ):
+        try:
+            await session.execute(text(ddl))
+            await session.commit()
+        except Exception:
+            await session.rollback()
+    # One-time profitability-oriented defaults for rules that still have the
+    # original factory values. Custom rules are left untouched.
+    try:
+        await session.execute(text(
+            "UPDATE rules SET min_liquidity_usd=2500, min_holders=30, max_market_cap_usd=35000, max_slippage_pct=2, qualify_score_threshold=55 "
+            "WHERE platform='solana' AND min_liquidity_usd=2000 AND min_holders=25 AND max_market_cap_usd=55000 AND max_slippage_pct=5"
+        ))
+        await session.commit()
+    except Exception:
+        await session.rollback()
+    _BOT_STATE_SCHEMA_READY = True
+
+
+async def get_or_create_bot_state(owner_user_id: Optional[int] = None) -> BotState:
+    async with async_session_scope() as session:
+        await _ensure_bot_state_schema(session)
+        if owner_user_id is not None:
+            state = (await session.execute(
+                select(BotState).where(BotState.owner_user_id == owner_user_id)
+            )).scalar_one_or_none()
+            if state:
+                return state
+
+            # Clone the legacy global state once so deployment settings are
+            # preserved, then the admin becomes fully independent.
+            legacy = (await session.execute(
+                select(BotState).where(BotState.id == 1)
+            )).scalar_one_or_none()
+            if legacy:
+                state = BotState(
+                    owner_user_id=owner_user_id,
+                    mode=legacy.mode,
+                    trading_enabled=legacy.trading_enabled,
+                    anoncoin_trading_enabled=legacy.anoncoin_trading_enabled,
+                    pumpfun_trading_enabled=legacy.pumpfun_trading_enabled,
+                    fourmeme_trading_enabled=legacy.fourmeme_trading_enabled,
+                    paper_balance_sol=legacy.paper_balance_sol,
+                )
+            else:
+                from app.config.settings import settings
+                state = BotState(owner_user_id=owner_user_id, mode=settings.trading_mode, paper_balance_sol=settings.paper_starting_balance_sol)
+            session.add(state)
+            await session.commit(); await session.refresh(state)
+            return state
+
+        state = (await session.execute(
+            select(BotState).where(BotState.id == 1)
+        )).scalar_one_or_none()
         if not state:
             from app.config.settings import settings
-
-            state = BotState(
-                id=1,
-                mode=settings.trading_mode,
-                trading_enabled=True,
-                anoncoin_trading_enabled=True,
-                pumpfun_trading_enabled=True,
-                fourmeme_trading_enabled=False,
-                paper_balance_sol=(
-                    settings.paper_starting_balance_sol
-                ),
-            )
-
-            session.add(state)
-            await session.commit()
-            await session.refresh(state)
-
+            state = BotState(id=1, mode=settings.trading_mode, trading_enabled=True, anoncoin_trading_enabled=True, pumpfun_trading_enabled=True, fourmeme_trading_enabled=False, paper_balance_sol=settings.paper_starting_balance_sol)
+            session.add(state); await session.commit(); await session.refresh(state)
         return state
 
 
-async def update_bot_state(
-    **kwargs,
-) -> BotState:
-    await get_or_create_bot_state()
-
+async def update_bot_state(owner_user_id: Optional[int] = None, **kwargs) -> BotState:
+    state = await get_or_create_bot_state(owner_user_id)
     async with async_session_scope() as session:
-
-        state = (
-            await session.execute(
-                select(BotState).where(
-                    BotState.id == 1
-                )
-            )
-        ).scalar_one_or_none()
-
-        for key, value in kwargs.items():
-            setattr(
-                state,
-                key,
-                value,
-            )
-
-        state.updated_at = (
-            datetime.now(
-                timezone.utc
-            )
-        )
-
-        await session.commit()
-        await session.refresh(state)
-
+        state = (await session.execute(select(BotState).where(BotState.id == state.id))).scalar_one()
+        for key, value in kwargs.items(): setattr(state, key, value)
+        state.updated_at = datetime.now(timezone.utc)
+        await session.commit(); await session.refresh(state)
         return state
 
 
@@ -487,6 +509,8 @@ async def create_position(
     owner_user_id: Optional[int] = None,
     entry_volume_24h_usd: float = 0.0,
     source: str = "anoncoin_onchain",
+    entry_cost_usd: float = 0.0,
+    entry_fee_usd: float = 0.0,
 ) -> Position:
     """
     Create an open position.
@@ -531,6 +555,10 @@ async def create_position(
                 entry_volume_24h_usd
             ),
             defensive_exit_done=False,
+            entry_cost_usd=entry_cost_usd,
+            remaining_cost_basis_usd=entry_cost_usd,
+            total_fees_usd=entry_fee_usd,
+            total_network_fee_usd=entry_fee_usd,
         )
 
         session.add(position)
