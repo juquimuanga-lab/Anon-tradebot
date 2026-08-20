@@ -81,6 +81,7 @@ from app.scanners.normalize import (
 from app.scoring.rules import (
     TokenSnapshot,
     evaluate_hard_filters,
+    evaluate_fast_sniper_filters,
     evaluate_late_entry,
 )
 
@@ -136,6 +137,10 @@ def _rule_platform_for_source(source: str) -> str:
 
 def _rule_matches_source(rule, source: str) -> bool:
     return (getattr(rule, "platform", "solana") or "solana") == _rule_platform_for_source(source)
+
+
+def _rule_strategy(rule) -> str:
+    return "fast" if getattr(rule, "strategy", "smart") == "fast" else "smart"
 
 
 # ---------------------------------------------------------------------------
@@ -1115,6 +1120,44 @@ class ScannerService:
         )
         rule_params = self._apply_late_entry_settings(rule_params)
 
+        strategy = _rule_strategy(rule_row)
+
+        # Fast Sniper revalidation deliberately avoids holder enrichment, the
+        # Pump.fun quality score, and the full Smart score threshold. It only
+        # rechecks the fresh bonding-curve safety bounds plus the lightweight
+        # anti-chase guard before the transaction is sent.
+        if strategy == "fast":
+            fresh_token.raw_enrichment["late_entry_history"] = (
+                self._momentum_history.get(token.mint) or {}
+            )
+            fast_passed, fast_reasons = evaluate_fast_sniper_filters(
+                fresh_token, rule_params
+            )
+            fast_score_result = compute_score(
+                fresh_token, rule_params, settings.creator_watchlist
+            )
+            elapsed_ms = (time.monotonic() - started) * 1000.0
+            logger.info(
+                "pumpfun_fast_prebuy_revalidation",
+                extra={
+                    "mint": token.mint,
+                    "rule_id": rule_row.id,
+                    "market_cap_usd": fresh_token.market_cap_usd,
+                    "liquidity_usd": fresh_token.liquidity_usd,
+                    "age_seconds": fresh_token.age_seconds,
+                    "passed": fast_passed,
+                    "reasons": fast_reasons,
+                    "elapsed_ms": elapsed_ms,
+                },
+            )
+            if not fast_passed:
+                logger.info(
+                    "pumpfun_fast_prebuy_rejected",
+                    extra={"mint": token.mint, "rule_id": rule_row.id, "reasons": fast_reasons},
+                )
+                return fresh_token, fast_score_result, False
+            return fresh_token, fast_score_result, True
+
         # Carry the scanner's observed launch history into the fresh pre-buy
         # snapshot so the final RPC read cannot bypass the anti-chase gate.
         fresh_token.raw_enrichment["late_entry_history"] = (
@@ -1324,6 +1367,29 @@ class ScannerService:
             )
             return False
 
+        # Defense-in-depth: the pending-launch dispatcher already filters these
+        # lanes, but execution must enforce the per-admin strategy switch too.
+        if token.source == SOURCE_PUMPFUN:
+            strategy = _rule_strategy(rule_row)
+            if not state.pumpfun_trading_enabled:
+                await repo.save_trade_decision(
+                    token.mint, rule_row.id, "skip",
+                    "Pump.fun master switch disabled for this admin", score_result.score
+                )
+                return False
+            if strategy == "fast" and not getattr(state, "pumpfun_fast_enabled", False):
+                await repo.save_trade_decision(
+                    token.mint, rule_row.id, "skip",
+                    "Fast Sniper disabled for this admin", score_result.score
+                )
+                return False
+            if strategy == "smart" and not getattr(state, "pumpfun_smart_enabled", True):
+                await repo.save_trade_decision(
+                    token.mint, rule_row.id, "skip",
+                    "Smart Filter disabled for this admin", score_result.score
+                )
+                return False
+
         if (
             _is_anoncoin_source(token.source)
             and not state.anoncoin_trading_enabled
@@ -1454,25 +1520,35 @@ class ScannerService:
         # min_market_cap_usd=8000 cannot be satisfied by an old snapshot
         # while the actual buy occurs materially below that level.
         # --------------------------------------------------------------
-        (
-            token,
-            score_result,
-            prebuy_valid,
-        ) = await self._revalidate_pumpfun_before_buy(
-            token,
-            rule_row,
-            score_result,
-        )
-
-        if not prebuy_valid:
-            await repo.save_trade_decision(
-                token.mint,
-                rule_row.id,
-                "skip",
-                "Pump.fun pre-buy market data changed or no longer passed rules",
-                score_result.score,
+        if token.source == SOURCE_PUMPFUN and _rule_strategy(rule_row) == "fast":
+            # Fast Sniper deliberately avoids a second Python-side bonding-curve
+            # read here. The launch snapshot has already passed the fast safety
+            # gate and the transaction builder obtains the current execution data.
+            # This removes an avoidable RPC round-trip from the hot path.
+            logger.info(
+                "pumpfun_fast_hot_path_prebuy_revalidation_skipped",
+                extra={"mint": token.mint, "rule_id": rule_row.id},
             )
-            return False
+        else:
+            (
+                token,
+                score_result,
+                prebuy_valid,
+            ) = await self._revalidate_pumpfun_before_buy(
+                token,
+                rule_row,
+                score_result,
+            )
+
+            if not prebuy_valid:
+                await repo.save_trade_decision(
+                    token.mint,
+                    rule_row.id,
+                    "skip",
+                    "Pump.fun pre-buy market data changed or no longer passed rules",
+                    score_result.score,
+                )
+                return False
 
         if token.source == SOURCE_FOURMEME:
             # Four.meme rules use BNB. The legacy order column remains named
@@ -1934,6 +2010,42 @@ class ScannerService:
         else:
             token.raw_enrichment.pop("momentum_previous", None)
 
+        strategy = _rule_strategy(rule)
+
+        if token.source == SOURCE_PUMPFUN and strategy == "fast":
+            passed, reasons = evaluate_fast_sniper_filters(token, rule_params)
+            score_result = compute_score(token, rule_params, settings.creator_watchlist)
+            logger.info(
+                "fast_sniper_rule_evaluation",
+                extra={
+                    "mint": token.mint,
+                    "rule_id": rule.id,
+                    "score_telemetry": score_result.score,
+                    "market_cap_usd": token.market_cap_usd,
+                    "liquidity_usd": token.liquidity_usd,
+                    "age_seconds": token.age_seconds,
+                    "passed": passed,
+                    "reasons": reasons,
+                },
+            )
+            if not passed:
+                logger.info(
+                    "fast_sniper_rejected",
+                    extra={"mint": token.mint, "rule_id": rule.id, "reasons": reasons},
+                )
+                return False
+
+            metrics.tokens_qualified += 1
+            await self._notifier.new_qualified_token(
+                rule.created_by, token.ticker_symbol or token.mint[:8],
+                token.mint, score_result.score, token.source
+            )
+            logger.info(
+                "fast_sniper_buy_dispatch",
+                extra={"mint": token.mint, "rule_id": rule.id, "score_telemetry": score_result.score},
+            )
+            return await self._maybe_trade(token, rule, score_result)
+
         # Evaluate the normal hard filters before scoring/late-entry checks.
         # ``passed`` and ``reasons`` are used by the telemetry, persistence,
         # and hard-filter rejection path below.
@@ -2286,12 +2398,26 @@ class ScannerService:
 
                 continue
 
-            due_rules = [
-                rule
-                for rule in active_rules
-                if _rule_matches_source(rule, source)
-                and age_seconds <= rule.max_age_seconds
-            ]
+            due_rules = []
+            for rule in active_rules:
+                if not _rule_matches_source(rule, source):
+                    continue
+                # Pump.fun has independent Fast/Smart switches per admin.
+                if source == SOURCE_PUMPFUN:
+                    state = await repo.get_or_create_bot_state(rule.created_by)
+                    if not state.trading_enabled or not state.pumpfun_trading_enabled:
+                        continue
+                    strategy = _rule_strategy(rule)
+                    if strategy == "fast" and not getattr(state, "pumpfun_fast_enabled", False):
+                        continue
+                    if strategy == "smart" and not getattr(state, "pumpfun_smart_enabled", True):
+                        continue
+                    # Fast lane is intentionally limited to a two-second hot window.
+                    effective_age = min(rule.max_age_seconds, 2) if strategy == "fast" else rule.max_age_seconds
+                else:
+                    effective_age = rule.max_age_seconds
+                if age_seconds <= effective_age:
+                    due_rules.append(rule)
 
             if not due_rules:
 
@@ -2333,30 +2459,57 @@ class ScannerService:
                 token
             )
 
-            token = (
-                await self._enrich_holders(
-                    token
-                )
-            )
+            # ----------------------------------------------------------
+            # FAST SNIPER HOT PATH
+            # ----------------------------------------------------------
+            # Process Fast rules immediately from the first bonding-curve
+            # snapshot. Do NOT call Helius holder enrichment or the Smart
+            # quality gate before this path.
+            fast_rules = [r for r in due_rules if _rule_strategy(r) == "fast"]
+            smart_rules = [r for r in due_rules if _rule_strategy(r) != "fast"]
+
+            fast_settled = True
+            if source == SOURCE_PUMPFUN and fast_rules:
+                for rule in fast_rules:
+                    key = (mint, rule.id)
+                    done = await self._screen_and_maybe_trade(
+                        token, rule, notify_on_fail=False
+                    )
+                    self._notified_fail.add(key)
+                    if done:
+                        self._notified_fail.discard(key)
+                    else:
+                        fast_settled = False
+
+            # ----------------------------------------------------------
+            # SMART FILTER PATH
+            # ----------------------------------------------------------
+            # Only the Smart lane pays the holder-enrichment/quality-gate
+            # latency cost.
+            if smart_rules:
+                token = await self._enrich_holders(token)
 
             # Apply the Pump.fun launch-quality score after holder enrichment.
             # Unlike the previous 5k/10-holder/50x hard gate, this score lets
             # decent early launches through while filtering the weakest
             # launches. Temporary missing snapshot data is deferred rather
             # than permanently discarded.
-            (
-                quality_status,
-                quality_score,
-                quality_reasons,
-                quality_breakdown,
-            ) = self._pumpfun_quality_gate(token)
+            if smart_rules:
+                (
+                    quality_status,
+                    quality_score,
+                    quality_reasons,
+                    quality_breakdown,
+                ) = self._pumpfun_quality_gate(token)
+            else:
+                quality_status, quality_score, quality_reasons, quality_breakdown = ("pass", 100.0, [], {})
 
-            if quality_status == "defer":
+            if smart_rules and quality_status == "defer":
                 # Keep the token in _pending_watch for another snapshot.
                 continue
 
-            if quality_status == "reject":
-                for rule in due_rules:
+            if smart_rules and quality_status == "reject":
+                for rule in smart_rules:
                     await repo.save_screening_result(
                         token.mint,
                         False,
@@ -2390,9 +2543,9 @@ class ScannerService:
                     self._notified_fail.discard((mint, rule.id))
                 continue
 
-            all_settled = True
+            all_settled = fast_settled
 
-            for rule in due_rules:
+            for rule in smart_rules:
 
                 key = (
                     mint,
