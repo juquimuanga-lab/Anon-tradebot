@@ -333,7 +333,7 @@ class ExecutionRouter:
                 return NoWalletConnectedAdapter(
                     "Four.meme live trading is disabled at deployment level; set FOURMEME_TRADING_ENABLED=true."
                 )
-            state = await repo.get_or_create_bot_state()
+            state = await repo.get_or_create_bot_state(owner_user_id)
             if not state.fourmeme_trading_enabled:
                 return NoWalletConnectedAdapter(
                     "Four.meme trading is paused. Use /enablefourmeme to resume."
