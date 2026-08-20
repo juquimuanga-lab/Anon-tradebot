@@ -147,6 +147,12 @@ class Rule(Base):
         index=True,
     )
 
+    strategy: Mapped[str] = mapped_column(
+        String,
+        default="smart",
+        index=True,
+    )
+
     is_active: Mapped[bool] = mapped_column(
         Boolean,
         default=False,
@@ -527,6 +533,18 @@ class BotState(Base):
     )
 
     pumpfun_trading_enabled: Mapped[bool] = mapped_column(
+        Boolean,
+        default=True,
+    )
+
+    # Independent Pump.fun strategy switches. Smart remains enabled by default
+    # for backwards compatibility; Fast Sniper is opt-in.
+    pumpfun_fast_enabled: Mapped[bool] = mapped_column(
+        Boolean,
+        default=False,
+    )
+
+    pumpfun_smart_enabled: Mapped[bool] = mapped_column(
         Boolean,
         default=True,
     )
