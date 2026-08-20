@@ -283,7 +283,13 @@ class Settings(BaseSettings):
         "https://lite-api.jup.ag/price/v3"
     )
 
-    default_slippage_bps: int = 300
+    default_slippage_bps: int = 200
+
+    # Execution-friction controls. Priority fee is capped per transaction.
+    pumpfun_priority_level: str = Field(default="Medium", validation_alias="PUMPFUN_PRIORITY_LEVEL")
+    pumpfun_priority_fee_cap_micro_lamports: int = Field(default=10_000, validation_alias="PUMPFUN_PRIORITY_FEE_CAP_MICROLAMPORTS")
+    pumpfun_buy_slippage_bps: int = Field(default=200, validation_alias="PUMPFUN_BUY_SLIPPAGE_BPS")
+    pumpfun_sell_slippage_bps: int = Field(default=200, validation_alias="PUMPFUN_SELL_SLIPPAGE_BPS")
 
     # ------------------------------------------------------------------
     # Timers
