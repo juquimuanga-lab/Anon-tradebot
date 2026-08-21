@@ -1587,6 +1587,50 @@ def _extract_wallet_bought_mint(tx, wallet: str) -> Optional[dict]:
     return max(candidates, key=lambda item: item["token_amount_raw"])
 
 
+def _extract_wallet_sold_mint(tx, wallet: str) -> Optional[dict]:
+    """Find a non-SOL token balance decrease for the watched wallet."""
+    transaction = _obj_get(tx, "transaction")
+    meta = _obj_get(transaction, "meta")
+    if meta is None:
+        return None
+
+    pre = _obj_get(meta, "pre_token_balances", []) or []
+    post = _obj_get(meta, "post_token_balances", []) or []
+
+    post_by_key: dict[tuple, int] = {}
+    for item in post:
+        mint = str(_obj_get(item, "mint", "") or "")
+        owner = _obj_get(item, "owner")
+        owner = str(owner) if owner else ""
+        account_index = _obj_get(item, "account_index", _obj_get(item, "accountIndex", -1))
+        post_by_key[(owner, mint, int(account_index or -1))] = _token_balance_amount(item)
+
+    candidates: list[dict] = []
+    for item in pre:
+        mint = str(_obj_get(item, "mint", "") or "")
+        if not mint or mint == SOL_MINT:
+            continue
+        owner = _obj_get(item, "owner")
+        owner = str(owner) if owner else ""
+        if owner and owner != wallet:
+            continue
+        account_index = _obj_get(item, "account_index", _obj_get(item, "accountIndex", -1))
+        account_index = int(account_index or -1)
+        before = _token_balance_amount(item)
+        after = post_by_key.get((owner, mint, account_index), 0)
+        delta = before - after
+        if delta > 0:
+            candidates.append({
+                "mint": mint,
+                "token_amount_raw": delta,
+                "account_index": account_index,
+            })
+
+    if not candidates:
+        return None
+    return max(candidates, key=lambda item: item["token_amount_raw"])
+
+
 async def _get_transaction_for_smart_money(rpc_url: str, signature: str):
     last_exc = None
     for delay in (0.0, 0.05, 0.15, 0.30):
@@ -1744,15 +1788,42 @@ async def _smart_money_stream_worker(
                             continue
 
                         bought = _extract_wallet_bought_mint(tx, wallet)
+                        sold = _extract_wallet_sold_mint(tx, wallet)
+                        sol_spent = _estimate_wallet_sol_spent(tx, wallet)
+
+                        # This diagnostic is intentionally emitted before any
+                        # downstream rule/filter. It tells us exactly what Helius
+                        # delivered and how the wallet movement was classified.
+                        direction = "BUY" if bought else ("SELL" if sold else "UNKNOWN")
+                        classified = bought or sold
+                        logger.info(
+                            "smart_money_transaction_classified",
+                            extra={
+                                "wallet": wallet,
+                                "signature": signature,
+                                "has_pumpfun": has_pumpfun,
+                                "direction": direction,
+                                "mint": (classified or {}).get("mint"),
+                                "token_amount_raw": (classified or {}).get("token_amount_raw", 0),
+                                "sol_spent": sol_spent,
+                                "log_count": len(logs),
+                            },
+                        )
+
                         if not bought:
-                            logger.debug(
-                                "smart_money_buy_without_token_delta",
-                                extra={"wallet": wallet, "signature": signature},
+                            logger.info(
+                                "smart_money_copy_skipped",
+                                extra={
+                                    "wallet": wallet,
+                                    "signature": signature,
+                                    "direction": direction,
+                                    "reason": "not_a_buy",
+                                    "mint": (classified or {}).get("mint"),
+                                },
                             )
                             continue
 
-                        sol_spent = _estimate_wallet_sol_spent(tx, wallet)
-                                        # We do not have to price the trade here to detect it.
+                        # We do not have to price the trade here to detect it.
                         # The configured minimum is intentionally not enforced at
                         # the transport layer because SOL/USD would add another
                         # latency/API dependency. The event carries the exact SOL
@@ -1772,6 +1843,16 @@ async def _smart_money_stream_worker(
                         state["last_event_signature"] = signature
                         state["last_event_mint"] = bought["mint"]
 
+                        logger.info(
+                            "smart_money_buy_dispatch_ready",
+                            extra={
+                                "wallet": wallet,
+                                "signature": signature,
+                                "mint": bought["mint"],
+                                "token_amount_raw": bought["token_amount_raw"],
+                                "sol_spent": sol_spent,
+                            },
+                        )
                         try:
                             queue.put_nowait(event)
                         except asyncio.QueueFull:
@@ -2806,3 +2887,4 @@ async def poll_new_pumpfun_mints(
         )
 
     return discovered
+
