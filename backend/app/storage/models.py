@@ -563,6 +563,13 @@ class BotState(Base):
         nullable=True,
     )
 
+    # GO Guardian V1 state. These fields persist the supervisory circuit breaker
+    # independently for each Telegram admin.
+    guardian_enabled: Mapped[bool] = mapped_column(Boolean, default=True)
+    guardian_auto_pause_enabled: Mapped[bool] = mapped_column(Boolean, default=True)
+    guardian_last_status: Mapped[str] = mapped_column(String, default="HEALTHY")
+    guardian_pause_reason: Mapped[str | None] = mapped_column(String, nullable=True)
+
     fourmeme_trading_enabled: Mapped[bool] = mapped_column(
         Boolean,
         default=False,
