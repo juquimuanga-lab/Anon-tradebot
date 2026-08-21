@@ -41,30 +41,50 @@ def _parse_take_profit(raw: str) -> list[TakeProfitLevel]:
     return levels
 
 
+
+def _parse_strategy(raw: str) -> str:
+    value = sanitize_text(raw).lower().replace("-", "_").replace(" ", "_")
+    aliases = {
+        "fast": "fast",
+        "fast_sniper": "fast",
+        "smart": "smart",
+        "smart_filter": "smart",
+    }
+    if value not in aliases:
+        raise ValueError("must be one of: fast, smart")
+    return aliases[value]
+
+
 def _steps(platform: str) -> list[Step]:
     buy_key = "max_buy_size_bnb" if platform == "fourmeme" else "max_buy_size_sol"
     buy_unit = "BNB" if platform == "fourmeme" else "SOL"
     buy_default = 0.01 if platform == "fourmeme" else 0.1
     return [
-        Step("name", "Step 1/18 - Name this rule set (e.g. `sniper-default`):", sanitize_text, default="default"),
-        Step(buy_key, f"Step 2/18 - Max buy size per trade, in {buy_unit} (e.g. `0.01`):", lambda r: parse_float(r, 0.000001, 1000), default=buy_default),
-        Step("min_liquidity_usd", "Step 3/18 - Minimum liquidity in USD (e.g. `1000`):", lambda r: parse_float(r, 0, 1e9)),
-        Step("min_holders", "Step 4/18 - Minimum holder count (e.g. `10`):", lambda r: parse_int(r, 0, 1_000_000)),
-        Step("max_age_seconds", "Step 5/18 - Max token age since creation, in seconds (e.g. `600`):", lambda r: parse_int(r, 1, 86400 * 30)),
-        Step("creator_allowlist", "Step 6/18 - Creator wallet ALLOWLIST, comma separated, or /skip for none:", parse_wallet_list, default=[], optional=True),
-        Step("creator_denylist", "Step 7/18 - Creator wallet DENYLIST, comma separated, or /skip for none:", parse_wallet_list, default=[], optional=True),
-        Step("bonding_curve_phase", "Step 8/18 - Bonding curve phase requirement: `any`, `pre_graduation` or `post_graduation`:", _parse_phase, default="any"),
-        Step("min_market_cap_usd", "Step 9/18 - Min market cap in USD, or /skip for none:", lambda r: parse_float(r, 0, 1e12), default=None, optional=True),
-        Step("max_market_cap_usd", "Step 10/18 - Max market cap in USD, or /skip for none:", lambda r: parse_float(r, 0, 1e12), default=None, optional=True),
-        Step("max_slippage_pct", "Step 11/19 - Max slippage percent (e.g. `5`):", lambda r: parse_float(r, 0, 100)),
-        Step("qualify_score_threshold", "Step 12/19 - Minimum qualification score (0-100, e.g. `50`):", lambda r: parse_float(r, 0, 100), default=52.0),
-        Step("max_trades_per_hour", "Step 13/19 - Max trades per hour (e.g. `5`):", lambda r: parse_int(r, 1, 1000)),
-        Step("cooldown_seconds", "Step 14/19 - Cooldown between buys, in seconds (e.g. `120`):", lambda r: parse_int(r, 0, 86400)),
-        Step("take_profit_levels", "Step 15/19 - Take profit levels as `gain:sell%,gain:sell%` (e.g. `50:50,100:50`), or /skip:", _parse_take_profit, default=[], optional=True),
-        Step("stop_loss_pct", "Step 16/19 - Stop loss percent (e.g. `20`):", lambda r: parse_float(r, 0, 100)),
-        Step("trailing_stop_pct", "Step 17/19 - Trailing stop percent, or /skip for none:", lambda r: parse_float(r, 0, 100), default=None, optional=True),
-        Step("sell_on_volume_drop_pct", "Step 18/19 - Sell on volume drop percent, or /skip for none:", lambda r: parse_float(r, 0, 100), default=None, optional=True),
-        Step("time_based_exit_seconds", "Step 19/19 - Time-based exit, in seconds, or /skip for none:", lambda r: parse_int(r, 1, 86400 * 30), default=None, optional=True),
+        Step("name", "Step 1/20 - Name this rule set (e.g. `sniper-default`):", sanitize_text, default="default"),
+        Step(
+            "strategy",
+            "Step 2/20 - Entry strategy: `fast` for ⚡ Fast Sniper or `smart` for 🧠 Smart Filter:",
+            _parse_strategy,
+            default="smart",
+        ),
+        Step(buy_key, f"Step 3/20 - Max buy size per trade, in {buy_unit} (e.g. `0.01`):", lambda r: parse_float(r, 0.000001, 1000), default=buy_default),
+        Step("min_liquidity_usd", "Step 4/20 - Minimum liquidity in USD (e.g. `1000`):", lambda r: parse_float(r, 0, 1e9)),
+        Step("min_holders", "Step 5/20 - Minimum holder count (e.g. `10`):", lambda r: parse_int(r, 0, 1_000_000)),
+        Step("max_age_seconds", "Step 6/20 - Max token age since creation, in seconds (e.g. `600`):", lambda r: parse_int(r, 1, 86400 * 30)),
+        Step("creator_allowlist", "Step 7/20 - Creator wallet ALLOWLIST, comma separated, or /skip for none:", parse_wallet_list, default=[], optional=True),
+        Step("creator_denylist", "Step 8/20 - Creator wallet DENYLIST, comma separated, or /skip for none:", parse_wallet_list, default=[], optional=True),
+        Step("bonding_curve_phase", "Step 9/20 - Bonding curve phase requirement: `any`, `pre_graduation` or `post_graduation`:", _parse_phase, default="any"),
+        Step("min_market_cap_usd", "Step 10/20 - Min market cap in USD, or /skip for none:", lambda r: parse_float(r, 0, 1e12), default=None, optional=True),
+        Step("max_market_cap_usd", "Step 11/20 - Max market cap in USD, or /skip for none:", lambda r: parse_float(r, 0, 1e12), default=None, optional=True),
+        Step("max_slippage_pct", "Step 12/20 - Max slippage percent (e.g. `5`):", lambda r: parse_float(r, 0, 100)),
+        Step("qualify_score_threshold", "Step 13/20 - Minimum qualification score (0-100, e.g. `50`):", lambda r: parse_float(r, 0, 100), default=52.0),
+        Step("max_trades_per_hour", "Step 14/20 - Max trades per hour (e.g. `5`):", lambda r: parse_int(r, 1, 1000)),
+        Step("cooldown_seconds", "Step 15/20 - Cooldown between buys, in seconds (e.g. `120`):", lambda r: parse_int(r, 0, 86400)),
+        Step("take_profit_levels", "Step 16/20 - Take profit levels as `gain:sell%,gain:sell%` (e.g. `50:50,100:50`), or /skip:", _parse_take_profit, default=[], optional=True),
+        Step("stop_loss_pct", "Step 17/20 - Stop loss percent (e.g. `20`):", lambda r: parse_float(r, 0, 100)),
+        Step("trailing_stop_pct", "Step 18/20 - Trailing stop percent, or /skip for none:", lambda r: parse_float(r, 0, 100), default=None, optional=True),
+        Step("sell_on_volume_drop_pct", "Step 19/20 - Sell on volume drop percent, or /skip for none:", lambda r: parse_float(r, 0, 100), default=None, optional=True),
+        Step("time_based_exit_seconds", "Step 20/20 - Time-based exit, in seconds, or /skip for none:", lambda r: parse_int(r, 1, 86400 * 30), default=None, optional=True),
     ]
 
 
@@ -144,7 +164,8 @@ async def _finish_wizard(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         f"Max buy: {buy} {unit} | Min liq: ${params.min_liquidity_usd:,.0f} | "
         f"Min holders: {params.min_holders} | Max age: {params.max_age_seconds}s\n"
         f"Market cap: ${params.min_market_cap_usd or 0:,.0f} - ${params.max_market_cap_usd:,.0f} | "
-        f"SL: {params.stop_loss_pct}% | TP levels: {len(params.take_profit_levels)}\n\n"
+        f"SL: {params.stop_loss_pct}% | TP levels: {len(params.take_profit_levels)}\n"
+        f"Entry strategy: {'⚡ FAST SNIPER' if params.strategy == 'fast' else '🧠 SMART FILTER'}\n\n"
         f"Activate this *{label}* rule set now?"
     )
     keyboard = InlineKeyboardMarkup(
