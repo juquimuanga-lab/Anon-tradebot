@@ -57,8 +57,12 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 async def status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     state = await repo.get_or_create_bot_state()
-    active_rule = await repo.get_active_rule_for(update.effective_user.id, "solana")
+    fast_rule = await repo.get_active_rule_for_strategy(update.effective_user.id, "solana", "fast")
+    smart_rule = await repo.get_active_rule_for_strategy(update.effective_user.id, "solana", "smart")
     fourmeme_rule = await repo.get_active_rule_for(update.effective_user.id, "fourmeme")
+    smart_money_rule = None
+    if hasattr(repo, "get_active_smart_money_rule"):
+        smart_money_rule = await repo.get_active_smart_money_rule(update.effective_user.id, "solana")
     positions = await repo.get_open_positions()
     orders = await repo.get_recent_orders(3)
 
@@ -69,7 +73,9 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     wallet_key = await secrets_manager.get_wallet_private_key(update.effective_user.id)
     wallet_line = "connected (use /balance to check funds)" if wallet_key else "not connected (use /connectwallet for live trading)"
 
-    rule_line = f"`{active_rule.name}` (id {active_rule.id})" if active_rule else "none - use /setrule"
+    fast_rule_line = f"`{fast_rule.name}` (id {fast_rule.id})" if fast_rule else "none"
+    smart_rule_line = f"`{smart_rule.name}` (id {smart_rule.id})" if smart_rule else "none"
+    smart_money_rule_line = f"`{smart_money_rule.name}` (id {smart_money_rule.id})" if smart_money_rule else "none"
     fourmeme_rule_line = f"`{fourmeme_rule.name}` (id {fourmeme_rule.id})" if fourmeme_rule else "none - use /setrulefourmeme"
     recent_lines = "\n".join(
         f"  - {o.side} {o.mint[:6]}... [{o.status}]" for o in orders
@@ -81,7 +87,9 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         f"*Pump.fun trading:* {state.pumpfun_trading_enabled} | "
         f"*Smart Money Copy:* {getattr(state, 'smart_money_copy_enabled', False)} | "
         f"*Four.meme trading:* {state.fourmeme_trading_enabled and settings.fourmeme_trading_enabled}\n"
-        f"*Solana rule:* {rule_line}\n"
+        f"*Fast rule:* {fast_rule_line}\n"
+        f"*Smart rule:* {smart_rule_line}\n"
+        f"*Smart Money rule:* {smart_money_rule_line}\n"
         f"*Four.meme rule:* {fourmeme_rule_line}\n"
         f"*Connected APIs:* Anoncoin: {anoncoin_connected}, Helius: {helius_connected}\n"
         f"*Your wallet:* {wallet_line}\n"
