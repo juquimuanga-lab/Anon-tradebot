@@ -35,6 +35,8 @@ def build_application() -> Application:
     application.add_handler(CommandHandler("pumpfunsnipers", handlers_admin.pumpfun_snipers_cmd))
     application.add_handler(CommandHandler("setfast", handlers_admin.setfast_cmd))
     application.add_handler(CommandHandler("setsmart", handlers_admin.setsmart_cmd))
+    application.add_handler(CommandHandler("enablesmartmoney", handlers_admin.enablesmartmoney_cmd))
+    application.add_handler(CommandHandler("disablesmartmoney", handlers_admin.disablesmartmoney_cmd))
     application.add_handler(CommandHandler("enablefourmeme", handlers_admin.enablefourmeme_cmd))
     application.add_handler(CommandHandler("disablefourmeme", handlers_admin.disablefourmeme_cmd))
     application.add_handler(CommandHandler("paper", handlers_admin.paper_cmd))
