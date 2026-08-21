@@ -183,7 +183,7 @@ class Settings(BaseSettings):
 
     smart_money_wallets_raw: str = Field(
         default=(
-            "6cNjLym8bDZ5JFGFSDom2us27iF7EBHYUXdFCdC5zWhX"
+            "HmUt3Jn46j7c7ANdURmEyjSRj8i3Em6MhjQUi37PZ219"
         ),
         validation_alias="SMART_MONEY_WALLETS",
     )
@@ -290,17 +290,6 @@ class Settings(BaseSettings):
     pumpfun_priority_fee_cap_micro_lamports: int = Field(default=10_000, validation_alias="PUMPFUN_PRIORITY_FEE_CAP_MICROLAMPORTS")
     pumpfun_buy_slippage_bps: int = Field(default=200, validation_alias="PUMPFUN_BUY_SLIPPAGE_BPS")
     pumpfun_sell_slippage_bps: int = Field(default=200, validation_alias="PUMPFUN_SELL_SLIPPAGE_BPS")
-
-    # Anti-late-entry safety controls. These are environment overrides for
-    # deployments that want to tune the strategy without changing code.
-    late_entry_enabled: bool = True
-    late_entry_max_age_seconds: float = 5.0
-    late_entry_soft_market_cap_usd: float = 18_000.0
-    late_entry_hard_market_cap_usd: float = 28_000.0
-    late_entry_near_high_pct: float = 4.0
-    late_entry_required_pullback_pct: float = 8.0
-    late_entry_max_short_runup_pct: float = 35.0
-    late_entry_max_runup_from_first_pct: float = 90.0
 
     # ------------------------------------------------------------------
     # Timers
