@@ -1535,12 +1535,11 @@ def _estimate_wallet_sol_spent(tx, wallet: str) -> float:
 
 
 def _extract_wallet_bought_mint(tx, wallet: str) -> Optional[dict]:
-    """Find a non-SOL token whose balance increased for the watched wallet.
+    """Find a non-SOL token balance increase for the watched wallet.
 
-    The transaction has already been identified from Helius WSS logs as a
-    successful transaction containing Pump.fun's Buy instruction. Token
-    balance deltas are then used to identify the exact mint received by the
-    wallet. This avoids a second provider/API dependency.
+    Direction is established from the actual token/SOL balance changes rather
+    than requiring an exact Pump.fun log message. This makes Smart Money
+    detection resilient to instruction/log variants.
     """
     transaction = _obj_get(tx, "transaction")
     meta = _obj_get(transaction, "meta")
@@ -1696,15 +1695,36 @@ async def _smart_money_stream_worker(
                             for old_signature, _ in oldest:
                                 seen.pop(old_signature, None)
 
-                        # We only want Pump.fun buys, not arbitrary transfers or
-                        # sells made by the tracked wallet.
+                        # Do not discard wallet transactions solely because a
+                        # particular Pump.fun log string is missing. The tracked
+                        # wallet may buy through a variant/route whose logs do not
+                        # contain the exact "Instruction: Buy" text. Fetch the
+                        # transaction and prove direction from balance deltas.
                         has_pumpfun = any(
                             PUMPFUN_PROGRAM_ID in str(line) for line in logs
                         )
-                        has_buy = any(
-                            "Instruction: Buy" in str(line) for line in logs
+
+                        state["transactions_seen"] = int(
+                            state.get("transactions_seen", 0)
+                        ) + 1
+                        state["last_transaction_at"] = time.time()
+                        state["last_transaction_signature"] = signature
+                        state["last_transaction_has_pumpfun"] = has_pumpfun
+
+                        logger.info(
+                            "smart_money_transaction_received",
+                            extra={
+                                "wallet": wallet,
+                                "signature": signature,
+                                "has_pumpfun": has_pumpfun,
+                                "log_count": len(logs),
+                            },
                         )
-                        if not (has_pumpfun and has_buy):
+
+                        if not has_pumpfun:
+                            state["non_pumpfun_transactions"] = int(
+                                state.get("non_pumpfun_transactions", 0)
+                            ) + 1
                             continue
 
                         try:
@@ -1827,10 +1847,15 @@ def _get_or_create_smart_money_stream(rpc_url: str, wallet: str) -> dict:
         "task": None,
         "connected": False,
         "events_seen": 0,
+        "transactions_seen": 0,
+        "non_pumpfun_transactions": 0,
         "queue_drops": 0,
         "last_event_at": 0.0,
         "last_event_signature": None,
         "last_event_mint": None,
+        "last_transaction_at": 0.0,
+        "last_transaction_signature": None,
+        "last_transaction_has_pumpfun": False,
         "seen_signatures": {},
     }
     state["task"] = asyncio.create_task(
@@ -2781,4 +2806,3 @@ async def poll_new_pumpfun_mints(
         )
 
     return discovered
-
