@@ -183,17 +183,27 @@ async def get_active_smart_money_rule(admin_id: int, platform: str = "solana") -
     """Return the rule explicitly assigned to this admin's Smart Money lane."""
     async with async_session_scope() as session:
         await _ensure_bot_state_schema(session)
-        state = (await session.execute(
-            select(BotState).where(BotState.owner_user_id == admin_id)
-        )).scalar_one_or_none()
-        rule_id = getattr(state, "smart_money_rule_id", None) if state else None
+        state = (
+            await session.execute(
+                select(BotState).where(
+                    BotState.owner_user_id == admin_id
+                )
+            )
+        ).scalar_one_or_none()
+
+        rule_id = state.smart_money_rule_id if state else None
         if not rule_id:
             return None
-        return (await session.execute(
-            select(Rule).where(
-                Rule.id == rule_id, Rule.created_by == admin_id, Rule.platform == platform
+
+        return (
+            await session.execute(
+                select(Rule).where(
+                    Rule.id == rule_id,
+                    Rule.created_by == admin_id,
+                    Rule.platform == platform,
+                )
             )
-        )).scalars().first()
+        ).scalars().first()
 
 
 async def set_smart_money_rule(rule_id: int, admin_id: int) -> Optional[Rule]:
@@ -229,8 +239,8 @@ async def set_smart_money_rule(rule_id: int, admin_id: int) -> Optional[Rule]:
                 from app.config.settings import settings
                 state=BotState(owner_user_id=admin_id, mode=settings.trading_mode, paper_balance_sol=settings.paper_starting_balance_sol)
             session.add(state)
-        state.smart_money_rule_id=rule_id
-        state.updated_at=datetime.now(timezone.utc)
+        state.smart_money_rule_id = rule_id
+        state.updated_at = datetime.now(timezone.utc)
         await session.commit()
         await session.refresh(target)
         return target
@@ -677,16 +687,17 @@ async def create_position(
         return position
 
 
-async def get_open_positions() -> list[Position]:
+async def get_open_positions(owner_user_id: Optional[int] = None) -> list[Position]:
 
     async with async_session_scope() as session:
+        conditions = [Position.status == "open"]
+        if owner_user_id is not None:
+            conditions.append(Position.owner_user_id == owner_user_id)
 
         return list(
             (
                 await session.execute(
-                    select(Position).where(
-                        Position.status == "open"
-                    )
+                    select(Position).where(*conditions)
                 )
             ).scalars().all()
         )
@@ -722,17 +733,17 @@ async def update_position(
 
 async def get_recent_orders(
     limit: int = 10,
+    owner_user_id: Optional[int] = None,
 ) -> list[Order]:
 
     async with async_session_scope() as session:
+        query = select(Order)
+        if owner_user_id is not None:
+            query = query.where(Order.owner_user_id == owner_user_id)
 
         rows = (
             await session.execute(
-                select(Order)
-                .order_by(
-                    Order.created_at.desc()
-                )
-                .limit(limit)
+                query.order_by(Order.created_at.desc()).limit(limit)
             )
         ).scalars().all()
 
