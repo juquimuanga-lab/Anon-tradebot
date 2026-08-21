@@ -67,10 +67,9 @@ async def enable_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 
 @admin_required
 async def disable_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    token = confirmation_store.create("disable_all", {})
     keyboard = InlineKeyboardMarkup(
-        [[InlineKeyboardButton("Confirm disable", callback_data=f"confirm:{token}:yes"),
-          InlineKeyboardButton("Cancel", callback_data=f"confirm:{token}:no")]]
+        [[InlineKeyboardButton("Confirm disable", callback_data="actionconfirm:disable_all:yes"),
+          InlineKeyboardButton("Cancel", callback_data="actionconfirm:disable_all:no")]]
     )
     await update.message.reply_text(
         "This will immediately pause ALL automated trading - no new buys, and no "
@@ -90,10 +89,9 @@ async def enableanoncoin_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
 @admin_required
 async def disableanoncoin_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    token = confirmation_store.create("disable_anoncoin", {})
     keyboard = InlineKeyboardMarkup(
-        [[InlineKeyboardButton("Confirm disable Anoncoin", callback_data=f"confirm:{token}:yes"),
-          InlineKeyboardButton("Cancel", callback_data=f"confirm:{token}:no")]]
+        [[InlineKeyboardButton("Confirm disable Anoncoin", callback_data="actionconfirm:disable_anoncoin:yes"),
+          InlineKeyboardButton("Cancel", callback_data="actionconfirm:disable_anoncoin:no")]]
     )
     await update.message.reply_text(
         "This pauses new Anoncoin buys only - Pump.fun keeps trading, and any open "
@@ -124,10 +122,9 @@ async def enablefourmeme_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
 @admin_required
 async def disablefourmeme_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    token = confirmation_store.create("disable_fourmeme", {})
     keyboard = InlineKeyboardMarkup(
-        [[InlineKeyboardButton("Confirm disable Four.meme", callback_data=f"confirm:{token}:yes"),
-          InlineKeyboardButton("Cancel", callback_data=f"confirm:{token}:no")]]
+        [[InlineKeyboardButton("Confirm disable Four.meme", callback_data="actionconfirm:disable_fourmeme:yes"),
+          InlineKeyboardButton("Cancel", callback_data="actionconfirm:disable_fourmeme:no")]]
     )
     await update.message.reply_text(
         "This pauses new Four.meme buys only. Pump.fun and Anoncoin keep trading, and existing Four.meme positions keep their automated exits. Confirm?",
@@ -137,10 +134,9 @@ async def disablefourmeme_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE
 
 @admin_required
 async def disablepumpfun_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    token = confirmation_store.create("disable_pumpfun", {})
     keyboard = InlineKeyboardMarkup(
-        [[InlineKeyboardButton("Confirm disable Pump.fun", callback_data=f"confirm:{token}:yes"),
-          InlineKeyboardButton("Cancel", callback_data=f"confirm:{token}:no")]]
+        [[InlineKeyboardButton("Confirm disable Pump.fun", callback_data="actionconfirm:disable_pumpfun:yes"),
+          InlineKeyboardButton("Cancel", callback_data="actionconfirm:disable_pumpfun:no")]]
     )
     await update.message.reply_text(
         "This pauses new Pump.fun buys only - Anoncoin keeps trading, and any open "
@@ -152,20 +148,18 @@ async def disablepumpfun_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
 @admin_required
 async def paper_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    token = confirmation_store.create("switch_mode", {"mode": "paper"})
     keyboard = InlineKeyboardMarkup(
-        [[InlineKeyboardButton("Confirm switch to PAPER", callback_data=f"confirm:{token}:yes"),
-          InlineKeyboardButton("Cancel", callback_data=f"confirm:{token}:no")]]
+        [[InlineKeyboardButton("Confirm switch to PAPER", callback_data="actionconfirm:paper:yes"),
+          InlineKeyboardButton("Cancel", callback_data="actionconfirm:paper:no")]]
     )
     await update.message.reply_text("Switch trading mode to PAPER?", reply_markup=keyboard)
 
 
 @admin_required
 async def live_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    token = confirmation_store.create("switch_mode", {"mode": "live"})
     keyboard = InlineKeyboardMarkup(
-        [[InlineKeyboardButton("Confirm switch to LIVE", callback_data=f"confirm:{token}:yes"),
-          InlineKeyboardButton("Cancel", callback_data=f"confirm:{token}:no")]]
+        [[InlineKeyboardButton("Confirm switch to LIVE", callback_data="actionconfirm:live:yes"),
+          InlineKeyboardButton("Cancel", callback_data="actionconfirm:live:no")]]
     )
     await update.message.reply_text(
         "*Warning:* LIVE mode places real on-chain trades using the wallet each rule's "
@@ -179,21 +173,25 @@ async def live_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 @admin_required
 async def pumpfun_snipers_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Show and control the per-admin Pump.fun Fast/Smart strategy lanes."""
+    """Show and control the independent Pump.fun Fast/Smart/Smart-Money lanes."""
     owner_id = update.effective_user.id
     state = await repo.get_or_create_bot_state(owner_id)
     rules = [r for r in await repo.get_rules_for_admin(owner_id) if getattr(r, "platform", "solana") == "solana"]
     fast_rule = next((r for r in rules if r.is_active and getattr(r, "strategy", "smart") == "fast"), None)
     smart_rule = next((r for r in rules if r.is_active and getattr(r, "strategy", "smart") == "smart"), None)
+    smart_money_rule = None
+    if hasattr(repo, "get_active_smart_money_rule"):
+        smart_money_rule = await repo.get_active_smart_money_rule(owner_id, "solana")
 
     text = (
         "⚡ *Pump.fun Sniper Control*\n\n"
         f"Master Pump.fun: {'ON' if state.pumpfun_trading_enabled else 'OFF'}\n"
         f"⚡ Fast Sniper: {'ON' if getattr(state, 'pumpfun_fast_enabled', False) else 'OFF'}\n"
         f"🧠 Smart Filter: {'ON' if getattr(state, 'pumpfun_smart_enabled', True) else 'OFF'}\n"
-        f"👁 Smart Money Copy: {'ON' if getattr(state, 'smart_money_copy_enabled', False) else 'OFF'}\n\n"
+        f"👁 Smart Money Copy: {'ON' if getattr(state, 'smart_money_copy_enabled', False) else 'OFF'}\n"
         f"⚡ Fast rule: #{fast_rule.id} {fast_rule.name if fast_rule else 'none'}\n"
-        f"🧠 Smart rule: #{smart_rule.id} {smart_rule.name if smart_rule else 'none'}\n\n"
+        f"🧠 Smart rule: #{smart_rule.id} {smart_rule.name if smart_rule else 'none'}\n"
+        f"👁 Smart Money rule: #{smart_money_rule.id} {smart_money_rule.name if smart_money_rule else 'none'}\n\n"
         "Fast rules intentionally skip holder/score checks and use only the launch-time safety gate. "
         "Smart rules use the full quality/score pipeline."
     )
@@ -216,6 +214,13 @@ async def pumpfun_snipers_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE
             InlineKeyboardButton(f"Use #{rule.id} as ⚡ Fast", callback_data=f"sniper:rule:fast:{rule.id}"),
             InlineKeyboardButton(f"Use #{rule.id} as 🧠 Smart", callback_data=f"sniper:rule:smart:{rule.id}"),
         ])
+        if hasattr(repo, "set_smart_money_rule"):
+            buttons.append([
+                InlineKeyboardButton(
+                    f"Use #{rule.id} as 👁 Smart Money",
+                    callback_data=f"sniper:rule:smart_money:{rule.id}",
+                )
+            ])
     await update.message.reply_text(text, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(buttons))
 
 
@@ -259,6 +264,27 @@ async def pumpfun_snipers_callback(update: Update, context: ContextTypes.DEFAULT
         except ValueError:
             await query.edit_message_text("Invalid rule ID.")
             return
+        if kind == "smart_money":
+            if not hasattr(repo, "set_smart_money_rule"):
+                await query.edit_message_text(
+                    "Smart Money rule support is not deployed yet. "
+                    "Deploy the matching repository patch first."
+                )
+                return
+            rule = await repo.set_smart_money_rule(rule_id, owner_id)
+            if not rule:
+                await query.edit_message_text("Rule not found or does not belong to you.")
+                return
+            await repo.write_audit_log(
+                str(owner_id),
+                "assign_pumpfun_smart_money_rule",
+                {"rule_id": rule.id},
+            )
+            await query.edit_message_text(
+                f"Rule #{rule.id} ({rule.name}) is now the independent Pump.fun Smart Money rule."
+            )
+            return
+
         rule = await repo.activate_rule_for_admin_strategy(rule_id, owner_id, kind)
         if not rule:
             await query.edit_message_text("Rule not found or does not belong to you.")
@@ -328,6 +354,61 @@ async def disablesmartmoney_cmd(update: Update, context: ContextTypes.DEFAULT_TY
         "🧠 Smart Money Copy: OFF\n\n"
         "No new wallet buys will be copied. Existing positions keep their normal exits."
     )
+
+
+async def action_confirmation_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle simple confirmations without an expiring in-memory token."""
+    query = update.callback_query
+    await query.answer()
+
+    from app.security.allowlist import is_admin
+    if not is_admin(update.effective_user.id):
+        await query.edit_message_text("Restricted to admin.")
+        return
+
+    parts = query.data.split(":", 2)
+    if len(parts) != 3:
+        await query.edit_message_text("Invalid confirmation.")
+        return
+
+    _, action, decision = parts
+    if decision != "yes":
+        await query.edit_message_text("Cancelled.")
+        return
+
+    owner_id = update.effective_user.id
+
+    if action == "disable_all":
+        await repo.update_bot_state(owner_id, trading_enabled=False)
+        await repo.write_audit_log(str(owner_id), "disable_all_confirmed", {})
+        await query.edit_message_text("All automated trading has been paused.")
+        return
+
+    if action == "disable_anoncoin":
+        await repo.update_bot_state(owner_id, anoncoin_trading_enabled=False)
+        await repo.write_audit_log(str(owner_id), "disable_anoncoin_confirmed", {})
+        await query.edit_message_text("Anoncoin trading paused. Pump.fun is unaffected.")
+        return
+
+    if action == "disable_pumpfun":
+        await repo.update_bot_state(owner_id, pumpfun_trading_enabled=False)
+        await repo.write_audit_log(str(owner_id), "disable_pumpfun_confirmed", {})
+        await query.edit_message_text("Pump.fun trading paused. Anoncoin and Four.meme are unaffected.")
+        return
+
+    if action == "disable_fourmeme":
+        await repo.update_bot_state(owner_id, fourmeme_trading_enabled=False)
+        await repo.write_audit_log(str(owner_id), "disable_fourmeme_confirmed", {})
+        await query.edit_message_text("Four.meme trading paused. Pump.fun and Anoncoin are unaffected.")
+        return
+
+    if action in ("paper", "live"):
+        await repo.update_bot_state(owner_id, mode=action)
+        await repo.write_audit_log(str(owner_id), "switch_mode", {"mode": action})
+        await query.edit_message_text(f"Trading mode switched to {action.upper()}.")
+        return
+
+    await query.edit_message_text("Unknown confirmation action.")
 
 
 async def confirmation_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
