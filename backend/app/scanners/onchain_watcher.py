@@ -21,6 +21,7 @@ import base64
 import logging
 import json
 import struct
+import time
 from collections import deque
 from typing import Optional
 from urllib.parse import urlsplit, urlunsplit
@@ -123,15 +124,17 @@ ALCHEMY_HEALTHCHECK_TIMEOUT_SECONDS = 8.0
 PUMPFUN_FALLBACK_SIGNATURE_LIMIT = 10
 PUMPFUN_EVENT_QUEUE_MAXSIZE = 500
 
-# Low-latency launch discovery. `processed` is intentionally used for the
-# websocket feed so the trading pipeline can see a launch as soon as the RPC
-# provider observes it. HTTP recovery remains `confirmed` and is the
-# reconciliation path. The execution layer must still perform its own safety
-# checks before signing a live trade.
-PUMPFUN_WS_COMMITMENT = "processed"
+# Smart-money wallet monitoring. This uses the existing Helius Solana
+# WebSocket transport instead of Solana Tracker REST polling.
+SMART_MONEY_EVENT_QUEUE_MAXSIZE = 200
+SMART_MONEY_STREAM_RECONNECT_SECONDS = 1.0
+SMART_MONEY_STREAM_MAX_BACKOFF_SECONDS = 15.0
 
 # One stream task per watched mint-authority address.
 _pumpfun_streams: dict[str, dict] = {}
+
+# One low-latency Helius stream for the configured smart-money wallet.
+_smart_money_streams: dict[str, dict] = {}
 
 
 # ---------------------------------------------------------------------------
@@ -1469,28 +1472,388 @@ def _is_supported_pumpfun_launch(
     """Return True for both supported Pump.fun launch instruction versions.
 
     Legacy Pump.fun launches use `create` and Token-2022 launches use
-    `create_v2`. The websocket CreateEvent path uses `create_event` because
-    the event layout is shared by both versions. That event is accepted as a
-    discovery signal without waiting for getTransaction; HTTP recovery remains
-    authoritative when reconciling missed launches. The execution builder
-    resolves the actual mint owner at buy time so it can construct the correct
+    `create_v2`. Both are valid Pump.fun bonding-curve launches and are
+    forwarded to the common trading pipeline. The execution builder resolves
+    the actual mint owner at buy time so it can construct the correct
     Token/Token-2022 instructions.
     """
 
     return bool(
         launch
-        and (
-            launch.get("instruction") in {
-                "create",
-                "create_v2",
-            }
-            or (
-                launch.get("instruction") == "create_event"
-                and launch.get("discovery") == "websocket_create_event"
-                and launch.get("verification_pending") is True
-            )
-        )
+        and launch.get("instruction") in {
+            "create",
+            "create_v2",
+        }
     )
+
+
+# ---------------------------------------------------------------------------
+# Smart-money wallet streaming
+# ---------------------------------------------------------------------------
+
+def _obj_get(obj, key: str, default=None):
+    """Read a field from either a dict or a solders/solana object."""
+    if obj is None:
+        return default
+    if isinstance(obj, dict):
+        return obj.get(key, default)
+    return getattr(obj, key, default)
+
+
+def _token_balance_amount(balance) -> int:
+    token_amount = _obj_get(balance, "ui_token_amount")
+    raw = _obj_get(token_amount, "amount", 0)
+    try:
+        return int(raw or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _estimate_wallet_sol_spent(tx, wallet: str) -> float:
+    transaction = _obj_get(tx, "transaction")
+    meta = _obj_get(transaction, "meta")
+    if meta is None:
+        return 0.0
+    pre_balances = _obj_get(meta, "pre_balances", []) or []
+    post_balances = _obj_get(meta, "post_balances", []) or []
+    message = _obj_get(transaction, "transaction")
+    message = _obj_get(message, "message") or _obj_get(transaction, "message")
+    account_keys = _obj_get(message, "account_keys", []) or _obj_get(message, "accountKeys", []) or []
+    wallet_index = None
+    for idx, account in enumerate(account_keys):
+        pubkey = _obj_get(account, "pubkey", account)
+        if str(pubkey) == wallet:
+            wallet_index = idx
+            break
+    if wallet_index is None or wallet_index >= len(pre_balances) or wallet_index >= len(post_balances):
+        return 0.0
+    try:
+        delta = int(pre_balances[wallet_index]) - int(post_balances[wallet_index])
+        return max(0.0, delta / 1_000_000_000)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _extract_wallet_bought_mint(tx, wallet: str) -> Optional[dict]:
+    """Find a non-SOL token whose balance increased for the watched wallet.
+
+    The transaction has already been identified from Helius WSS logs as a
+    successful transaction containing Pump.fun's Buy instruction. Token
+    balance deltas are then used to identify the exact mint received by the
+    wallet. This avoids a second provider/API dependency.
+    """
+    transaction = _obj_get(tx, "transaction")
+    meta = _obj_get(transaction, "meta")
+    if meta is None:
+        return None
+
+    pre = _obj_get(meta, "pre_token_balances", []) or []
+    post = _obj_get(meta, "post_token_balances", []) or []
+
+    pre_by_key: dict[tuple, int] = {}
+    for item in pre:
+        mint = str(_obj_get(item, "mint", "") or "")
+        owner = _obj_get(item, "owner")
+        owner = str(owner) if owner else ""
+        account_index = _obj_get(item, "account_index", _obj_get(item, "accountIndex", -1))
+        pre_by_key[(owner, mint, int(account_index or -1))] = _token_balance_amount(item)
+
+    candidates: list[dict] = []
+    for item in post:
+        mint = str(_obj_get(item, "mint", "") or "")
+        if not mint or mint == SOL_MINT:
+            continue
+        owner = _obj_get(item, "owner")
+        owner = str(owner) if owner else ""
+        if owner and owner != wallet:
+            continue
+        account_index = _obj_get(item, "account_index", _obj_get(item, "accountIndex", -1))
+        account_index = int(account_index or -1)
+        after = _token_balance_amount(item)
+        before = pre_by_key.get((owner, mint, account_index), 0)
+        delta = after - before
+        if delta > 0:
+            candidates.append({
+                "mint": mint,
+                "token_amount_raw": delta,
+                "account_index": account_index,
+            })
+
+    if not candidates:
+        return None
+
+    # A Pump.fun buy normally has one newly/increased token mint. If a
+    # transaction contains multiple positive token deltas, prefer the largest
+    # delta rather than guessing from account ordering.
+    return max(candidates, key=lambda item: item["token_amount_raw"])
+
+
+async def _get_transaction_for_smart_money(rpc_url: str, signature: str):
+    last_exc = None
+    for delay in (0.0, 0.05, 0.15, 0.30):
+        if delay:
+            await asyncio.sleep(delay)
+        try:
+            async with AsyncClient(rpc_url) as client:
+                response = await client.get_transaction(
+                    Signature.from_string(signature),
+                    encoding="jsonParsed",
+                    max_supported_transaction_version=0,
+                )
+            if response.value is not None:
+                return response.value
+        except Exception as exc:
+            last_exc = exc
+    if last_exc:
+        raise last_exc
+    return None
+
+
+async def _smart_money_stream_worker(
+    rpc_url: str,
+    wallet: str,
+    queue: asyncio.Queue,
+    stop_event: asyncio.Event,
+    state: dict,
+) -> None:
+    """Watch one wallet through Helius WSS and emit Pump.fun buys immediately."""
+    backoff = SMART_MONEY_STREAM_RECONNECT_SECONDS
+
+    while not stop_event.is_set():
+        ws_url = _rpc_http_to_ws_url(rpc_url)
+        if not ws_url:
+            state["connected"] = False
+            logger.warning("smart_money_stream_unavailable", extra={"wallet": wallet})
+        else:
+            try:
+                logger.info(
+                    "smart_money_stream_connect_attempt",
+                    extra={"wallet": wallet, "ws_url": _safe_rpc_url(ws_url)},
+                )
+                async with websockets.connect(
+                    ws_url,
+                    open_timeout=15,
+                    ping_interval=20,
+                    ping_timeout=20,
+                    close_timeout=5,
+                    max_size=4 * 1024 * 1024,
+                ) as ws:
+                    request = {
+                        "jsonrpc": "2.0",
+                        "id": 1,
+                        "method": "logsSubscribe",
+                        "params": [
+                            {"mentions": [wallet]},
+                            {"commitment": "processed"},
+                        ],
+                    }
+                    await ws.send(json.dumps(request))
+                    raw = await asyncio.wait_for(ws.recv(), timeout=15)
+                    response = json.loads(raw)
+                    if "error" in response:
+                        raise RuntimeError(f"Helius smart-money logsSubscribe failed: {response['error']}")
+                    if "result" not in response:
+                        raise RuntimeError(f"Helius smart-money subscription returned no id: {response!r}")
+
+                    state["connected"] = True
+                    state["subscription_id"] = response.get("result")
+                    backoff = SMART_MONEY_STREAM_RECONNECT_SECONDS
+                    logger.info(
+                        "smart_money_stream_connected",
+                        extra={"wallet": wallet, "subscription_id": response.get("result")},
+                    )
+
+                    while not stop_event.is_set():
+                        try:
+                            raw = await asyncio.wait_for(ws.recv(), timeout=60)
+                        except asyncio.TimeoutError:
+                            pong = await ws.ping()
+                            await asyncio.wait_for(pong, timeout=10)
+                            continue
+
+                        try:
+                            message = json.loads(raw)
+                        except Exception:
+                            continue
+
+                        params = message.get("params") or {}
+                        result = params.get("result") or {}
+                        value = result.get("value") or {}
+                        if value.get("err") is not None:
+                            continue
+
+                        signature = value.get("signature")
+                        logs = value.get("logs") or []
+                        if not signature:
+                            continue
+
+                        seen = state.setdefault("seen_signatures", {})
+                        if signature in seen:
+                            continue
+                        seen[signature] = asyncio.get_running_loop().time()
+                        if len(seen) > 5000:
+                            oldest = sorted(seen.items(), key=lambda item: item[1])[:1000]
+                            for old_signature, _ in oldest:
+                                seen.pop(old_signature, None)
+
+                        # We only want Pump.fun buys, not arbitrary transfers or
+                        # sells made by the tracked wallet.
+                        has_pumpfun = any(
+                            PUMPFUN_PROGRAM_ID in str(line) for line in logs
+                        )
+                        has_buy = any(
+                            "Instruction: Buy" in str(line) for line in logs
+                        )
+                        if not (has_pumpfun and has_buy):
+                            continue
+
+                        try:
+                            tx = await _get_transaction_for_smart_money(rpc_url, signature)
+                        except Exception as exc:
+                            logger.warning(
+                                "smart_money_get_transaction_failed",
+                                extra={
+                                    "wallet": wallet,
+                                    "signature": signature,
+                                    "error": f"{type(exc).__name__}: {exc}",
+                                },
+                            )
+                            continue
+
+                        if not tx:
+                            continue
+
+                        bought = _extract_wallet_bought_mint(tx, wallet)
+                        if not bought:
+                            logger.debug(
+                                "smart_money_buy_without_token_delta",
+                                extra={"wallet": wallet, "signature": signature},
+                            )
+                            continue
+
+                        sol_spent = _estimate_wallet_sol_spent(tx, wallet)
+                                        # We do not have to price the trade here to detect it.
+                        # The configured minimum is intentionally not enforced at
+                        # the transport layer because SOL/USD would add another
+                        # latency/API dependency. The event carries the exact SOL
+                        # delta for downstream telemetry.
+                        event = {
+                            "wallet": wallet,
+                            "mint": bought["mint"],
+                            "tx_signature": signature,
+                            "token_amount_raw": bought["token_amount_raw"],
+                            "sol_spent": sol_spent,
+                            "detected_at": time.time(),
+                            "discovery": "helius_wss_wallet_buy",
+                            "source": "pumpfun",
+                        }
+                        state["events_seen"] = int(state.get("events_seen", 0)) + 1
+                        state["last_event_at"] = time.time()
+                        state["last_event_signature"] = signature
+                        state["last_event_mint"] = bought["mint"]
+
+                        try:
+                            queue.put_nowait(event)
+                        except asyncio.QueueFull:
+                            state["queue_drops"] = int(state.get("queue_drops", 0)) + 1
+                            try:
+                                queue.get_nowait()
+                            except asyncio.QueueEmpty:
+                                pass
+                            try:
+                                queue.put_nowait(event)
+                            except asyncio.QueueFull:
+                                pass
+
+                        logger.info(
+                            "smart_money_buy_detected " + json.dumps(
+                                event,
+                                default=str,
+                                separators=(",", ":"),
+                                sort_keys=True,
+                            ),
+                            extra=event,
+                        )
+
+            except asyncio.CancelledError:
+                raise
+            except ConnectionClosed as exc:
+                state["connected"] = False
+                logger.warning(
+                    "smart_money_stream_disconnected",
+                    extra={
+                        "wallet": wallet,
+                        "close_code": exc.code,
+                        "close_reason": exc.reason,
+                        "retry_seconds": backoff,
+                    },
+                )
+            except Exception as exc:
+                state["connected"] = False
+                logger.warning(
+                    "smart_money_stream_disconnected",
+                    extra={
+                        "wallet": wallet,
+                        "error": f"{type(exc).__name__}: {exc}",
+                        "retry_seconds": backoff,
+                    },
+                )
+
+        try:
+            await asyncio.wait_for(stop_event.wait(), timeout=backoff)
+        except asyncio.TimeoutError:
+            pass
+        backoff = min(backoff * 2, SMART_MONEY_STREAM_MAX_BACKOFF_SECONDS)
+
+
+def _get_or_create_smart_money_stream(rpc_url: str, wallet: str) -> dict:
+    state = _smart_money_streams.get(wallet)
+    if state:
+        task = state.get("task")
+        if task and not task.done():
+            return state
+
+    queue: asyncio.Queue = asyncio.Queue(maxsize=SMART_MONEY_EVENT_QUEUE_MAXSIZE)
+    stop_event = asyncio.Event()
+    state = {
+        "queue": queue,
+        "stop_event": stop_event,
+        "task": None,
+        "connected": False,
+        "events_seen": 0,
+        "queue_drops": 0,
+        "last_event_at": 0.0,
+        "last_event_signature": None,
+        "last_event_mint": None,
+        "seen_signatures": {},
+    }
+    state["task"] = asyncio.create_task(
+        _smart_money_stream_worker(rpc_url, wallet, queue, stop_event, state),
+        name=f"smart-money-{wallet[:8]}",
+    )
+    _smart_money_streams[wallet] = state
+    return state
+
+
+def drain_smart_money_buys(rpc_url: str, wallets: list[str]) -> list[dict]:
+    """Drain smart-money buys already received by Helius WSS."""
+    discovered: list[dict] = []
+    if not settings.smart_money_enabled:
+        return discovered
+
+    for wallet in wallets:
+        wallet = str(wallet or "").strip()
+        if not wallet:
+            continue
+        state = _get_or_create_smart_money_stream(rpc_url, wallet)
+        queue = state["queue"]
+        while True:
+            try:
+                item = queue.get_nowait()
+            except asyncio.QueueEmpty:
+                break
+            discovered.append(item)
+    return discovered
 
 
 # ---------------------------------------------------------------------------
@@ -1751,7 +2114,7 @@ async def _pumpfun_stream_worker(
                         "method": "logsSubscribe",
                         "params": [
                             {"mentions": [mint_authority]},
-                            {"commitment": PUMPFUN_WS_COMMITMENT},
+                            {"commitment": "confirmed"},
                         ],
                     }
 
@@ -1852,21 +2215,50 @@ async def _pumpfun_stream_worker(
                         if not launch:
                             continue
 
-                        # LOW-LATENCY PATH:
-                        # CreateEvent already contains the mint + creator and is
-                        # emitted by Pump.fun for both legacy `create` and
-                        # Token-2022 `create_v2`. Do NOT call getTransaction here.
-                        # That extra RPC round-trip was on the critical path and
-                        # could add hundreds of milliseconds (or seconds during
-                        # RPC pressure), defeating first-seconds sniping.
-                        #
-                        # Recovery still performs authoritative transaction
-                        # parsing below, so the stream is treated as a discovery
-                        # signal rather than a final transaction classification.
-                        launch["tx_signature"] = signature
-                        launch["instruction"] = "create_event"
-                        launch["verification_pending"] = True
-                        launch["block_time"] = None
+                        # CreateEvent is identical for legacy `create` and
+                        # Token-2022 `create_v2`, so the event alone cannot
+                        # safely tell us which token program was used.
+                        # Verify the actual transaction before allowing the
+                        # launch into the trading pipeline. Fail closed:
+                        # if verification cannot prove a supported Pump.fun create version, skip it.
+                        verified_launch = None
+                        try:
+                            async with AsyncClient(rpc_url) as verify_client:
+                                verify_resp = await verify_client.get_transaction(
+                                    Signature.from_string(signature),
+                                    encoding="jsonParsed",
+                                    max_supported_transaction_version=0,
+                                )
+                            verify_tx = verify_resp.value
+                            if verify_tx:
+                                verified_launch = extract_pumpfun_create(verify_tx)
+                        except Exception as exc:
+                            logger.warning(
+                                "pumpfun_launch_version_verification_failed",
+                                extra={
+                                    "signature": signature,
+                                    "error": f"{type(exc).__name__}: {exc}",
+                                },
+                            )
+
+                        if not _is_supported_pumpfun_launch(verified_launch):
+                            logger.info(
+                                "pumpfun_unsupported_launch_skipped",
+                                extra={
+                                    "signature": signature,
+                                    "mint": launch.get("mint"),
+                                    "instruction": (
+                                        verified_launch.get("instruction")
+                                        if verified_launch
+                                        else None
+                                    ),
+                                },
+                            )
+                            continue
+
+                        # Use the transaction-derived launch metadata because
+                        # it includes the authoritative instruction version.
+                        launch = verified_launch
 
                         now = asyncio.get_running_loop().time()
                         state["events_seen"] = int(state.get("events_seen", 0)) + 1
@@ -1900,17 +2292,16 @@ async def _pumpfun_stream_worker(
                                 },
                             )
 
+                        launch["tx_signature"] = signature
+                        launch["block_time"] = None
                         launch["watched_wallet"] = mint_authority
                         launch["discovery"] = "websocket_create_event"
                         launch["rpc_transport"] = "primary"
-                        # The CreateEvent layout is shared by legacy and
-                        # Token-2022 launches, so leave the standard unresolved.
-                        # The execution builder already resolves the actual mint
-                        # owner when constructing the buy transaction.
-                        launch["token_standard"] = "unknown"
-
-                        launch["discovery_received_at"] = now
-                        launch["discovery_latency_ms"] = 0.0
+                        launch["token_standard"] = (
+                            "token2022"
+                            if launch.get("instruction") == "create_v2"
+                            else "legacy"
+                        )
 
                         try:
                             queue.put_nowait(launch)
