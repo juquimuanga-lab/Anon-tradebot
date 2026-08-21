@@ -34,6 +34,7 @@ async def _ensure_bot_state_schema(session) -> None:
         "ALTER TABLE bot_state ADD COLUMN owner_user_id INTEGER",
         "ALTER TABLE bot_state ADD COLUMN pumpfun_fast_enabled BOOLEAN DEFAULT FALSE",
         "ALTER TABLE bot_state ADD COLUMN pumpfun_smart_enabled BOOLEAN DEFAULT TRUE",
+        "ALTER TABLE bot_state ADD COLUMN smart_money_copy_enabled BOOLEAN DEFAULT FALSE",
         "ALTER TABLE positions ADD COLUMN entry_cost_usd FLOAT DEFAULT 0",
         "ALTER TABLE positions ADD COLUMN remaining_cost_basis_usd FLOAT DEFAULT 0",
         "ALTER TABLE positions ADD COLUMN total_proceeds_usd FLOAT DEFAULT 0",
@@ -103,6 +104,7 @@ async def get_or_create_bot_state(owner_user_id: Optional[int] = None) -> BotSta
                     pumpfun_trading_enabled=legacy.pumpfun_trading_enabled,
                     pumpfun_fast_enabled=getattr(legacy, "pumpfun_fast_enabled", False),
                     pumpfun_smart_enabled=getattr(legacy, "pumpfun_smart_enabled", True),
+                    smart_money_copy_enabled=getattr(legacy, "smart_money_copy_enabled", False),
                     fourmeme_trading_enabled=legacy.fourmeme_trading_enabled,
                     paper_balance_sol=legacy.paper_balance_sol,
                 )
@@ -150,6 +152,27 @@ async def get_active_rule_for(
                     Rule.platform == platform,
                 )
                 .order_by(Rule.id.desc())
+            )
+        ).scalars().first()
+
+
+async def get_active_rule_for_strategy(
+    admin_id: int,
+    platform: str = "solana",
+    strategy: str = "smart",
+) -> Optional[Rule]:
+    """Return one admin's active rule for a specific strategy lane."""
+    strategy = "fast" if strategy == "fast" else "smart"
+    async with async_session_scope() as session:
+        await _ensure_rule_schema(session)
+        return (
+            await session.execute(
+                select(Rule).where(
+                    Rule.is_active.is_(True),
+                    Rule.created_by == admin_id,
+                    Rule.platform == platform,
+                    Rule.strategy == strategy,
+                ).order_by(Rule.id.desc())
             )
         ).scalars().first()
 
