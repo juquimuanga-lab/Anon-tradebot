@@ -20,6 +20,10 @@ from app.config.settings import settings
 logger = logging.getLogger("app.connectors.solana_tracker")
 
 BASE_URL = "https://data.solanatracker.io"
+SOL_MINT = "So11111111111111111111111111111111111111112"
+# Phase-1 copy-trade polling. One watched wallet = one lightweight request.
+SMART_MONEY_WATCH_INTERVAL_SECONDS = 1.0
+SMART_MONEY_WATCH_LOOKBACK_MS = 15_000
 
 
 class SolanaTrackerError(Exception):
@@ -145,6 +149,11 @@ class SolanaTrackerClient:
             str, tuple[float, SmartMoneyWalletQuality]
         ] = {}
         self._lock = asyncio.Lock()
+        # Transaction signatures already consumed by the copy-trade watcher.
+        # This is intentionally in-memory: after a restart we prime the feed
+        # without executing historical buys.
+        self._copy_trade_seen: set[str] = set()
+        self._copy_trade_primed: set[str] = set()
 
     @property
     def enabled(self) -> bool:
@@ -208,6 +217,116 @@ class SolanaTrackerClient:
         if not isinstance(trades, list):
             return []
         return trades[: settings.smart_money_max_trades_per_token]
+
+    async def get_wallet_trades(
+        self,
+        wallet: str,
+    ) -> list[dict[str, Any]]:
+        """Fetch the latest trades for one wallet.
+
+        Solana Tracker exposes a wallet-level trade feed specifically for
+        copy-trading use cases. We keep this separate from ``get_token_trades``
+        because the copy-trade watcher must not wait for a token to enter the
+        normal launch scanner first.
+        """
+        data = await self._get(f"/wallet/{wallet}/trades")
+        trades = data.get("trades", []) if isinstance(data, dict) else []
+        return trades if isinstance(trades, list) else []
+
+    @staticmethod
+    def _is_wallet_buy(raw: dict[str, Any]) -> bool:
+        """Identify a token purchase from the wallet-trades response.
+
+        The API may expose an explicit ``type`` field. For responses where
+        it does not, a swap from SOL/stablecoin into a non-SOL token is a
+        conservative buy signal.
+        """
+        trade_type = str(raw.get("type") or "").lower()
+        if trade_type == "buy":
+            return True
+        if trade_type in {"sell", "transfer", "unknown"}:
+            return False
+
+        source = raw.get("from") or {}
+        target = raw.get("to") or {}
+        from_address = str(source.get("address") or "")
+        to_address = str(target.get("address") or "")
+        if not to_address or to_address == SOL_MINT:
+            return False
+
+        # SOL is the normal Pump.fun quote asset. Stablecoin-funded swaps are
+        # also accepted because the watched wallet may use Jupiter after
+        # migration. The downstream Pump.fun snapshot decides whether this
+        # mint is actually a Pump.fun asset.
+        stable_mints = {
+            "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
+            "Es9vMFrzaCERmJfrF4H2FYD4Wm5v4gV8s4n4x2qYh1Y",
+        }
+        return from_address == SOL_MINT or from_address in stable_mints
+
+    async def poll_smart_money_buys(
+        self,
+        wallet: str,
+    ) -> list[dict[str, Any]]:
+        """Return newly observed token buys from a watched wallet.
+
+        The first successful poll is a baseline only, preventing a bot restart
+        from replaying an old trade. Subsequent polls return only unseen
+        signatures from the recent feed.
+        """
+        wallet = wallet.strip()
+        if not wallet or not self.api_key:
+            return []
+
+        raw_trades = await self.get_wallet_trades(wallet)
+        now_ms = int(time.time() * 1000)
+        candidates: list[dict[str, Any]] = []
+
+        for raw in raw_trades:
+            if not isinstance(raw, dict) or not self._is_wallet_buy(raw):
+                continue
+            tx = str(raw.get("tx") or "")
+            if not tx or tx in self._copy_trade_seen:
+                continue
+            timestamp_ms = int(raw.get("time") or 0)
+            if timestamp_ms <= 0 or timestamp_ms < now_ms - SMART_MONEY_WATCH_LOOKBACK_MS:
+                continue
+            target = raw.get("to") or {}
+            mint = str(target.get("address") or "")
+            if not mint or mint == SOL_MINT:
+                continue
+
+            volume = raw.get("volume") or {}
+            if isinstance(volume, dict):
+                amount_usd = float(volume.get("usd") or 0.0)
+            else:
+                amount_usd = float(raw.get("volumeUsd") or volume or 0.0)
+            if amount_usd < float(getattr(settings, "smart_money_min_buy_usd", 0.0) or 0.0):
+                continue
+            raw["copy_amount_usd"] = amount_usd
+            candidates.append(raw)
+
+        # Prime the feed on startup/reconnect. Mark the currently visible
+        # trades as seen but do not copy them; only future buys are triggers.
+        if wallet not in self._copy_trade_primed:
+            for raw in candidates:
+                tx = str(raw.get("tx") or "")
+                if tx:
+                    self._copy_trade_seen.add(tx)
+            self._copy_trade_primed.add(wallet)
+            return []
+
+        # Mark before returning so duplicate API pages cannot fire twice.
+        for raw in candidates:
+            tx = str(raw.get("tx") or "")
+            if tx:
+                self._copy_trade_seen.add(tx)
+
+        candidates.sort(key=lambda row: int(row.get("time") or 0))
+        # Keep memory bounded while preserving enough history for reconnects.
+        if len(self._copy_trade_seen) > 5000:
+            self._copy_trade_seen = set(list(self._copy_trade_seen)[-2500:])
+        return candidates
 
     async def get_wallet_quality(
         self,
