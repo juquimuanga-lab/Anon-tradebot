@@ -1,4 +1,5 @@
 """Builds the python-telegram-bot Application and registers all handlers."""
+from telegram import BotCommand
 from telegram.ext import (
     Application,
     CallbackQueryHandler,
@@ -13,8 +14,43 @@ from app.bot.setrule_wizard import COLLECTING, setrule_collect, setrule_start, s
 from app.config.settings import settings
 
 
+async def set_bot_commands(application: Application) -> None:
+    """Populate Telegram's command menu with the currently supported commands."""
+    commands = [
+        BotCommand("start", "Start the bot"),
+        BotCommand("help", "Show help"),
+        BotCommand("status", "Show bot status"),
+        BotCommand("balance", "Show wallet and paper balance"),
+        BotCommand("rules", "List your rules"),
+        BotCommand("listrules", "List saved rules"),
+        BotCommand("activaterule", "Activate a rule"),
+        BotCommand("positions", "Show open positions"),
+        BotCommand("history", "Show recent trades"),
+        BotCommand("pumpfunsnipers", "Control Fast, Smart and Smart Money"),
+        BotCommand("setfast", "Set a Pump.fun Fast rule"),
+        BotCommand("setsmart", "Set a Pump.fun Smart rule"),
+        BotCommand("enablesmartmoney", "Enable Smart Money copy"),
+        BotCommand("disablesmartmoney", "Disable Smart Money copy"),
+        BotCommand("enablepumpfun", "Enable Pump.fun trading"),
+        BotCommand("disablepumpfun", "Disable Pump.fun trading"),
+        BotCommand("connectwallet", "Connect your live wallet"),
+        BotCommand("disconnectwallet", "Disconnect your live wallet"),
+        BotCommand("paper", "Switch to paper mode"),
+        BotCommand("live", "Switch to live mode"),
+        BotCommand("setrule", "Create a Solana rule"),
+        BotCommand("recoverent", "Recover token-account rent"),
+        BotCommand("burnclose", "Burn and close token accounts"),
+    ]
+    await application.bot.set_my_commands(commands)
+
+
 def build_application() -> Application:
-    application = Application.builder().token(settings.telegram_bot_token).build()
+    application = (
+        Application.builder()
+        .token(settings.telegram_bot_token)
+        .post_init(set_bot_commands)
+        .build()
+    )
 
     application.add_handler(CommandHandler("start", handlers_basic.start))
     application.add_handler(CommandHandler("help", handlers_basic.help_cmd))
@@ -32,9 +68,14 @@ def build_application() -> Application:
     application.add_handler(CommandHandler("disableanoncoin", handlers_admin.disableanoncoin_cmd))
     application.add_handler(CommandHandler("enablepumpfun", handlers_admin.enablepumpfun_cmd))
     application.add_handler(CommandHandler("disablepumpfun", handlers_admin.disablepumpfun_cmd))
+
+    # Pump.fun sniper lanes
     application.add_handler(CommandHandler("pumpfunsnipers", handlers_admin.pumpfun_snipers_cmd))
     application.add_handler(CommandHandler("setfast", handlers_admin.setfast_cmd))
     application.add_handler(CommandHandler("setsmart", handlers_admin.setsmart_cmd))
+    application.add_handler(CommandHandler("enablesmartmoney", handlers_admin.enablesmartmoney_cmd))
+    application.add_handler(CommandHandler("disablesmartmoney", handlers_admin.disablesmartmoney_cmd))
+
     application.add_handler(CommandHandler("enablefourmeme", handlers_admin.enablefourmeme_cmd))
     application.add_handler(CommandHandler("disablefourmeme", handlers_admin.disablefourmeme_cmd))
     application.add_handler(CommandHandler("paper", handlers_admin.paper_cmd))
@@ -46,7 +87,10 @@ def build_application() -> Application:
         entry_points=[CommandHandler("connect", handlers_admin.connect_start)],
         states={
             handlers_admin.CONNECT_WAITING_KEY: [
-                MessageHandler(filters.TEXT & ~filters.COMMAND | filters.Regex("^/cancel$"), handlers_admin.connect_receive)
+                MessageHandler(
+                    filters.TEXT & ~filters.COMMAND | filters.Regex("^/cancel$"),
+                    handlers_admin.connect_receive,
+                )
             ]
         },
         fallbacks=[CommandHandler("cancel", handlers_admin.connect_receive)],
@@ -58,7 +102,10 @@ def build_application() -> Application:
         entry_points=[CommandHandler("connectbscwallet", handlers_wallet.connectbscwallet_start)],
         states={
             handlers_wallet.BSC_CONNECT_WALLET_WAITING: [
-                MessageHandler(filters.TEXT & ~filters.COMMAND | filters.Regex("^/cancel$"), handlers_wallet.connectbscwallet_receive)
+                MessageHandler(
+                    filters.TEXT & ~filters.COMMAND | filters.Regex("^/cancel$"),
+                    handlers_wallet.connectbscwallet_receive,
+                )
             ]
         },
         fallbacks=[CommandHandler("cancel", handlers_wallet.connectbscwallet_receive)],
@@ -70,7 +117,10 @@ def build_application() -> Application:
         entry_points=[CommandHandler("connectwallet", handlers_wallet.connectwallet_start)],
         states={
             handlers_wallet.CONNECT_WALLET_WAITING: [
-                MessageHandler(filters.TEXT & ~filters.COMMAND | filters.Regex("^/cancel$"), handlers_wallet.connectwallet_receive)
+                MessageHandler(
+                    filters.TEXT & ~filters.COMMAND | filters.Regex("^/cancel$"),
+                    handlers_wallet.connectwallet_receive,
+                )
             ]
         },
         fallbacks=[CommandHandler("cancel", handlers_wallet.connectwallet_receive)],
@@ -93,8 +143,6 @@ def build_application() -> Application:
     )
     application.add_handler(burnclose_conv)
 
-    # SOL rent recovery: recover rent from empty token accounts discovered from
-    # confirmed BUY/SELL transaction signatures.
     rent_recovery_conv = ConversationHandler(
         entry_points=[CommandHandler("recoverent", handlers_admin.recoverent_cmd)],
         states={
@@ -114,7 +162,10 @@ def build_application() -> Application:
         entry_points=[CommandHandler("setrulefourmeme", setrule_fourmeme_start)],
         states={
             COLLECTING: [
-                MessageHandler(filters.TEXT & ~filters.COMMAND | filters.Regex("^/(skip|cancel)$"), setrule_collect)
+                MessageHandler(
+                    filters.TEXT & ~filters.COMMAND | filters.Regex("^/(skip|cancel)$"),
+                    setrule_collect,
+                )
             ]
         },
         fallbacks=[CommandHandler("cancel", setrule_collect)],
@@ -126,7 +177,10 @@ def build_application() -> Application:
         entry_points=[CommandHandler("setrule", setrule_start)],
         states={
             COLLECTING: [
-                MessageHandler(filters.TEXT & ~filters.COMMAND | filters.Regex("^/(skip|cancel)$"), setrule_collect)
+                MessageHandler(
+                    filters.TEXT & ~filters.COMMAND | filters.Regex("^/(skip|cancel)$"),
+                    setrule_collect,
+                )
             ]
         },
         fallbacks=[CommandHandler("cancel", setrule_collect)],
