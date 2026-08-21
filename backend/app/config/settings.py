@@ -214,6 +214,16 @@ class Settings(BaseSettings):
     )
 
     # ------------------------------------------------------------------
+    # GO Guardian AI supervisor
+    # ------------------------------------------------------------------
+    guardian_enabled: bool = Field(default=True, validation_alias="GUARDIAN_ENABLED")
+    guardian_tick_seconds: float = Field(default=5.0, validation_alias="GUARDIAN_TICK_SECONDS")
+    guardian_window_seconds: int = Field(default=600, validation_alias="GUARDIAN_WINDOW_SECONDS")
+    guardian_min_buy_attempts: int = Field(default=5, validation_alias="GUARDIAN_MIN_BUY_ATTEMPTS")
+    guardian_pause_failure_rate_pct: float = Field(default=70.0, validation_alias="GUARDIAN_PAUSE_FAILURE_RATE_PCT")
+    guardian_min_candidates_for_filter_warning: int = Field(default=20, validation_alias="GUARDIAN_MIN_CANDIDATES_FOR_FILTER_WARNING")
+
+    # ------------------------------------------------------------------
     # Persistence
     # ------------------------------------------------------------------
 
