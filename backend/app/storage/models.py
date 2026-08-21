@@ -549,6 +549,13 @@ class BotState(Base):
         default=True,
     )
 
+    # Independent copy-trading trigger for configured smart-money wallets.
+    # Disabled by default so adding a wallet never silently enables live buys.
+    smart_money_copy_enabled: Mapped[bool] = mapped_column(
+        Boolean,
+        default=False,
+    )
+
     fourmeme_trading_enabled: Mapped[bool] = mapped_column(
         Boolean,
         default=False,
