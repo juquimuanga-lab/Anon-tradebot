@@ -66,6 +66,7 @@ from app.execution.router import (
 )
 
 from app.metrics import metrics
+from app.guardian import guardian
 
 from app.scanners import (
     mock_feed,
@@ -363,6 +364,8 @@ class ScannerService:
             }
 
             metrics.tokens_scanned += 1
+            await guardian.record("candidate", source=SOURCE_PUMPFUN, smart_money=True, mint=mint)
+            await guardian.record("smart_money_buy", wallet=event.get("wallet"), mint=mint, tx_signature=event.get("tx_signature"))
             logger.info(
                 "smart_money_candidate_queued " + json.dumps(
                     {
@@ -1397,6 +1400,7 @@ class ScannerService:
             return fresh_token, fresh_score_result, False
 
         if not late_passed:
+            await guardian.record("rejected", owner_id=rule.created_by, reason="late_entry")
             logger.info(
                 "pumpfun_prebuy_revalidation_rejected",
                 extra={
@@ -1705,6 +1709,7 @@ class ScannerService:
             state.mode,
         )
 
+        await guardian.record("buy_attempt", owner_id=rule_row.created_by, mint=token.mint, source=token.source)
         try:
 
             result = await asyncio.wait_for(
@@ -1942,6 +1947,7 @@ class ScannerService:
                 },
             )
 
+            await guardian.record("buy_success", owner_id=rule_row.created_by, mint=token.mint, tx_signature=result.tx_signature)
             await self._notifier.buy_filled(
                 rule_row.created_by,
                 (
@@ -1986,6 +1992,7 @@ class ScannerService:
             },
         )
 
+        await guardian.record("buy_failed", owner_id=rule_row.created_by, mint=token.mint, error=result.error_message or "unknown")
         await self._notifier.buy_failed(
             rule_row.created_by,
             (
@@ -2264,6 +2271,7 @@ class ScannerService:
 
         if not passed:
 
+            await guardian.record("rejected", owner_id=rule.created_by, reason="hard_filter")
             rejection_log = {
                 "mint": token.mint,
                 "rule_id": rule.id,
@@ -2331,6 +2339,7 @@ class ScannerService:
         # Smart-money confirmation is currently disabled, so a candidate
         # below the configured score threshold must not proceed to trading.
         if score_result.score < rule_params.qualify_score_threshold:
+            await guardian.record("rejected", owner_id=rule.created_by, reason="score")
             score_rejection = {
                 "mint": token.mint,
                 "rule_id": rule.id,
@@ -2389,7 +2398,7 @@ class ScannerService:
         # pass, the token proceeds directly to qualification and trading.
         # --------------------------------------------------------------
         metrics.tokens_qualified += 1
-
+        await guardian.record("qualified", owner_id=rule.created_by, mint=token.mint, score=score_result.score)
 
         await self._notifier.new_qualified_token(
             rule.created_by,
@@ -2777,6 +2786,7 @@ class ScannerService:
 
         while True:
             try:
+                await guardian.tick()
                 active_rules = await repo.get_all_active_rules()
 
                 await self._watch_wallets_for_new_mints()
@@ -2808,6 +2818,7 @@ class ScannerService:
 
             except Exception as exc:
                 metrics.error_count += 1
+                await guardian.record("scanner_error", error=f"{type(exc).__name__}: {exc}")
                 logger.exception("scan_cycle_failed")
                 await self._notifier.api_error("scanner", str(exc))
 
