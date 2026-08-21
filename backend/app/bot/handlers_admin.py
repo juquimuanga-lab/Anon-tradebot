@@ -379,12 +379,43 @@ async def confirmation_callback(update: Update, context: ContextTypes.DEFAULT_TY
         from app.scoring.rules import RuleParams
 
         params = RuleParams(**entry.payload["params"])
-        activate = decision == "activate"
-        rule = await repo.create_rule(params, entry.payload["user_id"], activate=activate)
-        await repo.write_audit_log(str(update.effective_user.id), "save_rule", {"rule_id": rule.id, "activated": activate})
-        await query.edit_message_text(
-            f"Rule '{rule.name}' saved" + (" and activated." if activate else " (not activated).")
-        )
+
+        # The /setrule wizard presents the lane choice at the final confirmation.
+        # Fast and Smart remain independent lanes.
+        if decision in ("save_fast", "save_smart"):
+            strategy = "fast" if decision == "save_fast" else "smart"
+            params.strategy = strategy
+            rule = await repo.create_rule(
+                params,
+                entry.payload["user_id"],
+                activate=True,
+            )
+            await repo.write_audit_log(
+                str(update.effective_user.id),
+                "save_rule_strategy",
+                {"rule_id": rule.id, "strategy": strategy, "activated": True},
+            )
+            lane = "⚡ Fast Sniper" if strategy == "fast" else "🧠 Smart Filter"
+            await query.edit_message_text(
+                f"Rule '{rule.name}' saved and activated as {lane}.\n\n"
+                "This changes only that sniper lane; the other lane keeps its own active rule."
+            )
+        else:
+            # Save-only never activates either lane.
+            rule = await repo.create_rule(
+                params,
+                entry.payload["user_id"],
+                activate=False,
+            )
+            await repo.write_audit_log(
+                str(update.effective_user.id),
+                "save_rule",
+                {"rule_id": rule.id, "activated": False},
+            )
+            await query.edit_message_text(
+                f"Rule '{rule.name}' saved (not activated).\n\n"
+                "Use /setfast or /setsmart, or /pumpfunsnipers, to assign it to a lane."
+            )
 
     elif entry.action == "close_position":
         position_manager = context.application.bot_data.get("position_manager")
