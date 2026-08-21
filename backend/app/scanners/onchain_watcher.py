@@ -1765,12 +1765,10 @@ async def _smart_money_stream_worker(
                             },
                         )
 
-                        if not has_pumpfun:
-                            state["non_pumpfun_transactions"] = int(
-                                state.get("non_pumpfun_transactions", 0)
-                            ) + 1
-                            continue
-
+                        # Do not hard-gate on WSS log text. Helius logsSubscribe
+                        # can omit the Pump.fun program ID even when the transaction
+                        # itself contains Pump.fun instructions. Fetch the transaction
+                        # first and prove Pump.fun involvement from the parsed tx.
                         try:
                             tx = await _get_transaction_for_smart_money(rpc_url, signature)
                         except Exception as exc:
@@ -1785,6 +1783,56 @@ async def _smart_money_stream_worker(
                             continue
 
                         if not tx:
+                            logger.info(
+                                "smart_money_copy_skipped",
+                                extra={
+                                    "wallet": wallet,
+                                    "signature": signature,
+                                    "reason": "transaction_not_available",
+                                },
+                            )
+                            continue
+
+                        tx_has_pumpfun = False
+                        try:
+                            tx_outer = _obj_get(tx, "transaction")
+                            tx_message = _obj_get(tx_outer, "transaction")
+                            tx_message = _obj_get(tx_message, "message") or _obj_get(
+                                tx_outer, "message"
+                            )
+                            tx_account_keys = (
+                                _obj_get(tx_message, "account_keys", [])
+                                or _obj_get(tx_message, "accountKeys", [])
+                                or []
+                            )
+                            tx_instructions = _obj_get(
+                                tx_message, "instructions", []
+                            ) or []
+                            tx_has_pumpfun = any(
+                                _instruction_program_id(
+                                    instruction,
+                                    tx_account_keys,
+                                ) == PUMPFUN_PROGRAM_ID
+                                for instruction in tx_instructions
+                            )
+                        except Exception:
+                            tx_has_pumpfun = False
+
+                        has_pumpfun = bool(has_pumpfun or tx_has_pumpfun)
+                        state["last_transaction_has_pumpfun"] = has_pumpfun
+
+                        if not has_pumpfun:
+                            state["non_pumpfun_transactions"] = int(
+                                state.get("non_pumpfun_transactions", 0)
+                            ) + 1
+                            logger.info(
+                                "smart_money_copy_skipped",
+                                extra={
+                                    "wallet": wallet,
+                                    "signature": signature,
+                                    "reason": "not_pumpfun",
+                                },
+                            )
                             continue
 
                         bought = _extract_wallet_bought_mint(tx, wallet)
