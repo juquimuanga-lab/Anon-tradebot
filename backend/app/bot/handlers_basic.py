@@ -56,15 +56,15 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    state = await repo.get_or_create_bot_state()
+    state = await repo.get_or_create_bot_state(update.effective_user.id)
     fast_rule = await repo.get_active_rule_for_strategy(update.effective_user.id, "solana", "fast")
     smart_rule = await repo.get_active_rule_for_strategy(update.effective_user.id, "solana", "smart")
     fourmeme_rule = await repo.get_active_rule_for(update.effective_user.id, "fourmeme")
     smart_money_rule = None
     if hasattr(repo, "get_active_smart_money_rule"):
         smart_money_rule = await repo.get_active_smart_money_rule(update.effective_user.id, "solana")
-    positions = await repo.get_open_positions()
-    orders = await repo.get_recent_orders(3)
+    positions = await repo.get_open_positions(update.effective_user.id)
+    orders = await repo.get_recent_orders(3, update.effective_user.id)
 
     anoncoin_key = await secrets_manager.get_anoncoin_api_key()
     anoncoin_connected = "yes" if anoncoin_key else "no (use /connect)"
@@ -161,14 +161,16 @@ async def activaterule(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
 
 async def balance(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    state = await repo.get_or_create_bot_state()
-    if state.mode == "paper":
-        await update.message.reply_text(f"Paper balance: {state.paper_balance_sol:.3f} SOL")
-        return
-
+    """Show the user's real wallet balance independently of trading mode."""
+    state = await repo.get_or_create_bot_state(update.effective_user.id)
     wallet_key = await secrets_manager.get_wallet_private_key(update.effective_user.id)
+
     if not wallet_key:
-        await update.message.reply_text("No wallet connected. Use /connectwallet to trade live.")
+        await update.message.reply_text(
+            f"Mode: {state.mode.upper()}\\n"
+            f"Paper balance: {state.paper_balance_sol:.3f} SOL\\n\\n"
+            "No wallet connected. Use /connectwallet for live trading."
+        )
         return
 
     from app.execution.onchain.solana_rpc import get_sol_balance
@@ -176,10 +178,22 @@ async def balance(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
     try:
         keypair = load_keypair(wallet_key)
-        sol_balance = await get_sol_balance(settings.solana_rpc_url, str(keypair.pubkey()))
-        await update.message.reply_text(f"Wallet balance: {sol_balance:.4f} SOL\nAddress: `{keypair.pubkey()}`", parse_mode="Markdown")
+        address = str(keypair.pubkey())
+        sol_balance = await get_sol_balance(settings.solana_rpc_url, address)
+
+        await update.message.reply_text(
+            f"Mode: {state.mode.upper()}\\n"
+            f"Wallet balance: {sol_balance:.4f} SOL\\n"
+            f"Paper balance: {state.paper_balance_sol:.3f} SOL\\n"
+            f"Address: `{address}`",
+            parse_mode="Markdown",
+        )
     except Exception as exc:
-        await update.message.reply_text(f"Could not fetch wallet balance right now: {exc}")
+        await update.message.reply_text(
+            f"Mode: {state.mode.upper()}\\n"
+            f"Paper balance: {state.paper_balance_sol:.3f} SOL\\n\\n"
+            f"Could not fetch wallet balance right now: {exc}"
+        )
 
 
 async def positions_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -204,7 +218,7 @@ async def positions_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         await update.message.reply_text(f"Close position {position_id} now?", reply_markup=keyboard)
         return
 
-    open_positions = await repo.get_open_positions()
+    open_positions = await repo.get_open_positions(update.effective_user.id)
     if not open_positions:
         await update.message.reply_text("No open positions.")
         return
@@ -223,7 +237,7 @@ async def positions_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
 
 async def history(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    orders = await repo.get_recent_orders(10)
+    orders = await repo.get_recent_orders(10, update.effective_user.id)
     if not orders:
         await update.message.reply_text("No trade history yet.")
         return
