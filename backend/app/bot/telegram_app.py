@@ -40,6 +40,7 @@ async def set_bot_commands(application: Application) -> None:
         BotCommand("setrule", "Create a Solana rule"),
         BotCommand("recoverent", "Recover token-account rent"),
         BotCommand("burnclose", "Burn and close token accounts"),
+        BotCommand("guardian", "GO Guardian AI dashboard"),
     ]
     await application.bot.set_my_commands(commands)
 
@@ -61,6 +62,7 @@ def build_application() -> Application:
     application.add_handler(CommandHandler("balance", handlers_basic.balance))
     application.add_handler(CommandHandler("positions", handlers_basic.positions_cmd))
     application.add_handler(CommandHandler("history", handlers_basic.history))
+    application.add_handler(CommandHandler("guardian", handlers_admin.guardian_cmd))
 
     application.add_handler(CommandHandler("enable", handlers_admin.enable_cmd))
     application.add_handler(CommandHandler("disable", handlers_admin.disable_cmd))
@@ -191,6 +193,7 @@ def build_application() -> Application:
     application.add_handler(CallbackQueryHandler(handlers_admin.action_confirmation_callback, pattern=r"^actionconfirm:"))
     application.add_handler(CallbackQueryHandler(handlers_admin.confirmation_callback, pattern=r"^confirm:"))
     application.add_handler(CallbackQueryHandler(handlers_admin.pumpfun_snipers_callback, pattern=r"^sniper:"))
+    application.add_handler(CallbackQueryHandler(handlers_admin.guardian_callback, pattern=r"^guardian:"))
     application.add_handler(CallbackQueryHandler(handlers_admin.burnclose_callback, pattern=r"^burnclose:"))
     application.add_handler(CallbackQueryHandler(handlers_admin.rent_recovery_callback, pattern=r"^rent:"))
 
