@@ -13,6 +13,7 @@ from app.security.secrets_manager import secrets_manager
 from app.storage import repository as repo
 from app.execution.onchain import rent_recovery
 from app.config.settings import settings
+from app.guardian import guardian
 
 logger = logging.getLogger("app.bot.admin")
 
@@ -871,3 +872,53 @@ async def rent_recovery_callback(update: Update, context: ContextTypes.DEFAULT_T
         context.user_data.pop("rent_recovery_scan", None)
         context.user_data.pop("rent_recovery_wallet", None)
 
+
+
+@admin_required
+async def guardian_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    snap = await guardian.snapshot(update.effective_user.id)
+    status = snap["status"]
+    top = ", ".join(f"{name}:{count}" for name, count in snap["top_rejections"]) or "none"
+    text = (
+        "🧠 *GO Guardian AI*\n\n"
+        f"Status: *{status}*\n"
+        f"Guardian: {'ON' if snap['enabled'] else 'OFF'}\n"
+        f"Auto pause: {'ON' if snap['auto_pause'] else 'OFF'}\n"
+        f"Trading: {'ON' if snap['trading_enabled'] else 'PAUSED'}\n\n"
+        f"Last {snap['window_seconds']}s\n"
+        f"• Candidates: {snap['candidates']}\n"
+        f"• Qualified: {snap['qualified']}\n"
+        f"• Buy attempts: {snap['buy_attempts']}\n"
+        f"• Buy success: {snap['buy_success']}\n"
+        f"• Buy failed: {snap['buy_failed']}\n"
+        f"• Smart Money buys: {snap['smart_money_buys']}\n"
+        f"• Top rejections: {top}\n\n"
+        f"*Diagnosis:* {snap['diagnosis']}"
+    )
+    buttons = InlineKeyboardMarkup([
+        [InlineKeyboardButton("🛑 Pause", callback_data="guardian:pause"), InlineKeyboardButton("▶ Resume", callback_data="guardian:resume")],
+        [InlineKeyboardButton("Auto Pause ON/OFF", callback_data="guardian:autopause")],
+    ])
+    await update.message.reply_text(text, parse_mode="Markdown", reply_markup=buttons)
+
+
+@admin_required
+async def guardian_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    q = update.callback_query
+    await q.answer()
+    owner = update.effective_user.id
+    action = (q.data or "").split(":", 1)[-1]
+    if action == "pause":
+        await guardian.pause(owner)
+        await q.edit_message_text("🛑 GO Guardian paused automated trading for your account.")
+        return
+    if action == "resume":
+        await guardian.resume(owner)
+        await q.edit_message_text("▶ GO Guardian resumed automated trading for your account.")
+        return
+    if action == "autopause":
+        state = await repo.get_or_create_bot_state(owner)
+        enabled = not bool(getattr(state, "guardian_auto_pause_enabled", True))
+        await repo.update_bot_state(owner, guardian_auto_pause_enabled=enabled)
+        await q.edit_message_text(f"GO Guardian auto-pause is now {'ON' if enabled else 'OFF'}.")
+        return
