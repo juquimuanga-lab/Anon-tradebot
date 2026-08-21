@@ -239,6 +239,21 @@ class Settings(BaseSettings):
     # after hard filters before it can reach the BUY path.
     qualify_score_threshold: float = 52.0
 
+    # ------------------------------------------------------------------
+    # Pump.fun anti-late-entry / anti-chase protection
+    # ------------------------------------------------------------------
+    # These deployment-level values are applied by ScannerService to every
+    # Pump.fun rule before screening/revalidation. They mirror the safe
+    # defaults defined in app/scoring/rules.py.
+    late_entry_enabled: bool = True
+    late_entry_max_age_seconds: float = 5.0
+    late_entry_soft_market_cap_usd: float = 18000.0
+    late_entry_hard_market_cap_usd: float = 28000.0
+    late_entry_near_high_pct: float = 4.0
+    late_entry_required_pullback_pct: float = 8.0
+    late_entry_max_short_runup_pct: float = 35.0
+    late_entry_max_runup_from_first_pct: float = 90.0
+
     # Fast Pump.fun polling is intentionally separate from the slower
     # Anoncoin API scan interval.
     pumpfun_scan_interval_seconds: float = 1.0
