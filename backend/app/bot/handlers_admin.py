@@ -190,7 +190,8 @@ async def pumpfun_snipers_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE
         "⚡ *Pump.fun Sniper Control*\n\n"
         f"Master Pump.fun: {'ON' if state.pumpfun_trading_enabled else 'OFF'}\n"
         f"⚡ Fast Sniper: {'ON' if getattr(state, 'pumpfun_fast_enabled', False) else 'OFF'}\n"
-        f"🧠 Smart Filter: {'ON' if getattr(state, 'pumpfun_smart_enabled', True) else 'OFF'}\n\n"
+        f"🧠 Smart Filter: {'ON' if getattr(state, 'pumpfun_smart_enabled', True) else 'OFF'}\n"
+        f"👁 Smart Money Copy: {'ON' if getattr(state, 'smart_money_copy_enabled', False) else 'OFF'}\n\n"
         f"⚡ Fast rule: #{fast_rule.id} {fast_rule.name if fast_rule else 'none'}\n"
         f"🧠 Smart rule: #{smart_rule.id} {smart_rule.name if smart_rule else 'none'}\n\n"
         "Fast rules intentionally skip holder/score checks and use only the launch-time safety gate. "
@@ -204,6 +205,10 @@ async def pumpfun_snipers_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE
          InlineKeyboardButton(
             f"🧠 Smart {'OFF' if getattr(state, 'pumpfun_smart_enabled', True) else 'ON'}",
             callback_data=f"sniper:toggle:smart:{'off' if getattr(state, 'pumpfun_smart_enabled', True) else 'on'}"
+        )],
+        [InlineKeyboardButton(
+            f"👁 Copy Wallet {'OFF' if getattr(state, 'smart_money_copy_enabled', False) else 'ON'}",
+            callback_data=f"sniper:toggle:copy:{'off' if getattr(state, 'smart_money_copy_enabled', False) else 'on'}"
         )]
     ]
     for rule in rules[:12]:
@@ -231,6 +236,18 @@ async def pumpfun_snipers_callback(update: Update, context: ContextTypes.DEFAULT
     value = parts[3]
     if action == "toggle":
         enabled = value == "on"
+        if kind == "copy":
+            await repo.update_bot_state(owner_id, smart_money_copy_enabled=enabled)
+            await repo.write_audit_log(str(owner_id), f"smart_money_copy_{value}", {
+                "wallet": "HmUt3Jn46j7c7ANdURmEyjSRj8i3Em6MhjQUi37PZ219",
+            })
+            await query.edit_message_text(
+                f"👁 Smart Money Copy: {'ON' if enabled else 'OFF'}\n\n"
+                "The configured smart-money wallet is now "
+                + ("being copied for new Pump.fun buys." if enabled else "ignored for new buys.")
+            )
+            return
+
         field = "pumpfun_fast_enabled" if kind == "fast" else "pumpfun_smart_enabled"
         await repo.update_bot_state(owner_id, **{field: enabled})
         await repo.write_audit_log(str(owner_id), f"pumpfun_{kind}_{value}", {})
@@ -273,6 +290,43 @@ async def setsmart_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     rule = await repo.activate_rule_for_admin_strategy(int(context.args[0]), update.effective_user.id, "smart")
     await update.message.reply_text(
         f"Rule #{rule.id} is now the active Pump.fun Smart Filter rule." if rule else "Rule not found or it is not yours."
+    )
+
+
+@admin_required
+async def enablesmartmoney_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Enable copy-trading from the configured smart-money wallet(s)."""
+    await repo.update_bot_state(
+        update.effective_user.id,
+        smart_money_copy_enabled=True,
+    )
+    await repo.write_audit_log(
+        str(update.effective_user.id),
+        "smart_money_copy_on",
+        {},
+    )
+    await update.message.reply_text(
+        "🧠 Smart Money Copy: ON\n\n"
+        "New buys from the configured wallet will be copied using your active Smart rule. "
+        "Your existing position exits/TP/SL rules remain unchanged."
+    )
+
+
+@admin_required
+async def disablesmartmoney_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Disable copy-trading without changing existing positions."""
+    await repo.update_bot_state(
+        update.effective_user.id,
+        smart_money_copy_enabled=False,
+    )
+    await repo.write_audit_log(
+        str(update.effective_user.id),
+        "smart_money_copy_off",
+        {},
+    )
+    await update.message.reply_text(
+        "🧠 Smart Money Copy: OFF\n\n"
+        "No new wallet buys will be copied. Existing positions keep their normal exits."
     )
 
 
