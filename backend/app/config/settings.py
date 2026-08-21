@@ -247,8 +247,8 @@ class Settings(BaseSettings):
     # defaults defined in app/scoring/rules.py.
     late_entry_enabled: bool = True
     late_entry_max_age_seconds: float = 5.0
-    late_entry_soft_market_cap_usd: float = 18000.0
-    late_entry_hard_market_cap_usd: float = 28000.0
+    late_entry_soft_market_cap_usd: float = 12000.0
+    late_entry_hard_market_cap_usd: float = 25000.0
     late_entry_near_high_pct: float = 4.0
     late_entry_required_pullback_pct: float = 8.0
     late_entry_max_short_runup_pct: float = 35.0
@@ -260,9 +260,9 @@ class Settings(BaseSettings):
 
     # Risk management for live positions. These are deliberately tighter
     # than the legacy rule defaults and are applied by PositionManager.
-    defensive_stop_loss_pct: float = 50.0
-    defensive_stop_sell_pct: float = 50.0
-    hard_stop_loss_pct: float = 65.0
+    defensive_stop_loss_pct: float = 25.0
+    defensive_stop_sell_pct: float = 19.0
+    hard_stop_loss_pct: float = 35.0
     breakeven_trigger_pct: float = 10.0
     breakeven_lock_pct: float = -2.0
     profit_lock_trigger_pct: float = 20.0
