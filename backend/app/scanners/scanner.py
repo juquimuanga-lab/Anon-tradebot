@@ -38,6 +38,11 @@ from app.connectors.fourmeme import fourmeme_client
 from app.connectors.helius import (    HeliusAPIError,
     HeliusClient,
 )
+from app.connectors.solana_tracker import (
+    SMART_MONEY_WATCH_INTERVAL_SECONDS,
+    SolanaTrackerClient,
+    SolanaTrackerError,
+)
 
 from app.execution.base import OrderResult
 
@@ -164,6 +169,13 @@ class ScannerService:
         self._execution_router = execution_router
 
         self._fourmeme = fourmeme_client
+        # Dedicated low-latency wallet copy-trade watcher. It is deliberately
+        # separate from launch qualification so the watched wallet does not
+        # have to wait for the normal launch scanner.
+        self._smart_money = SolanaTrackerClient(timeout_seconds=3.0)
+        self._smart_money_wallet = (
+            "HmUt3Jn46j7c7ANdURmEyjSRj8i3Em6MhjQUi37PZ219"
+        )
 
         self._watermarks = (            onchain_watcher.WatermarkStore()
         )
@@ -1354,6 +1366,7 @@ class ScannerService:
         token,
         rule_row,
         score_result,
+        smart_money_trigger: bool = False,
     ) -> bool:
 
         state = (
@@ -1520,7 +1533,17 @@ class ScannerService:
         # min_market_cap_usd=8000 cannot be satisfied by an old snapshot
         # while the actual buy occurs materially below that level.
         # --------------------------------------------------------------
-        if token.source == SOURCE_PUMPFUN and _rule_strategy(rule_row) == "fast":
+        if smart_money_trigger:
+            # The smart-money wallet is itself the entry signal. Do not add a
+            # second launch-age/market-cap revalidation round-trip here; doing
+            # so would recreate the late-entry friction this path is designed
+            # to remove. The fresh Pump.fun snapshot above still validates the
+            # mint and current market data before execution.
+            logger.info(
+                "smart_money_hot_path_prebuy_revalidation_skipped",
+                extra={"mint": token.mint, "rule_id": rule_row.id},
+            )
+        elif token.source == SOURCE_PUMPFUN and _rule_strategy(rule_row) == "fast":
             # Fast Sniper deliberately avoids a second Python-side bonding-curve
             # read here. The launch snapshot has already passed the fast safety
             # gate and the transaction builder obtains the current execution data.
@@ -2598,6 +2621,148 @@ class ScannerService:
                     )
 
     # ------------------------------------------------------------------
+    # Smart-money copy trading
+    # ------------------------------------------------------------------
+
+    async def _watch_smart_money_wallet(self) -> None:
+        """Watch the configured smart-money wallet and copy new Pump.fun buys.
+
+        This path intentionally does NOT call the normal launch qualification
+        pipeline. The wallet buy itself is the trigger. The admin's active
+        Smart rule still controls buy size, cooldown/max-trades and all exit
+        management through the existing position manager.
+        """
+        if not self._smart_money.api_key or not getattr(settings, "smart_money_enabled", True):
+            return
+
+        try:
+            events = await self._smart_money.poll_smart_money_buys(
+                self._smart_money_wallet
+            )
+        except SolanaTrackerError as exc:
+            logger.warning(
+                "smart_money_wallet_poll_failed",
+                extra={"wallet": self._smart_money_wallet, "error": str(exc)},
+            )
+            return
+        except Exception as exc:
+            logger.exception(
+                "smart_money_wallet_poll_unexpected",
+                extra={"wallet": self._smart_money_wallet, "error": str(exc)},
+            )
+            return
+
+        if not events:
+            return
+
+        for event in events:
+            target = event.get("to") or {}
+            mint = str(target.get("address") or "")
+            if not mint:
+                continue
+
+            # Each admin gets an independent copy decision. We deliberately
+            # use the Smart lane, not the Fast launch lane.
+            rules = await repo.get_all_active_rules()
+            admin_rules: dict[int, object] = {}
+            for rule in rules:
+                if not _rule_matches_source(rule, SOURCE_PUMPFUN):
+                    continue
+                if _rule_strategy(rule) != "smart":
+                    continue
+                admin_rules[rule.created_by] = rule
+
+            for admin_id, rule in admin_rules.items():
+                state = await repo.get_or_create_bot_state(admin_id)
+                if not state.trading_enabled:
+                    continue
+                if not state.pumpfun_trading_enabled:
+                    continue
+                if not getattr(state, "smart_money_copy_enabled", False):
+                    continue
+
+                # Never duplicate an existing position for this admin.
+                if await repo.has_open_or_pending_position(mint, admin_id):
+                    continue
+
+                # Build a fresh Pump.fun snapshot immediately after the wallet
+                # buy. This verifies the mint is actually reachable through the
+                # Pump.fun curve and gives the execution adapter a live price.
+                first_seen = datetime.now(timezone.utc)
+                metadata = {
+                    "creator": "",
+                    "ticker_name": str((target.get("token") or {}).get("name") or mint[:6]),
+                    "ticker_symbol": str((target.get("token") or {}).get("symbol") or mint[:6]),
+                    "smart_money_wallet": self._smart_money_wallet,
+                    "smart_money_tx": str(event.get("tx") or ""),
+                    "smart_money_trade_time": event.get("time"),
+                }
+                token = await self._build_onchain_snapshot(
+                    mint, SOURCE_PUMPFUN, metadata, first_seen
+                )
+                if token is None:
+                    # Not a readable Pump.fun asset (or it has already moved
+                    # to an unsupported venue). Do not blindly copy it.
+                    logger.info(
+                        "smart_money_non_pumpfun_or_unreadable",
+                        extra={"mint": mint, "tx": event.get("tx"), "admin_id": admin_id},
+                    )
+                    continue
+
+                await repo.save_token(token)
+
+                from app.storage.repository import rule_row_to_params
+                rule_params = rule_row_to_params(rule)
+                score_result = compute_score(
+                    token, rule_params, settings.creator_watchlist
+                )
+
+                logger.info(
+                    "smart_money_buy_detected",
+                    extra={
+                        "wallet": self._smart_money_wallet,
+                        "mint": mint,
+                        "tx": event.get("tx"),
+                        "program": event.get("program"),
+                        "wallet_trade_time": event.get("time"),
+                        "admin_id": admin_id,
+                        "rule_id": rule.id,
+                        "market_cap_usd": token.market_cap_usd,
+                        "liquidity_usd": token.liquidity_usd,
+                    },
+                )
+
+                # Immediate Telegram alert, followed by the normal buy path.
+                try:
+                    await self._notifier.new_qualified_token(
+                        admin_id,
+                        token.ticker_symbol or mint[:8],
+                        mint,
+                        100.0,
+                        "smart_money",
+                    )
+                except Exception:
+                    logger.exception(
+                        "smart_money_alert_failed",
+                        extra={"admin_id": admin_id, "mint": mint},
+                    )
+
+                await self._maybe_trade(
+                    token, rule, score_result, smart_money_trigger=True
+                )
+
+    async def _smart_money_loop(self) -> None:
+        """Independent 1-second polling loop for the watched wallet."""
+        while True:
+            try:
+                await self._watch_smart_money_wallet()
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception("smart_money_loop_failed")
+            await asyncio.sleep(SMART_MONEY_WATCH_INTERVAL_SECONDS)
+
+    # ------------------------------------------------------------------
     # Scan
     # ------------------------------------------------------------------
 
@@ -2660,46 +2825,54 @@ class ScannerService:
     async def run_forever(
         self,
     ):
-        """Run Pump.fun polling quickly without hammering Anoncoin."""
+        """Run launch scanning while a dedicated smart-money loop runs in parallel."""
         last_anoncoin_scan = 0.0
+        smart_money_task = asyncio.create_task(self._smart_money_loop())
 
-        while True:
-            try:
-                active_rules = await repo.get_all_active_rules()
+        try:
+            while True:
+                try:
+                    active_rules = await repo.get_all_active_rules()
 
-                await self._watch_wallets_for_new_mints()
-                await self._process_watched_wallet_pending(active_rules)
+                    await self._watch_wallets_for_new_mints()
+                    await self._process_watched_wallet_pending(active_rules)
 
-                now = time.monotonic()
-                if now - last_anoncoin_scan >= settings.scan_interval_seconds:
-                    for token in await self._fetch_new_tokens():
-                        if await repo.token_already_seen(token.mint):
-                            logger.debug(
-                                "anoncoin_discovery_duplicate",
-                                extra={"mint": token.mint},
-                            )
-                            continue
-                        logger.info(
-                            "anoncoin_legacy_candidate_discovered",
-                            extra={"mint": token.mint, "source": SOURCE_ANONCOIN},
-                        )
-                        await repo.save_token(token)
-                        metrics.tokens_scanned += 1
-                        token = await self._enrich_holders(token)
-                        for rule in active_rules:
-                            if not _rule_matches_source(rule, token.source):
+                    now = time.monotonic()
+                    if now - last_anoncoin_scan >= settings.scan_interval_seconds:
+                        for token in await self._fetch_new_tokens():
+                            if await repo.token_already_seen(token.mint):
+                                logger.debug(
+                                    "anoncoin_discovery_duplicate",
+                                    extra={"mint": token.mint},
+                                )
                                 continue
-                            await self._screen_and_maybe_trade(
-                                token, rule, notify_on_fail=True
+                            logger.info(
+                                "anoncoin_legacy_candidate_discovered",
+                                extra={"mint": token.mint, "source": SOURCE_ANONCOIN},
                             )
-                    last_anoncoin_scan = now
+                            await repo.save_token(token)
+                            metrics.tokens_scanned += 1
+                            token = await self._enrich_holders(token)
+                            for rule in active_rules:
+                                if not _rule_matches_source(rule, token.source):
+                                    continue
+                                await self._screen_and_maybe_trade(
+                                    token, rule, notify_on_fail=True
+                                )
+                        last_anoncoin_scan = now
 
-            except Exception as exc:
-                metrics.error_count += 1
-                logger.exception("scan_cycle_failed")
-                await self._notifier.api_error("scanner", str(exc))
+                except Exception as exc:
+                    metrics.error_count += 1
+                    logger.exception("scan_cycle_failed")
+                    await self._notifier.api_error("scanner", str(exc))
 
-            await asyncio.sleep(settings.pumpfun_scan_interval_seconds)
+                await asyncio.sleep(settings.pumpfun_scan_interval_seconds)
+        finally:
+            smart_money_task.cancel()
+            try:
+                await smart_money_task
+            except asyncio.CancelledError:
+                pass
 
     # ------------------------------------------------------------------
     # Daily summary
