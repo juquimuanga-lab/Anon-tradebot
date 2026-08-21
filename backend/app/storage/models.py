@@ -556,6 +556,13 @@ class BotState(Base):
         default=False,
     )
 
+    # Explicit rule assigned to the independent Smart Money copy-trading lane.
+    # Nullable so existing BotState rows remain compatible.
+    smart_money_rule_id: Mapped[int | None] = mapped_column(
+        Integer,
+        nullable=True,
+    )
+
     fourmeme_trading_enabled: Mapped[bool] = mapped_column(
         Boolean,
         default=False,
