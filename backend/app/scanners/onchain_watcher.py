@@ -1765,6 +1765,12 @@ async def _smart_money_stream_worker(
                             except asyncio.QueueFull:
                                 pass
 
+                        try:
+                            from app.guardian import guardian
+                            await guardian.record("smart_money_buy", wallet=wallet, mint=bought["mint"], tx_signature=signature)
+                        except Exception:
+                            pass
+
                         logger.info(
                             "smart_money_buy_detected " + json.dumps(
                                 event,
