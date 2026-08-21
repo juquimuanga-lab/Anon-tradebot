@@ -841,7 +841,13 @@ class ScannerService:
                 )
             ),
             source=SOURCE_PUMPFUN,
-        )
+            raw_enrichment={
+                "smart_money": bool(metadata.get("smart_money")),
+                "smart_money_wallet": metadata.get("smart_money_wallet"),
+                "smart_money_tx_signature": metadata.get("smart_money_tx_signature"),
+                "tx_signature": metadata.get("tx_signature"),
+            },
+               )
 
     # ------------------------------------------------------------------
     # Unified snapshot dispatcher
@@ -2474,18 +2480,22 @@ class ScannerService:
             for rule in active_rules:
                 if not _rule_matches_source(rule, source):
                     continue
-                # Pump.fun has independent Fast/Smart switches per admin.
+                # Pump.fun has three independent per-admin lanes: Fast, Smart, Smart Money.
                 if source == SOURCE_PUMPFUN:
                     state = await repo.get_or_create_bot_state(rule.created_by)
                     if not state.trading_enabled or not state.pumpfun_trading_enabled:
                         continue
                     strategy = _rule_strategy(rule)
-                    if strategy == "fast" and not getattr(state, "pumpfun_fast_enabled", False):
+                    is_smart_money = bool(watch.get("smart_money"))
+                    if is_smart_money:
+                        assigned = await repo.get_active_smart_money_rule(rule.created_by)
+                        if not assigned or assigned.id != rule.id or not getattr(state, "smart_money_copy_enabled", False):
+                            continue
+                    elif strategy == "fast" and not getattr(state, "pumpfun_fast_enabled", False):
                         continue
-                    if strategy == "smart" and not getattr(state, "pumpfun_smart_enabled", True):
+                    elif strategy == "smart" and not getattr(state, "pumpfun_smart_enabled", True):
                         continue
-                    # Fast lane is intentionally limited to a two-second hot window.
-                    effective_age = min(rule.max_age_seconds, 2) if strategy == "fast" else rule.max_age_seconds
+                    effective_age = min(rule.max_age_seconds, 2) if strategy == "fast" and not is_smart_money else rule.max_age_seconds
                 else:
                     effective_age = rule.max_age_seconds
                 if age_seconds <= effective_age:
@@ -2537,8 +2547,14 @@ class ScannerService:
             # Process Fast rules immediately from the first bonding-curve
             # snapshot. Do NOT call Helius holder enrichment or the Smart
             # quality gate before this path.
-            fast_rules = [r for r in due_rules if _rule_strategy(r) == "fast"]
-            smart_rules = [r for r in due_rules if _rule_strategy(r) != "fast"]
+            if watch.get("smart_money"):
+                smart_money_rules = list(due_rules)
+                fast_rules = []
+                smart_rules = []
+            else:
+                smart_money_rules = []
+                fast_rules = [r for r in due_rules if _rule_strategy(r) == "fast"]
+                smart_rules = [r for r in due_rules if _rule_strategy(r) != "fast"]
 
             fast_settled = True
             if source == SOURCE_PUMPFUN and fast_rules:
@@ -2554,6 +2570,30 @@ class ScannerService:
                         fast_settled = False
 
             # ----------------------------------------------------------
+            # SMART MONEY COPY PATH
+            # ----------------------------------------------------------
+            if smart_money_rules:
+                for rule in smart_money_rules:
+                    logger.info(
+                        "smart_money_rule_evaluation",
+                        extra={
+                            "mint": mint,
+                            "rule_id": rule.id,
+                            "wallet": metadata.get("smart_money_wallet"),
+                            "tx_signature": metadata.get("smart_money_tx_signature"),
+                        },
+                    )
+                    done = await self._screen_and_maybe_trade(token, rule, notify_on_fail=False)
+                    logger.info(
+                        "smart_money_rule_result",
+                        extra={
+                            "mint": mint, "rule_id": rule.id, "done": done,
+                            "wallet": metadata.get("smart_money_wallet"),
+                            "tx_signature": metadata.get("smart_money_tx_signature"),
+                        },
+                    )
+
+            # ----------------------------------------------------------
             # SMART FILTER PATH
             # ----------------------------------------------------------
             # Only the Smart lane pays the holder-enrichment/quality-gate
@@ -2566,7 +2606,7 @@ class ScannerService:
             # decent early launches through while filtering the weakest
             # launches. Temporary missing snapshot data is deferred rather
             # than permanently discarded.
-            if smart_rules:
+            if smart_rules and not watch.get("smart_money"):
                 (
                     quality_status,
                     quality_score,
@@ -2576,11 +2616,11 @@ class ScannerService:
             else:
                 quality_status, quality_score, quality_reasons, quality_breakdown = ("pass", 100.0, [], {})
 
-            if smart_rules and quality_status == "defer":
+            if smart_rules and not watch.get("smart_money") and quality_status == "defer":
                 # Keep the token in _pending_watch for another snapshot.
                 continue
 
-            if smart_rules and quality_status == "reject":
+            if smart_rules and not watch.get("smart_money") and quality_status == "reject":
                 for rule in smart_rules:
                     await repo.save_screening_result(
                         token.mint,
