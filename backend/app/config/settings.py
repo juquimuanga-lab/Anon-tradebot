@@ -183,7 +183,7 @@ class Settings(BaseSettings):
 
     smart_money_wallets_raw: str = Field(
         default=(
-            "HmUt3Jn46j7c7ANdURmEyjSRj8i3Em6MhjQUi37PZ219"
+            "HmUt3Jn46j7c7ANdURmEyjSRj8i3Em6MhjQUi37PZ219,DdM1tyCdoEyoxYYmGMjdf5rRPcpmj3UzZTpE7ScuTf7d"
         ),
         validation_alias="SMART_MONEY_WALLETS",
     )
