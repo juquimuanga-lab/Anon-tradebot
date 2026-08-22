@@ -882,70 +882,46 @@ def _instruction_program_id(
     instruction,
     account_keys=None,
 ) -> Optional[str]:
-    """Get program ID from native or raw JSON-RPC instruction."""
+    """Get program ID from native, compiled, or raw JSON-RPC instruction."""
+    if instruction is None:
+        return None
 
-    program_id = getattr(
-        instruction,
-        "program_id",
-        None,
-    )
-
-    if program_id is not None:
-        return _pubkey_string(
-            program_id
-        )
-
-    program_id = getattr(
-        instruction,
-        "programId",
-        None,
-    )
-
-    if program_id is not None:
-        return _pubkey_string(
-            program_id
-        )
-
-    if isinstance(
-        instruction,
-        dict,
-    ):
-        program_id = instruction.get(
-            "programId"
-        )
-
+    # Native/parsed instructions.
+    for attr in ("program_id", "programId"):
+        program_id = getattr(instruction, attr, None)
         if program_id is not None:
-            return _pubkey_string(
-                program_id
-            )
+            value = _pubkey_string(program_id)
+            if value:
+                return value
 
-        # Partially-decoded JSON-RPC instructions may expose the
-        # program as an account-key index.
+    if isinstance(instruction, dict):
+        for key in ("programId", "program_id"):
+            program_id = instruction.get(key)
+            if program_id is not None:
+                value = _pubkey_string(program_id)
+                if value:
+                    return value
+
+        # Raw JSON compiled instruction.
         program_index = instruction.get(
-            "programIdIndex"
+            "programIdIndex",
+            instruction.get("program_id_index"),
+        )
+    else:
+        # solders CompiledInstruction uses program_id_index.
+        program_index = getattr(
+            instruction,
+            "program_id_index",
+            None,
         )
 
-        if (
-            program_index is not None
-            and account_keys
-        ):
-            try:
-                program_index = int(
-                    program_index
-                )
-
-                if (
-                    0 <= program_index
-                    < len(account_keys)
-                ):
-                    return _pubkey_string(
-                        account_keys[
-                            program_index
-                        ]
-                    )
-
-            except Exception:
-                pass
+    if program_index is not None and account_keys:
+        try:
+            index = int(program_index)
+            if 0 <= index < len(account_keys):
+                return _pubkey_string(account_keys[index])
+        except Exception:
+            pass
 
     return None
 
@@ -1534,6 +1510,47 @@ def _estimate_wallet_sol_spent(tx, wallet: str) -> float:
         return 0.0
 
 
+def _transaction_contains_program(tx, program_id: str) -> bool:
+    """Check outer and inner instructions for a program ID."""
+    try:
+        transaction = _obj_get(tx, "transaction")
+        message = _obj_get(transaction, "transaction")
+        message = _obj_get(message, "message") or _obj_get(transaction, "message")
+        account_keys = (
+            _obj_get(message, "account_keys", [])
+            or _obj_get(message, "accountKeys", [])
+            or []
+        )
+        instructions = _obj_get(message, "instructions", []) or []
+        for instruction in instructions:
+            if _instruction_program_id(instruction, account_keys) == program_id:
+                return True
+
+        meta = _obj_get(transaction, "meta")
+        inner_groups = (
+            _obj_get(meta, "inner_instructions", [])
+            or _obj_get(meta, "innerInstructions", [])
+            or []
+        )
+        for group in inner_groups:
+            inner_instructions = (
+                _obj_get(group, "instructions", [])
+                or []
+            )
+            for instruction in inner_instructions:
+                if _instruction_program_id(
+                    instruction,
+                    account_keys,
+                ) == program_id:
+                    return True
+    except Exception:
+        logger.debug(
+            "smart_money_program_scan_failed",
+            exc_info=True,
+        )
+    return False
+
+
 def _extract_wallet_bought_mint(tx, wallet: str) -> Optional[dict]:
     """Find a non-SOL token balance increase for the watched wallet.
 
@@ -1793,30 +1810,15 @@ async def _smart_money_stream_worker(
                             )
                             continue
 
-                        tx_has_pumpfun = False
-                        try:
-                            tx_outer = _obj_get(tx, "transaction")
-                            tx_message = _obj_get(tx_outer, "transaction")
-                            tx_message = _obj_get(tx_message, "message") or _obj_get(
-                                tx_outer, "message"
-                            )
-                            tx_account_keys = (
-                                _obj_get(tx_message, "account_keys", [])
-                                or _obj_get(tx_message, "accountKeys", [])
-                                or []
-                            )
-                            tx_instructions = _obj_get(
-                                tx_message, "instructions", []
-                            ) or []
-                            tx_has_pumpfun = any(
-                                _instruction_program_id(
-                                    instruction,
-                                    tx_account_keys,
-                                ) == PUMPFUN_PROGRAM_ID
-                                for instruction in tx_instructions
-                            )
-                        except Exception:
-                            tx_has_pumpfun = False
+                        # Scan the parsed transaction itself, including CPI/inner
+                        # instructions. This matters for Smart Money wallets that buy
+                        # through a router/aggregator: Pump.fun may only appear in an
+                        # inner instruction and the outer instruction can belong to
+                        # another program.
+                        tx_has_pumpfun = _transaction_contains_program(
+                            tx,
+                            PUMPFUN_PROGRAM_ID,
+                        )
 
                         has_pumpfun = bool(has_pumpfun or tx_has_pumpfun)
                         state["last_transaction_has_pumpfun"] = has_pumpfun
@@ -1838,6 +1840,23 @@ async def _smart_money_stream_worker(
                         bought = _extract_wallet_bought_mint(tx, wallet)
                         sold = _extract_wallet_sold_mint(tx, wallet)
                         sol_spent = _estimate_wallet_sol_spent(tx, wallet)
+
+                        logger.info(
+                            "smart_money_balance_delta_analysis",
+                            extra={
+                                "wallet": wallet,
+                                "signature": signature,
+                                "buy_mint": (bought or {}).get("mint"),
+                                "buy_token_amount_raw": (bought or {}).get(
+                                    "token_amount_raw", 0
+                                ),
+                                "sell_mint": (sold or {}).get("mint"),
+                                "sell_token_amount_raw": (sold or {}).get(
+                                    "token_amount_raw", 0
+                                ),
+                                "sol_spent": sol_spent,
+                            },
+                        )
 
                         # This diagnostic is intentionally emitted before any
                         # downstream rule/filter. It tells us exactly what Helius
