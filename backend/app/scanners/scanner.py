@@ -2097,6 +2097,38 @@ class ScannerService:
 
         strategy = _rule_strategy(rule)
 
+        # ------------------------------------------------------------------
+        # SMART MONEY BLIND COPY PATH
+        # ------------------------------------------------------------------
+        # A tracked Smart Money wallet is itself the signal. Do NOT run the
+        # normal hard filters, Fast filters, holder enrichment, quality gate,
+        # late-entry checks, or score threshold before dispatching the buy.
+        # The rule is retained only for execution parameters (buy amount,
+        # slippage, priority fee, etc.) and the global Pump.fun/trading safety
+        # switches enforced by _maybe_trade().
+        if token.source == SOURCE_PUMPFUN and token.raw_enrichment.get("smart_money"):
+            score_result = compute_score(token, rule_params, settings.creator_watchlist)
+            logger.info(
+                "smart_money_blind_buy_dispatch",
+                extra={
+                    "mint": token.mint,
+                    "rule_id": rule.id,
+                    "wallet": token.raw_enrichment.get("smart_money_wallet"),
+                    "tx_signature": token.raw_enrichment.get("smart_money_tx_signature"),
+                    "telemetry_score": score_result.score,
+                    "reason": "tracked_smart_money_buy_bypasses_normal_filters",
+                },
+            )
+            metrics.tokens_qualified += 1
+            await self._notifier.new_qualified_token(
+                rule.created_by,
+                token.ticker_symbol or token.mint[:8],
+                token.mint,
+                score_result.score,
+                token.source,
+            )
+            return await self._maybe_trade(token, rule, score_result)
+
         if token.source == SOURCE_PUMPFUN and strategy == "fast":
             passed, reasons = evaluate_fast_sniper_filters(token, rule_params)
             score_result = compute_score(token, rule_params, settings.creator_watchlist)
@@ -2504,7 +2536,14 @@ class ScannerService:
                         continue
                     elif strategy == "smart" and not getattr(state, "pumpfun_smart_enabled", True):
                         continue
-                    effective_age = min(rule.max_age_seconds, 2) if strategy == "fast" and not is_smart_money else rule.max_age_seconds
+                    # Smart-money copy is event-driven: do not apply the normal
+                    # rule age window. The tracked wallet already made the buy,
+                    # so give the copy path enough time to build the on-chain
+                    # snapshot even when RPC data is temporarily delayed.
+                    if is_smart_money:
+                        effective_age = fallback_max_age
+                    else:
+                        effective_age = min(rule.max_age_seconds, 2) if strategy == "fast" else rule.max_age_seconds
                 else:
                     effective_age = rule.max_age_seconds
                 if age_seconds <= effective_age:
