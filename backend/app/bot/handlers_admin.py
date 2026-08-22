@@ -321,6 +321,38 @@ async def setsmart_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
 
 @admin_required
+async def setsmartmoney_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Assign an admin-owned Solana rule to the independent Smart Money copy lane."""
+    if not context.args or not context.args[0].isdigit():
+        await update.message.reply_text(
+            "Usage: /setsmartmoney RULE_ID\n\n"
+            "Example: /setsmartmoney 1"
+        )
+        return
+
+    rule_id = int(context.args[0])
+    rule = await repo.set_smart_money_rule(rule_id, update.effective_user.id)
+
+    if not rule:
+        await update.message.reply_text(
+            f"❌ Rule #{rule_id} was not found, does not belong to you, "
+            "or is not a Solana rule."
+        )
+        return
+
+    await repo.write_audit_log(
+        str(update.effective_user.id),
+        "assign_pumpfun_smart_money_rule",
+        {"rule_id": rule.id},
+    )
+    await update.message.reply_text(
+        f"👁 Rule #{rule.id} ({rule.name}) is now the independent "
+        "Pump.fun Smart Money rule.\n\n"
+        "Use /enablesmartmoney to turn Smart Money copying ON."
+    )
+
+
+@admin_required
 async def enablesmartmoney_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Enable copy-trading from the configured smart-money wallet(s)."""
     await repo.update_bot_state(
@@ -334,7 +366,7 @@ async def enablesmartmoney_cmd(update: Update, context: ContextTypes.DEFAULT_TYP
     )
     await update.message.reply_text(
         "🧠 Smart Money Copy: ON\n\n"
-        "New buys from the configured wallet will be copied using your active Smart rule. "
+        "New buys from the configured wallet will be copied using your independent Smart Money rule. "
         "Your existing position exits/TP/SL rules remain unchanged."
     )
 
