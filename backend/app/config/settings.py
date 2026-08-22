@@ -270,15 +270,16 @@ class Settings(BaseSettings):
 
     # Risk management for live positions. These are deliberately tighter
     # than the legacy rule defaults and are applied by PositionManager.
-    defensive_stop_loss_pct: float = 75.0
-    defensive_stop_sell_pct: float = 66.0
-    hard_stop_loss_pct: float = 80.0
+    defensive_stop_loss_pct: float = 15.0
+    defensive_stop_sell_pct: float = 50.0
+    hard_stop_loss_pct: float = 25.0
     breakeven_trigger_pct: float = 10.0
     breakeven_lock_pct: float = -2.0
     profit_lock_trigger_pct: float = 20.0
     profit_lock_pct: float = 5.0
     strong_profit_trigger_pct: float = 40.0
     strong_profit_lock_pct: float = 10.0
+    strong_runner_lock_pct: float = 35.0
     adaptive_trailing_min_pct: float = 15.0
     adaptive_trailing_mid_pct: float = 22.0
     adaptive_trailing_strong_pct: float = 30.0
@@ -322,7 +323,7 @@ class Settings(BaseSettings):
 
     scan_interval_seconds: int = 10
 
-    position_check_interval_seconds: int = 5
+    position_check_interval_seconds: int = 1
 
     execution_timeout_seconds: int = 180
 
