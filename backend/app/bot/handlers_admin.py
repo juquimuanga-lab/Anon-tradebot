@@ -190,9 +190,9 @@ async def pumpfun_snipers_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE
         f"⚡ Fast Sniper: {'ON' if getattr(state, 'pumpfun_fast_enabled', False) else 'OFF'}\n"
         f"🧠 Smart Filter: {'ON' if getattr(state, 'pumpfun_smart_enabled', True) else 'OFF'}\n"
         f"👁 Smart Money Copy: {'ON' if getattr(state, 'smart_money_copy_enabled', False) else 'OFF'}\n"
-        f"⚡ Fast rule: #{fast_rule.id} {fast_rule.name if fast_rule else 'none'}\n"
-        f"🧠 Smart rule: #{smart_rule.id} {smart_rule.name if smart_rule else 'none'}\n"
-        f"👁 Smart Money rule: #{smart_money_rule.id} {smart_money_rule.name if smart_money_rule else 'none'}\n\n"
+        f"⚡ Fast rule: #{fast_rule.id if fast_rule else 'none'} {fast_rule.name if fast_rule else 'none'}\n"
+        f"🧠 Smart rule: #{smart_rule.id if smart_rule else 'none'} {smart_rule.name if smart_rule else 'none'}\n"
+        f"👁 Smart Money rule: #{smart_money_rule.id if smart_money_rule else 'none'} {smart_money_rule.name if smart_money_rule else 'none'}\n\n"
         "Fast rules intentionally skip holder/score checks and use only the launch-time safety gate. "
         "Smart rules use the full quality/score pipeline."
     )
