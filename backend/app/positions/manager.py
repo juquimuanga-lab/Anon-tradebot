@@ -1583,8 +1583,8 @@ class PositionManager:
         #
         # A tiny fixed stop is unreliable on fast launch markets because
         # normal micro-wicks can exceed it before the sell lands. Instead:
-        #   - take a one-time 50% defensive exit at -8%;
-        #   - hard-close the remainder at -15%;
+        #   - take a one-time 50% defensive exit at -15%;
+        #   - hard-close the remainder at -25%;
         #   - once the trade proves itself, lock profit progressively;
         #   - use an adaptive trailing distance on larger winners.
         # --------------------------------------------------------------
@@ -1638,33 +1638,64 @@ class PositionManager:
             position.entry_price_usd, peak_price
         )
 
+        # --------------------------------------------------------------
+        # PROFIT PROTECTION / ADAPTIVE TRAILING
+        #
+        # Do not use a fixed "profit lock" as a separate full-position
+        # exit. On fast launches a brief wick can cross that floor and a
+        # market sell can then fill far below the trigger. Instead the
+        # protection level is derived from the highest confirmed PnL and
+        # acts as the trailing floor for the remaining position.
+        #
+        # The floor is deliberately progressive:
+        #   +10% peak -> protect -2% (near breakeven)
+        #   +20% peak -> protect +5%
+        #   +40% peak -> protect +10%
+        #   +75% peak -> protect +35%
+        #
+        # This keeps the runner alive during normal volatility while
+        # preventing a large winner from round-tripping into a loss.
+        # --------------------------------------------------------------
         protected_pnl = None
-        if peak_pnl_pct >= settings.strong_profit_trigger_pct:
+        protection_stage = None
+        if peak_pnl_pct >= 75.0:
+            protected_pnl = settings.strong_runner_lock_pct
+            protection_stage = "strong_runner"
+        elif peak_pnl_pct >= settings.strong_profit_trigger_pct:
             protected_pnl = settings.strong_profit_lock_pct
+            protection_stage = "strong_profit"
         elif peak_pnl_pct >= settings.profit_lock_trigger_pct:
             protected_pnl = settings.profit_lock_pct
+            protection_stage = "profit"
         elif peak_pnl_pct >= settings.breakeven_trigger_pct:
             protected_pnl = settings.breakeven_lock_pct
+            protection_stage = "breakeven"
 
         if protected_pnl is not None and pnl_pct <= protected_pnl:
             logger.info(
-                "profit_lock_triggered",
+                "adaptive_profit_floor_triggered",
                 extra={
                     "mint": token.mint,
                     "position_id": position.id,
                     "pnl_pct": pnl_pct,
                     "peak_pnl_pct": peak_pnl_pct,
                     "protected_pnl_pct": protected_pnl,
+                    "protection_stage": protection_stage,
+                    "remaining_pct": position.remaining_pct,
                 },
             )
             await self._close_position(
                 position, token, current_price,
                 position.remaining_pct,
-                f"profit lock {protected_pnl:+.1f}%",
+                f"adaptive profit floor {protected_pnl:+.1f}%",
                 reconcile_wallet=False,
             )
             return
 
+        # Keep a secondary price-distance trailing guard for very large
+        # winners. This catches a rapid collapse even if the PnL floor is
+        # skipped between monitoring ticks. The profit floor above is the
+        # primary protection for normal winners.
         if peak_pnl_pct >= 75.0:
             trailing_pct = settings.adaptive_trailing_max_pct
         elif peak_pnl_pct >= 40.0:
