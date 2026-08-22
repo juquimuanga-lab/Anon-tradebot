@@ -256,13 +256,13 @@ class Settings(BaseSettings):
     # Pump.fun rule before screening/revalidation. They mirror the safe
     # defaults defined in app/scoring/rules.py.
     late_entry_enabled: bool = True
-    late_entry_max_age_seconds: float = 5.0
-    late_entry_soft_market_cap_usd: float = 12000.0
-    late_entry_hard_market_cap_usd: float = 25000.0
+    late_entry_max_age_seconds: float = 3.0
+    late_entry_soft_market_cap_usd: float = 8000.0
+    late_entry_hard_market_cap_usd: float = 15000.0
     late_entry_near_high_pct: float = 4.0
-    late_entry_required_pullback_pct: float = 8.0
-    late_entry_max_short_runup_pct: float = 35.0
-    late_entry_max_runup_from_first_pct: float = 90.0
+    late_entry_required_pullback_pct: float = 10.0
+    late_entry_max_short_runup_pct: float = 25.0
+    late_entry_max_runup_from_first_pct: float = 60.0
 
     # Fast Pump.fun polling is intentionally separate from the slower
     # Anoncoin API scan interval.
