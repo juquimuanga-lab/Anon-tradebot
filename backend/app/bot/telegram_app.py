@@ -29,6 +29,7 @@ async def set_bot_commands(application: Application) -> None:
         BotCommand("pumpfunsnipers", "Control Fast, Smart and Smart Money"),
         BotCommand("setfast", "Set a Pump.fun Fast rule"),
         BotCommand("setsmart", "Set a Pump.fun Smart rule"),
+        BotCommand("setsmartmoney", "Set the Smart Money rule"),
         BotCommand("enablesmartmoney", "Enable Smart Money copy"),
         BotCommand("disablesmartmoney", "Disable Smart Money copy"),
         BotCommand("enablepumpfun", "Enable Pump.fun trading"),
@@ -75,6 +76,7 @@ def build_application() -> Application:
     application.add_handler(CommandHandler("pumpfunsnipers", handlers_admin.pumpfun_snipers_cmd))
     application.add_handler(CommandHandler("setfast", handlers_admin.setfast_cmd))
     application.add_handler(CommandHandler("setsmart", handlers_admin.setsmart_cmd))
+    application.add_handler(CommandHandler("setsmartmoney", handlers_admin.setsmartmoney_cmd))
     application.add_handler(CommandHandler("enablesmartmoney", handlers_admin.enablesmartmoney_cmd))
     application.add_handler(CommandHandler("disablesmartmoney", handlers_admin.disablesmartmoney_cmd))
 
