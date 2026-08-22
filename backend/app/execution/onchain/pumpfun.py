@@ -33,6 +33,8 @@ import json
 import logging
 import os
 import struct
+import time
+from collections import defaultdict
 from pathlib import Path
 from typing import Optional
 
@@ -62,6 +64,30 @@ PUMPFUN_POOL_CACHE_SECONDS = 1.25
 PUMPFUN_TOKEN_DECIMALS = 6
 _pumpfun_pool_cache: dict[str, tuple[float, dict]] = {}
 _pumpfun_decimals_cache: dict[str, tuple[float, int]] = {}
+
+# ---------------------------------------------------------------------------
+# Early-launch organic-flow safety gate
+# ---------------------------------------------------------------------------
+# These are internal safety defaults. They are deliberately independent of
+# Telegram RuleParams so admins can keep their existing multi-ruleset UI.
+#
+# The gate is designed to reject strong coordination signals without requiring
+# a large holder count or a long observation window.
+PUMPFUN_LAUNCH_SAFETY_CACHE_SECONDS = 1.25
+PUMPFUN_LAUNCH_SAFETY_SIGNATURE_LIMIT = 10
+PUMPFUN_LAUNCH_SAFETY_MAX_AGE_SECONDS = 20.0
+
+PUMPFUN_SAFETY_TOP_BUYER_SHARE = 0.50
+PUMPFUN_SAFETY_TOP3_BUYER_SHARE = 0.85
+PUMPFUN_SAFETY_SAME_SLOT_SHARE = 0.80
+PUMPFUN_SAFETY_SAME_SIZE_SHARE = 0.80
+PUMPFUN_SAFETY_SHARED_FUNDER_MAX_BUYERS = 3
+PUMPFUN_SAFETY_SHARED_FUNDER_VOLUME_SHARE = 0.45
+PUMPFUN_SAFETY_CREATOR_BUY_SHARE = 0.20
+PUMPFUN_SAFETY_MIN_BUY_PRESSURE = 0.55
+PUMPFUN_SAFETY_MIN_BUY_EVENTS_FOR_PRESSURE = 4
+
+_pumpfun_launch_safety_cache: dict[str, tuple[float, dict]] = {}
 
 
 # ---------------------------------------------------------------------------
@@ -792,6 +818,415 @@ async def get_pool_info(
     _pumpfun_pool_cache[mint] = (now, result)
     return dict(result)
 
+
+
+# ---------------------------------------------------------------------------
+# Early-launch organic-flow analysis
+# ---------------------------------------------------------------------------
+
+def _rpc_json_value(body: dict):
+    if not isinstance(body, dict):
+        return None
+    if "error" in body:
+        raise RuntimeError(f"RPC error: {body['error']}")
+    return body.get("result")
+
+
+async def _raw_rpc_call(rpc_url: str, method: str, params: list):
+    """Small raw JSON-RPC helper used only by the launch-safety analyzer."""
+    import httpx
+
+    payload = {
+        "jsonrpc": "2.0",
+        "id": "pumpfun-launch-safety",
+        "method": method,
+        "params": params,
+    }
+    async with httpx.AsyncClient(timeout=4.0) as client:
+        response = await client.post(
+            rpc_url,
+            json=payload,
+            headers={"Content-Type": "application/json"},
+        )
+        response.raise_for_status()
+        return _rpc_json_value(response.json())
+
+
+def _account_key_list(tx: dict) -> list[str]:
+    message = ((tx or {}).get("transaction") or {}).get("message") or {}
+    keys = message.get("accountKeys") or []
+    result = []
+    for item in keys:
+        if isinstance(item, str):
+            result.append(item)
+        elif isinstance(item, dict):
+            result.append(str(item.get("pubkey") or item.get("address") or ""))
+        else:
+            result.append(str(item))
+    return result
+
+
+def _token_balance_map(entries: list, mint: str) -> dict[int, tuple[str, int]]:
+    result = {}
+    for item in entries or []:
+        if not isinstance(item, dict) or item.get("mint") != mint:
+            continue
+        try:
+            index = int(item.get("accountIndex"))
+            amount = int(
+                ((item.get("uiTokenAmount") or {}).get("amount"))
+                or 0
+            )
+        except (TypeError, ValueError):
+            continue
+        owner = str(item.get("owner") or "")
+        result[index] = (owner, amount)
+    return result
+
+
+def _extract_direct_funder(tx: dict, buyer: str) -> str | None:
+    """Best-effort direct SOL funder detection from parsed System transfers."""
+    if not buyer:
+        return None
+
+    def inspect_instruction(ix):
+        if not isinstance(ix, dict):
+            return None
+        parsed = ix.get("parsed")
+        if not isinstance(parsed, dict):
+            return None
+        if parsed.get("type") != "transfer":
+            return None
+        if ix.get("program") != "system" and ix.get("programId") != "11111111111111111111111111111111":
+            return None
+        info = parsed.get("info") or {}
+        destination = str(info.get("destination") or "")
+        source = str(info.get("source") or "")
+        if destination == buyer and source and source != buyer:
+            return source
+        return None
+
+    message = ((tx or {}).get("transaction") or {}).get("message") or {}
+    for ix in message.get("instructions") or []:
+        funder = inspect_instruction(ix)
+        if funder:
+            return funder
+
+    for group in (tx.get("meta") or {}).get("innerInstructions") or []:
+        for ix in group.get("instructions") or []:
+            funder = inspect_instruction(ix)
+            if funder:
+                return funder
+    return None
+
+
+def _round_trade_size(sol_spent: float) -> float:
+    if sol_spent <= 0:
+        return 0.0
+    # 0.001 SOL buckets catch synchronized fixed-size buys while tolerating
+    # normal curve-price variation.
+    return round(sol_spent, 3)
+
+
+def _extract_buy_sell_event(tx: dict, mint: str) -> dict | None:
+    meta = (tx or {}).get("meta") or {}
+    pre = _token_balance_map(meta.get("preTokenBalances") or [], mint)
+    post = _token_balance_map(meta.get("postTokenBalances") or [], mint)
+    if not post and not pre:
+        return None
+
+    keys = _account_key_list(tx)
+    fee = int(meta.get("fee") or 0)
+    pre_lamports = meta.get("preBalances") or []
+    post_lamports = meta.get("postBalances") or []
+
+    buyers = defaultdict(int)
+    sellers = defaultdict(int)
+    buyer_sol = defaultdict(float)
+
+    indices = set(pre) | set(post)
+    for index in indices:
+        owner, post_amount = post.get(index, ("", 0))
+        pre_owner, pre_amount = pre.get(index, (owner, 0))
+        owner = owner or pre_owner
+        delta = post_amount - pre_amount
+        if not owner and 0 <= index < len(keys):
+            owner = keys[index]
+        if not owner or delta == 0:
+            continue
+
+        if delta > 0:
+            buyers[owner] += delta
+            if 0 <= index < len(pre_lamports) and 0 <= index < len(post_lamports):
+                spent_lamports = max(0, int(pre_lamports[index]) - int(post_lamports[index]))
+                if index == 0:
+                    spent_lamports = max(0, spent_lamports - fee)
+                buyer_sol[owner] += spent_lamports / SOL_LAMPORTS_PER_SOL
+        else:
+            sellers[owner] += abs(delta)
+
+    if not buyers and not sellers:
+        return None
+
+    slot = (tx or {}).get("slot")
+    return {
+        "buyers": dict(buyers),
+        "sellers": dict(sellers),
+        "buyer_sol": dict(buyer_sol),
+        "slot": int(slot) if slot is not None else None,
+    }
+
+
+async def analyze_launch_safety(
+    mint: str,
+    rpc_url: str,
+    creator: str = "",
+    created_at: float | None = None,
+) -> dict:
+    """Inspect the first Pump.fun curve transactions for coordination signals.
+
+    This is intentionally a safety layer, not another admin ruleset. It uses
+    multiple weak signals together so a normal launch is not rejected merely
+    because two snipers happened to buy in the same slot.
+    """
+    now = time.monotonic()
+    cached = _pumpfun_launch_safety_cache.get(mint)
+    if cached and (now - cached[0]) < PUMPFUN_LAUNCH_SAFETY_CACHE_SECONDS:
+        return dict(cached[1])
+
+    result = {
+        "status": "degraded",
+        "safe": True,
+        "mint": mint,
+        "reason": "",
+        "risk_score": 0,
+        "signals": {},
+    }
+
+    try:
+        curve_address, _ = get_bonding_curve_address(mint)
+        signatures = await _raw_rpc_call(
+            rpc_url,
+            "getSignaturesForAddress",
+            [
+                str(curve_address),
+                {
+                    "limit": PUMPFUN_LAUNCH_SAFETY_SIGNATURE_LIMIT,
+                    "commitment": "processed",
+                },
+            ],
+        )
+        signatures = signatures if isinstance(signatures, list) else []
+
+        events = []
+        for item in signatures:
+            if not isinstance(item, dict) or item.get("err") is not None:
+                continue
+            signature = item.get("signature")
+            if not signature:
+                continue
+
+            tx = await _raw_rpc_call(
+                rpc_url,
+                "getTransaction",
+                [
+                    signature,
+                    {
+                        "encoding": "jsonParsed",
+                        "maxSupportedTransactionVersion": 0,
+                        "commitment": "processed",
+                    },
+                ],
+            )
+            if not tx:
+                continue
+
+            event = _extract_buy_sell_event(tx, mint)
+            if not event:
+                continue
+
+            # A newly-created curve has no reason to have an old transaction
+            # stream. If block time exists, retain only a short launch window.
+            block_time = tx.get("blockTime")
+            if block_time is not None and created_at:
+                if float(block_time) < float(created_at) - 2.0:
+                    continue
+
+            event["signature"] = signature
+            event["block_time"] = block_time
+            event["funders"] = {
+                buyer: _extract_direct_funder(tx, buyer)
+                for buyer in event["buyers"]
+            }
+            events.append(event)
+
+            # Avoid turning the safety gate into a high-rate RPC consumer.
+            if len(events) >= 8:
+                break
+
+        buy_events = [e for e in events if e["buyers"]]
+        sell_events = [e for e in events if e["sellers"]]
+
+        buyer_volume = defaultdict(int)
+        buyer_sol = defaultdict(float)
+        slot_volume = defaultdict(int)
+        size_volume = defaultdict(int)
+        funder_volume = defaultdict(int)
+        funder_buyers = defaultdict(set)
+        creator_volume = 0
+
+        total_buy_tokens = 0
+        total_sell_tokens = 0
+
+        for event in buy_events:
+            for buyer, amount in event["buyers"].items():
+                buyer_volume[buyer] += int(amount)
+                total_buy_tokens += int(amount)
+                sol_amount = float(event["buyer_sol"].get(buyer, 0.0))
+                buyer_sol[buyer] += sol_amount
+                if event.get("slot") is not None:
+                    slot_volume[event["slot"]] += int(amount)
+                size_bucket = _round_trade_size(sol_amount)
+                if size_bucket > 0:
+                    size_volume[size_bucket] += int(amount)
+                funder = event["funders"].get(buyer)
+                if funder:
+                    funder_volume[funder] += int(amount)
+                    funder_buyers[funder].add(buyer)
+                if creator and buyer == creator:
+                    creator_volume += int(amount)
+
+        for event in sell_events:
+            total_sell_tokens += sum(int(v) for v in event["sellers"].values())
+
+        unique_buyers = len(buyer_volume)
+        buy_count = sum(len(e["buyers"]) for e in buy_events)
+        sell_count = sum(len(e["sellers"]) for e in sell_events)
+
+        def share(value, total):
+            return (float(value) / float(total)) if total > 0 else 0.0
+
+        sorted_buyer = sorted(buyer_volume.values(), reverse=True)
+        top1_share = share(sorted_buyer[0] if sorted_buyer else 0, total_buy_tokens)
+        top3_share = share(sum(sorted_buyer[:3]), total_buy_tokens)
+
+        max_slot_share = 0.0
+        if slot_volume:
+            max_slot_share = share(max(slot_volume.values()), total_buy_tokens)
+
+        max_size_share = 0.0
+        if size_volume:
+            max_size_share = share(max(size_volume.values()), total_buy_tokens)
+
+        max_shared_funder_buyers = 0
+        max_shared_funder_volume_share = 0.0
+        for funder, buyers in funder_buyers.items():
+            max_shared_funder_buyers = max(max_shared_funder_buyers, len(buyers))
+            max_shared_funder_volume_share = max(
+                max_shared_funder_volume_share,
+                share(funder_volume[funder], total_buy_tokens),
+            )
+
+        creator_buy_share = share(creator_volume, total_buy_tokens)
+        buy_pressure = share(total_buy_tokens, total_buy_tokens + total_sell_tokens)
+
+        risk = 0
+        reasons = []
+
+        if top1_share >= PUMPFUN_SAFETY_TOP_BUYER_SHARE:
+            risk += 30
+            reasons.append(f"top buyer controls {top1_share:.0%} of early buy flow")
+        elif top1_share >= 0.40:
+            risk += 15
+
+        if top3_share >= PUMPFUN_SAFETY_TOP3_BUYER_SHARE:
+            risk += 25
+            reasons.append(f"top 3 buyers control {top3_share:.0%} of early buy flow")
+        elif top3_share >= 0.70:
+            risk += 10
+
+        if max_slot_share >= PUMPFUN_SAFETY_SAME_SLOT_SHARE:
+            risk += 25
+            reasons.append(f"{max_slot_share:.0%} of early buy flow landed in one slot")
+
+        if max_size_share >= PUMPFUN_SAFETY_SAME_SIZE_SHARE and buy_count >= 4:
+            risk += 20
+            reasons.append(f"{max_size_share:.0%} of buy flow uses the same SOL-size bucket")
+
+        if (
+            max_shared_funder_buyers >= PUMPFUN_SAFETY_SHARED_FUNDER_MAX_BUYERS
+            and max_shared_funder_volume_share >= PUMPFUN_SAFETY_SHARED_FUNDER_VOLUME_SHARE
+        ):
+            risk += 40
+            reasons.append(
+                f"{max_shared_funder_buyers} early buyers share one direct funder "
+                f"({max_shared_funder_volume_share:.0%} of flow)"
+            )
+
+        if creator_buy_share >= PUMPFUN_SAFETY_CREATOR_BUY_SHARE:
+            risk += 30
+            reasons.append(f"creator controls {creator_buy_share:.0%} of early buy flow")
+
+        if (
+            buy_count >= PUMPFUN_SAFETY_MIN_BUY_EVENTS_FOR_PRESSURE
+            and buy_pressure < PUMPFUN_SAFETY_MIN_BUY_PRESSURE
+        ):
+            risk += 25
+            reasons.append(f"early buy pressure is only {buy_pressure:.0%}")
+
+        # Hard red flags require either strong evidence or several signals.
+        reject = (
+            (max_shared_funder_buyers >= 3 and max_shared_funder_volume_share >= 0.45)
+            or creator_buy_share >= 0.35
+            or top1_share >= 0.60
+            or (top3_share >= 0.90 and unique_buyers <= 4)
+            or risk >= 55
+        )
+
+        result.update(
+            {
+                "status": "ready",
+                "safe": not reject,
+                "reason": "; ".join(reasons[:4]) if reject else "",
+                "risk_score": min(100, risk),
+                "signals": {
+                    "transactions_examined": len(events),
+                    "buy_transactions": buy_count,
+                    "sell_transactions": sell_count,
+                    "unique_buyers": unique_buyers,
+                    "top_buyer_share": round(top1_share, 4),
+                    "top3_buyer_share": round(top3_share, 4),
+                    "same_slot_share": round(max_slot_share, 4),
+                    "same_size_share": round(max_size_share, 4),
+                    "shared_funder_buyers": max_shared_funder_buyers,
+                    "shared_funder_volume_share": round(max_shared_funder_volume_share, 4),
+                    "creator_buy_share": round(creator_buy_share, 4),
+                    "buy_pressure": round(buy_pressure, 4),
+                },
+            }
+        )
+    except Exception as exc:
+        # Safety telemetry is fail-open when the optional analysis RPC is
+        # unavailable; normal RuleParams, late-entry, and execution safeguards
+        # still decide whether the trade can proceed.
+        result.update(
+            {
+                "status": "degraded",
+                "safe": True,
+                "reason": f"launch safety RPC unavailable: {type(exc).__name__}",
+            }
+        )
+        logger.warning(
+            "pumpfun_launch_safety_degraded",
+            extra={"mint": mint, "error": f"{type(exc).__name__}: {exc}"},
+        )
+
+    _pumpfun_launch_safety_cache[mint] = (now, dict(result))
+    logger.info(
+        "pumpfun_launch_safety",
+        extra=result,
+    )
+    return result
 
 # ---------------------------------------------------------------------------
 # Pump.fun transaction builder
