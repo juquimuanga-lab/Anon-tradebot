@@ -279,9 +279,9 @@ class Settings(BaseSettings):
     profit_lock_pct: float = 5.0
     strong_profit_trigger_pct: float = 40.0
     strong_profit_lock_pct: float = 10.0
-    adaptive_trailing_min_pct: float = 6.0
-    adaptive_trailing_mid_pct: float = 8.0
-    adaptive_trailing_strong_pct: float = 10.0
+    adaptive_trailing_min_pct: float = 15.0
+    adaptive_trailing_mid_pct: float = 22.0
+    adaptive_trailing_strong_pct: float = 30.0
     adaptive_trailing_max_pct: float = 12.0
     smart_money_score_bonus: float = 10.0
     smart_money_probe_score: float = 55.0
