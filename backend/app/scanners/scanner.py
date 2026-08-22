@@ -117,6 +117,18 @@ PUMPFUN_RPC_RETRY_DELAYS = (0.35, 0.75, 1.5, 3.0)
 PUMPFUN_RPC_MIN_REQUEST_INTERVAL = 0.12
 PUMPFUN_RPC_RATE_LIMIT_COOLDOWN = 1.5
 
+# ---------------------------------------------------------------------------
+# Fast Sniper early-entry tuning
+# ---------------------------------------------------------------------------
+# The Fast lane must be able to enter before a generic Smart rule's market-cap
+# confirmation has already allowed the first vertical move to happen.
+# These are deliberately conservative safety floors; the normal Smart lane is
+# unchanged.
+FAST_EARLY_ENTRY_MAX_AGE_SECONDS = 1.50
+FAST_EARLY_ENTRY_MIN_MARKET_CAP_USD = 3_500.0
+FAST_EARLY_ENTRY_MAX_RUNUP_FROM_FIRST_PCT = 35.0
+FAST_EARLY_ENTRY_MAX_SHORT_RUNUP_PCT = 18.0
+
 
 
 def _is_anoncoin_source(source: str) -> bool:
@@ -129,6 +141,105 @@ def _is_anoncoin_source(source: str) -> bool:
     """
 
     return bool(source) and source.startswith("anoncoin")
+
+
+def _evaluate_fast_early_entry(token, rule_params) -> tuple[bool, list[str]]:
+    """Aggressive first-snapshot gate for the Pump.fun Fast Sniper lane.
+
+    This intentionally does NOT wait for the rule's normal minimum market-cap
+    confirmation. That confirmation can arrive after the first vertical move,
+    which is exactly the late-entry pattern we want the Fast lane to avoid.
+
+    Safety still comes from:
+      - very young token age;
+      - creator allow/deny rules;
+      - configured minimum liquidity;
+      - a small absolute MC floor;
+      - configured maximum MC;
+      - bonding-curve phase;
+      - anti-chase limits from the first and previous observations.
+
+    Smart Filter and Smart Money lanes never use this path.
+    """
+    reasons: list[str] = []
+
+    if token.source != SOURCE_PUMPFUN:
+        return False, ["fast early entry is only available for Pump.fun"]
+
+    age = float(getattr(token, "age_seconds", 0.0) or 0.0)
+    if age > FAST_EARLY_ENTRY_MAX_AGE_SECONDS:
+        reasons.append(
+            f"early entry window expired ({age:.2f}s > "
+            f"{FAST_EARLY_ENTRY_MAX_AGE_SECONDS:.2f}s)"
+        )
+
+    creator = getattr(token, "creator_wallet", "") or ""
+    if creator and creator in getattr(rule_params, "creator_denylist", []):
+        reasons.append("creator is denylisted")
+    allowlist = getattr(rule_params, "creator_allowlist", []) or []
+    if allowlist and creator not in allowlist:
+        reasons.append("creator not in allowlist")
+
+    liquidity = float(getattr(token, "liquidity_usd", 0.0) or 0.0)
+    min_liquidity = float(getattr(rule_params, "min_liquidity_usd", 0.0) or 0.0)
+    if liquidity < min_liquidity:
+        reasons.append(
+            f"liquidity ${liquidity:,.0f} below min ${min_liquidity:,.0f}"
+        )
+
+    market_cap = float(getattr(token, "market_cap_usd", 0.0) or 0.0)
+    configured_min_mc = getattr(rule_params, "min_market_cap_usd", None)
+    configured_min_mc = (
+        float(configured_min_mc) if configured_min_mc is not None else 0.0
+    )
+    # If the normal rule says e.g. $8k, the early lane may enter from $4k,
+    # but never below the absolute safety floor.
+    early_min_mc = max(
+        FAST_EARLY_ENTRY_MIN_MARKET_CAP_USD,
+        configured_min_mc * 0.50,
+    )
+    if market_cap < early_min_mc:
+        reasons.append(
+            f"early market cap ${market_cap:,.0f} below "
+            f"early min ${early_min_mc:,.0f}"
+        )
+
+    max_mc = getattr(rule_params, "max_market_cap_usd", None)
+    if max_mc is not None and market_cap > float(max_mc):
+        reasons.append(
+            f"market cap ${market_cap:,.0f} above max ${float(max_mc):,.0f}"
+        )
+
+    phase = getattr(rule_params, "bonding_curve_phase", "any")
+    if phase != "any" and getattr(token, "bonding_curve_phase", None) != phase:
+        reasons.append(
+            f"bonding curve phase {getattr(token, 'bonding_curve_phase', None)} "
+            f"!= required {phase}"
+        )
+
+    history = (getattr(token, "raw_enrichment", {}) or {}).get(
+        "late_entry_history"
+    ) or {}
+    first_price = float(history.get("first_price_usd", 0.0) or 0.0)
+    current_price = float(getattr(token, "price_usd", 0.0) or 0.0)
+    previous = history.get("previous") or {}
+    previous_price = float(previous.get("price_usd", 0.0) or 0.0)
+
+    if first_price > 0 and current_price > 0:
+        runup = (current_price - first_price) / first_price * 100.0
+        if runup >= FAST_EARLY_ENTRY_MAX_RUNUP_FROM_FIRST_PCT:
+            reasons.append(
+                f"early anti-chase: +{runup:.0f}% from first observed price"
+            )
+
+    if previous_price > 0 and current_price > 0:
+        short_runup = (current_price - previous_price) / previous_price * 100.0
+        if short_runup >= FAST_EARLY_ENTRY_MAX_SHORT_RUNUP_PCT:
+            reasons.append(
+                f"early anti-chase: +{short_runup:.0f}% since previous snapshot"
+            )
+
+    return len(reasons) == 0, reasons
 
 
 def _rule_platform_for_source(source: str) -> str:
@@ -2130,8 +2241,51 @@ class ScannerService:
             return await self._maybe_trade(token, rule, score_result)
 
         if token.source == SOURCE_PUMPFUN and strategy == "fast":
-            passed, reasons = evaluate_fast_sniper_filters(token, rule_params)
-            score_result = compute_score(token, rule_params, settings.creator_watchlist)
+            # First-snapshot early entry: try the aggressive gate before the
+            # generic Fast filter. This prevents a high configured min-MC from
+            # forcing the bot to wait for the first pump candle.
+            early_passed, early_reasons = _evaluate_fast_early_entry(
+                token, rule_params
+            )
+
+            if early_passed:
+                score_result = compute_score(
+                    token, rule_params, settings.creator_watchlist
+                )
+                logger.info(
+                    "fast_sniper_early_entry_dispatch",
+                    extra={
+                        "mint": token.mint,
+                        "rule_id": rule.id,
+                        "market_cap_usd": token.market_cap_usd,
+                        "liquidity_usd": token.liquidity_usd,
+                        "age_seconds": token.age_seconds,
+                        "score_telemetry": score_result.score,
+                        "entry_mode": "early_first_snapshot",
+                    },
+                )
+                metrics.tokens_qualified += 1
+                await self._notifier.new_qualified_token(
+                    rule.created_by,
+                    token.ticker_symbol or token.mint[:8],
+                    token.mint,
+                    score_result.score,
+                    token.source,
+                )
+                return await self._maybe_trade(
+                    token, rule, score_result
+                )
+
+            # Fall back to the existing Fast safety gate when the early gate
+            # does not pass. This preserves the existing Fast behavior for
+            # candidates that are not quite early enough.
+            passed, reasons = evaluate_fast_sniper_filters(
+                token, rule_params
+            )
+            reasons = list(early_reasons) + list(reasons)
+            score_result = compute_score(
+                token, rule_params, settings.creator_watchlist
+            )
             logger.info(
                 "fast_sniper_rule_evaluation",
                 extra={
@@ -2142,24 +2296,38 @@ class ScannerService:
                     "liquidity_usd": token.liquidity_usd,
                     "age_seconds": token.age_seconds,
                     "passed": passed,
+                    "early_passed": early_passed,
+                    "early_reasons": early_reasons,
                     "reasons": reasons,
                 },
             )
             if not passed:
                 logger.info(
                     "fast_sniper_rejected",
-                    extra={"mint": token.mint, "rule_id": rule.id, "reasons": reasons},
+                    extra={
+                        "mint": token.mint,
+                        "rule_id": rule.id,
+                        "reasons": reasons,
+                    },
                 )
                 return False
 
             metrics.tokens_qualified += 1
             await self._notifier.new_qualified_token(
-                rule.created_by, token.ticker_symbol or token.mint[:8],
-                token.mint, score_result.score, token.source
+                rule.created_by,
+                token.ticker_symbol or token.mint[:8],
+                token.mint,
+                score_result.score,
+                token.source,
             )
             logger.info(
                 "fast_sniper_buy_dispatch",
-                extra={"mint": token.mint, "rule_id": rule.id, "score_telemetry": score_result.score},
+                extra={
+                    "mint": token.mint,
+                    "rule_id": rule.id,
+                    "score_telemetry": score_result.score,
+                    "entry_mode": "standard_fast",
+                },
             )
             return await self._maybe_trade(token, rule, score_result)
 
