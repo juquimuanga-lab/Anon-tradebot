@@ -169,26 +169,21 @@ async def _finish_wizard(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         f"Market cap: ${params.min_market_cap_usd or 0:,.0f} - ${params.max_market_cap_usd:,.0f} | "
         f"SL: {params.stop_loss_pct}% | TP levels: {len(params.take_profit_levels)}\n"
         f"Entry strategy: {('⚡ FAST SNIPER' if params.strategy == 'fast' else '🐋 SMART MONEY COPY' if params.strategy == 'smart_money' else '🧠 SMART FILTER')}\n\n"
-        f"Activate this *{label}* rule set now?"
+        f"Activate this *{label}* rule set in the selected lane now?"
     )
-    activate_decision = (
-        "save_fast"
-        if params.strategy == "fast"
-        else "save_smart_money"
-        if params.strategy == "smart_money"
-        else "save_smart"
-    )
+    # The confirmation handler uses lane-specific decisions so Fast,
+    # Smart, and Smart Money are persisted as independent strategies.
+    activate_decision = {
+        "fast": "save_fast",
+        "smart": "save_smart",
+        "smart_money": "save_smart_money",
+    }[params.strategy]
+
     keyboard = InlineKeyboardMarkup(
         [[InlineKeyboardButton("Save & Activate", callback_data=f"confirm:{token}:{activate_decision}"),
           InlineKeyboardButton("Save only", callback_data=f"confirm:{token}:save"),
           InlineKeyboardButton("Discard", callback_data=f"confirm:{token}:discard")]]
     )
-    if params.strategy == "smart_money":
-        summary += (
-            "\n\n🐋 Smart Money Copy is a separate lane. "
-            "Use /setsmartmoney RULE_ID after saving if you chose 'Save only'. "
-            "Then use /enablesmartmoney to turn copying ON."
-        )
     await update.message.reply_text(summary, parse_mode="Markdown", reply_markup=keyboard)
     return ConversationHandler.END
 
