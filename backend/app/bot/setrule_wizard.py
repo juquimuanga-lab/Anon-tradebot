@@ -171,11 +171,24 @@ async def _finish_wizard(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         f"Entry strategy: {('⚡ FAST SNIPER' if params.strategy == 'fast' else '🐋 SMART MONEY COPY' if params.strategy == 'smart_money' else '🧠 SMART FILTER')}\n\n"
         f"Activate this *{label}* rule set now?"
     )
+    activate_decision = (
+        "save_fast"
+        if params.strategy == "fast"
+        else "save_smart_money"
+        if params.strategy == "smart_money"
+        else "save_smart"
+    )
     keyboard = InlineKeyboardMarkup(
-        [[InlineKeyboardButton("Save & Activate", callback_data=f"confirm:{token}:activate"),
+        [[InlineKeyboardButton("Save & Activate", callback_data=f"confirm:{token}:{activate_decision}"),
           InlineKeyboardButton("Save only", callback_data=f"confirm:{token}:save"),
           InlineKeyboardButton("Discard", callback_data=f"confirm:{token}:discard")]]
     )
+    if params.strategy == "smart_money":
+        summary += (
+            "\n\n🐋 Smart Money Copy is a separate lane. "
+            "Use /setsmartmoney RULE_ID after saving if you chose 'Save only'. "
+            "Then use /enablesmartmoney to turn copying ON."
+        )
     await update.message.reply_text(summary, parse_mode="Markdown", reply_markup=keyboard)
     return ConversationHandler.END
 
