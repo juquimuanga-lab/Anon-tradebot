@@ -172,7 +172,8 @@ async def get_active_rule_for_strategy(
     strategy: str = "smart",
 ) -> Optional[Rule]:
     """Return one admin's active rule for a specific strategy lane."""
-    strategy = "fast" if strategy == "fast" else "smart"
+    if strategy not in ("fast", "smart", "smart_money"):
+        strategy = "smart"
     async with async_session_scope() as session:
         await _ensure_rule_schema(session)
         return (
@@ -215,6 +216,7 @@ async def get_smart_money_rules(platform: str = "solana") -> list[Rule]:
                 select(Rule).where(
                     Rule.id.in_(list(assignments.keys())),
                     Rule.platform == platform,
+                    Rule.strategy == "smart_money",
                 )
             )
         ).scalars().all()
@@ -246,6 +248,7 @@ async def get_active_smart_money_rule(admin_id: int, platform: str = "solana") -
                     Rule.id == rule_id,
                     Rule.created_by == admin_id,
                     Rule.platform == platform,
+                    Rule.strategy == "smart_money",
                 )
             )
         ).scalars().first()
@@ -257,7 +260,10 @@ async def set_smart_money_rule(rule_id: int, admin_id: int) -> Optional[Rule]:
         await _ensure_bot_state_schema(session)
         target = (await session.execute(
             select(Rule).where(
-                Rule.id == rule_id, Rule.created_by == admin_id, Rule.platform == "solana"
+                Rule.id == rule_id,
+                Rule.created_by == admin_id,
+                Rule.platform == "solana",
+                Rule.strategy == "smart_money",
             )
         )).scalars().first()
         if not target:
@@ -354,7 +360,8 @@ async def activate_rule_for_admin_strategy(
     strategy: str,
 ) -> Optional[Rule]:
     """Activate one rule per admin/platform/strategy lane."""
-    strategy = "fast" if strategy == "fast" else "smart"
+    if strategy not in ("fast", "smart", "smart_money"):
+        strategy = "smart"
     async with async_session_scope() as session:
         await _ensure_rule_schema(session)
         target = (await session.execute(
