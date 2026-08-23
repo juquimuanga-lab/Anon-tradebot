@@ -1,3 +1,4 @@
+ANON_TRADEBOT_WATCHER_BUILD = 'V4_SMART_MONEY_PIPELINE_DIAGNOSTIC'
 SMART_MONEY_FIX_V3_ACTIVE = True
 
 """On-chain launch detection.
@@ -2961,3 +2962,7 @@ async def poll_new_pumpfun_mints(
 
     return discovered
 
+
+
+# Build marker for deployment verification.
+logger.info("anon_tradebot_watcher_build=%s", ANON_TRADEBOT_WATCHER_BUILD)
