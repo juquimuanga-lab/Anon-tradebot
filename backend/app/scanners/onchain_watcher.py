@@ -1,4 +1,4 @@
-ANON_TRADEBOT_WATCHER_BUILD = 'V5_SMART_MONEY_RPC_FIX'
+ANON_TRADEBOT_WATCHER_BUILD = 'V7_LAUNCH_VERIFY_SMART_MONEY_FALLBACK'
 SMART_MONEY_FIX_V3_ACTIVE = True
 
 """On-chain launch detection.
@@ -1680,55 +1680,71 @@ def _extract_wallet_sold_mint(tx, wallet: str) -> Optional[dict]:
     return max(candidates, key=lambda item: item["token_amount_raw"])
 
 
-async def _get_transaction_for_smart_money(rpc_url: str, signature: str):
-    """Fetch a just-seen transaction with enough retry time for RPC indexing."""
+async def _get_confirmed_transaction_with_fallback(rpc_url: str, signature: str, *, purpose: str):
+    """Fetch a confirmed transaction with primary/fallback/direct RPC recovery."""
     last_exc = None
-    delays = (0.0, 0.10, 0.25, 0.50, 1.0, 1.5)
-    for delay in delays:
-        if delay:
-            await asyncio.sleep(delay)
-        try:
-            async with AsyncClient(rpc_url) as client:
-                response = await client.get_transaction(
-                    Signature.from_string(signature),
-                    encoding="jsonParsed",
-                    max_supported_transaction_version=0,
+    for candidate_url, transport in _rpc_candidates(rpc_url):
+        for attempt in range(1, 4):
+            try:
+                async with AsyncClient(candidate_url) as client:
+                    response = await client.get_transaction(
+                        Signature.from_string(signature),
+                        encoding="jsonParsed",
+                        max_supported_transaction_version=0,
+                        commitment="confirmed",
+                    )
+                tx = response.value
+                if tx is not None:
+                    if transport != "primary":
+                        logger.info("onchain_tx_verification_fallback_success",
+                                    extra={"purpose": purpose, "transport": transport, "signature": signature})
+                    return tx
+                last_exc = RuntimeError("getTransaction returned null")
+            except Exception as exc:
+                last_exc = exc
+                logger.warning("onchain_tx_verification_rpc_attempt_failed",
+                               extra={"purpose": purpose, "transport": transport, "attempt": attempt,
+                                      "signature": signature, "error": f"{type(exc).__name__}: {exc}"})
+            if attempt < 3:
+                await asyncio.sleep(0.15 * attempt)
+
+    for candidate_url, transport in _rpc_candidates(rpc_url):
+        for attempt in range(1, 4):
+            try:
+                body = await _direct_rpc_request(
+                    candidate_url, "getTransaction",
+                    [signature, {"encoding": "jsonParsed",
+                                  "maxSupportedTransactionVersion": 0,
+                                  "commitment": "confirmed"}],
                 )
-            if response.value is not None:
-                return response.value
-        except Exception as exc:
-            last_exc = exc
+                tx = body.get("result") if isinstance(body, dict) else None
+                if tx is not None:
+                    logger.info("onchain_tx_verification_direct_success",
+                                extra={"purpose": purpose, "transport": transport, "signature": signature})
+                    return tx
+                last_exc = RuntimeError("direct getTransaction returned null")
+            except Exception as exc:
+                last_exc = exc
+                logger.warning("onchain_tx_verification_direct_attempt_failed",
+                               extra={"purpose": purpose, "transport": transport, "attempt": attempt,
+                                      "signature": signature, "error": f"{type(exc).__name__}: {exc}"})
+            if attempt < 3:
+                await asyncio.sleep(0.20 * attempt)
 
-    # Provider response fallback: preserve the raw JSON shape so the same
-    # normalization helpers can inspect it.
-    try:
-        import httpx
-        payload = {
-            "jsonrpc": "2.0",
-            "id": "smart-money-get-tx",
-            "method": "getTransaction",
-            "params": [
-                signature,
-                {
-                    "encoding": "jsonParsed",
-                    "maxSupportedTransactionVersion": 0,
-                    "commitment": "confirmed",
-                },
-            ],
-        }
-        async with httpx.AsyncClient(timeout=6.0) as client:
-            response = await client.post(rpc_url, json=payload)
-            response.raise_for_status()
-            body = response.json()
-            if body.get("error"):
-                raise RuntimeError(f"RPC error: {body['error']}")
-            return body.get("result")
-    except Exception as exc:
-        last_exc = exc
-
-    if last_exc:
-        raise last_exc
+    logger.warning("onchain_tx_verification_failed",
+                   extra={"purpose": purpose, "signature": signature,
+                          "error": f"{type(last_exc).__name__}: {last_exc}" if last_exc else "unknown"})
     return None
+
+
+async def _get_transaction_for_smart_money(rpc_url: str, signature: str):
+    """Fetch Smart Money transaction with confirmed commitment and fallback."""
+    tx = await _get_confirmed_transaction_with_fallback(
+        rpc_url, signature, purpose="smart_money"
+    )
+    if tx is not None:
+        return tx
+    raise RuntimeError("confirmed Smart Money transaction unavailable")
 
 
 async def _smart_money_stream_worker(
@@ -2463,24 +2479,20 @@ async def _pumpfun_stream_worker(
                         # CreateEvent is valid. Never discard a real launch merely
                         # because optional instruction-version verification failed.
                         verified_launch = None
-                        try:
-                            async with AsyncClient(rpc_url) as verify_client:
-                                verify_resp = await verify_client.get_transaction(
-                                    Signature.from_string(signature),
-                                    encoding="jsonParsed",
-                                    max_supported_transaction_version=0,
-                                )
-                            verify_tx = verify_resp.value
-                            if verify_tx:
+                        verify_tx = await _get_confirmed_transaction_with_fallback(
+                            rpc_url, signature, purpose="pumpfun_launch_version"
+                        )
+                        if verify_tx:
+                            try:
                                 verified_launch = extract_pumpfun_create(verify_tx)
-                        except Exception as exc:
-                            logger.warning(
-                                "pumpfun_launch_version_verification_failed",
-                                extra={
-                                    "signature": signature,
-                                    "error": f"{type(exc).__name__}: {exc}",
-                                },
-                            )
+                            except Exception as exc:
+                                logger.warning(
+                                    "pumpfun_launch_version_parse_failed",
+                                    extra={
+                                        "signature": signature,
+                                        "error": f"{type(exc).__name__}: {exc}",
+                                    },
+                                )
 
                         if _is_supported_pumpfun_launch(verified_launch):
                             # Prefer transaction-derived metadata when the RPC
