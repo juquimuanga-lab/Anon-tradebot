@@ -187,6 +187,43 @@ async def get_active_rule_for_strategy(
         ).scalars().first()
 
 
+async def get_smart_money_rules(platform: str = "solana") -> list[Rule]:
+    """Return rules explicitly assigned to enabled Smart Money lanes."""
+    async with async_session_scope() as session:
+        await _ensure_bot_state_schema(session)
+        rows = (
+            await session.execute(
+                text(
+                    """
+                    SELECT owner_user_id, smart_money_rule_id
+                    FROM bot_state
+                    WHERE smart_money_copy_enabled = TRUE
+                      AND smart_money_rule_id IS NOT NULL
+                    """
+                )
+            )
+        ).all()
+        assignments = {
+            int(row[1]): int(row[0])
+            for row in rows
+            if row[0] is not None and row[1] is not None
+        }
+        if not assignments:
+            return []
+        rules = (
+            await session.execute(
+                select(Rule).where(
+                    Rule.id.in_(list(assignments.keys())),
+                    Rule.platform == platform,
+                )
+            )
+        ).scalars().all()
+        return [
+            rule for rule in rules
+            if assignments.get(int(rule.id)) == int(rule.created_by)
+        ]
+
+
 async def get_active_smart_money_rule(admin_id: int, platform: str = "solana") -> Optional[Rule]:
     """Return the rule explicitly assigned to this admin's Smart Money lane."""
     async with async_session_scope() as session:
