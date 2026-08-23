@@ -73,7 +73,7 @@ _pumpfun_decimals_cache: dict[str, tuple[float, int]] = {}
 #
 # The gate is designed to reject strong coordination signals without requiring
 # a large holder count or a long observation window.
-PUMPFUN_LAUNCH_SAFETY_CACHE_SECONDS = 1.25
+PUMPFUN_LAUNCH_SAFETY_CACHE_SECONDS = 2.0
 PUMPFUN_LAUNCH_SAFETY_SIGNATURE_LIMIT = 10
 PUMPFUN_LAUNCH_SAFETY_MAX_AGE_SECONDS = 20.0
 
@@ -833,7 +833,7 @@ def _rpc_json_value(body: dict):
 
 
 async def _raw_rpc_call(rpc_url: str, method: str, params: list):
-    """Small raw JSON-RPC helper used only by the launch-safety analyzer."""
+    """RPC helper for launch safety with bounded retries and rate-limit backoff."""
     import httpx
 
     payload = {
@@ -842,15 +842,31 @@ async def _raw_rpc_call(rpc_url: str, method: str, params: list):
         "method": method,
         "params": params,
     }
-    async with httpx.AsyncClient(timeout=4.0) as client:
-        response = await client.post(
-            rpc_url,
-            json=payload,
-            headers={"Content-Type": "application/json"},
-        )
-        response.raise_for_status()
-        return _rpc_json_value(response.json())
+    delays = (0.0, 0.15, 0.35, 0.75)
+    last_exc = None
+    for delay in delays:
+        if delay:
+            await asyncio.sleep(delay)
+        try:
+            async with httpx.AsyncClient(timeout=6.0) as client:
+                response = await client.post(
+                    rpc_url,
+                    json=payload,
+                    headers={"Content-Type": "application/json"},
+                )
+                # Retry transient provider throttling/server failures.
+                if response.status_code in {408, 425, 429, 500, 502, 503, 504}:
+                    raise RuntimeError(
+                        f"RPC HTTP {response.status_code}: {response.text[:300]}"
+                    )
+                response.raise_for_status()
+                return _rpc_json_value(response.json())
+        except Exception as exc:
+            last_exc = exc
 
+    raise RuntimeError(
+        f"{method} failed after {len(delays)} attempts: {last_exc}"
+    )
 
 def _account_key_list(tx: dict) -> list[str]:
     message = ((tx or {}).get("transaction") or {}).get("message") or {}
@@ -1212,8 +1228,12 @@ async def analyze_launch_safety(
         result.update(
             {
                 "status": "degraded",
-                "safe": True,
+                "safe": False,
                 "reason": f"launch safety RPC unavailable: {type(exc).__name__}",
+                "risk_score": 100,
+                "signals": {
+                    "analysis_unavailable": True,
+                },
             }
         )
         logger.warning(
