@@ -1,3 +1,5 @@
+SMART_MONEY_FIX_V3_ACTIVE = True
+
 """On-chain launch detection.
 
 This module contains two independent launch detectors:
