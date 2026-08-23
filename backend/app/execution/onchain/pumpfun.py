@@ -86,6 +86,7 @@ PUMPFUN_SAFETY_SHARED_FUNDER_VOLUME_SHARE = 0.45
 PUMPFUN_SAFETY_CREATOR_BUY_SHARE = 0.20
 PUMPFUN_SAFETY_MIN_BUY_PRESSURE = 0.55
 PUMPFUN_SAFETY_MIN_BUY_EVENTS_FOR_PRESSURE = 4
+PUMPFUN_SAFETY_PATCH_VERSION = "V6_TX_RETRIEVAL"
 
 _pumpfun_launch_safety_cache: dict[str, tuple[float, dict]] = {}
 
@@ -969,15 +970,17 @@ async def _get_launch_transactions(
     *,
     limit: int,
 ) -> list[dict]:
-    """Fetch the newest curve transactions with an RPC-compatible fallback.
+    """Fetch recent Pump.fun curve transactions reliably.
 
-    Helius has a paid-only ``getTransactionsForAddress`` method that can return
-    full transactions in one request. We use it opportunistically when the
-    provider exposes it, but the standard Solana RPC path remains authoritative
-    and works on ordinary RPC endpoints as well.
+    Helius may expose the signature before the full transaction is queryable.
+    We therefore:
+      1. use confirmed signatures (required by this RPC endpoint),
+      2. retry getTransaction when it returns null,
+      3. retry transient RPC failures,
+      4. keep the successful transactions even if one signature is temporarily
+         unavailable,
+      5. log the exact failure instead of hiding it behind RuntimeError.
     """
-    # First use the standard Solana method. It is universally supported and
-    # gives us signatures without requiring an archival/paid extension.
     signatures = await _raw_rpc_call(
         rpc_url,
         "getSignaturesForAddress",
@@ -988,6 +991,7 @@ async def _get_launch_transactions(
                 "commitment": "confirmed",
             },
         ],
+        retries=3,
     )
 
     if not isinstance(signatures, list):
@@ -996,6 +1000,7 @@ async def _get_launch_transactions(
         )
 
     transactions: list[dict] = []
+    fetch_failures = 0
 
     for item in signatures:
         if not isinstance(item, dict) or item.get("err") is not None:
@@ -1006,49 +1011,57 @@ async def _get_launch_transactions(
             continue
 
         tx = None
-        # A transaction can briefly be visible through gSFA before its full
-        # record is queryable. Retry the detail lookup at processed first, then
-        # confirmed as a consistency fallback.
-        for commitment in ("processed", "confirmed"):
-            for _ in range(3):
-                try:
-                    tx = await _raw_rpc_call(
-                        rpc_url,
-                        "getTransaction",
-                        [
-                            signature,
-                            {
-                                "encoding": "jsonParsed",
-                                "maxSupportedTransactionVersion": 0,
-                                "commitment": commitment,
-                            },
-                        ],
-                        retries=2,
-                    )
-                except Exception as exc:
-                    logger.warning(
-                        "pumpfun_launch_safety_transaction_fetch_failed",
-                        extra={
-                            "signature": signature,
-                            "commitment": commitment,
-                            "error": f"{type(exc).__name__}: {exc}",
+
+        # A signature can become visible before its full transaction record.
+        # Retry null responses as well as transient RPC errors.
+        for attempt in range(1, 5):
+            try:
+                tx = await _raw_rpc_call(
+                    rpc_url,
+                    "getTransaction",
+                    [
+                        signature,
+                        {
+                            "encoding": "jsonParsed",
+                            "maxSupportedTransactionVersion": 0,
+                            "commitment": "confirmed",
                         },
-                    )
-                    tx = None
-                    break
+                    ],
+                    retries=2,
+                )
+            except Exception as exc:
+                fetch_failures += 1
+                logger.warning(
+                    "pumpfun_launch_safety_transaction_fetch_failed "
+                    f"signature={signature} attempt={attempt}/4 "
+                    f"error={type(exc).__name__}: {exc}"
+                )
+                tx = None
 
-                if tx is not None:
-                    break
-                await asyncio.sleep(0.10)
-
-            if tx is not None:
+            if isinstance(tx, dict):
                 break
+
+            if attempt < 4:
+                await asyncio.sleep(0.15 * attempt)
 
         if isinstance(tx, dict):
             transactions.append(tx)
+        else:
+            fetch_failures += 1
+            logger.warning(
+                "pumpfun_launch_safety_transaction_unavailable "
+                f"signature={signature} attempts=4"
+            )
 
         if len(transactions) >= min(8, max(1, int(limit))):
             break
+
+    logger.info(
+        "pumpfun_launch_safety_transaction_fetch_summary "
+        f"signatures={len(signatures)} "
+        f"transactions={len(transactions)} "
+        f"failures={fetch_failures}"
+    )
 
     return transactions
 
@@ -1211,6 +1224,11 @@ async def analyze_launch_safety(
             limit=PUMPFUN_LAUNCH_SAFETY_SIGNATURE_LIMIT,
         )
 
+        if not transactions:
+            raise RuntimeError(
+                "no launch transactions could be retrieved from Pump.fun curve"
+            )
+
         events = []
         for tx in transactions:
             event = _extract_buy_sell_event(tx, mint)
@@ -1363,6 +1381,8 @@ async def analyze_launch_safety(
                 "risk_score": min(100, risk),
                 "signals": {
                     "transactions_examined": len(events),
+                    "transaction_records_retrieved": len(transactions),
+                    "transaction_data_complete": bool(transactions),
                     "buy_transactions": buy_count,
                     "sell_transactions": sell_count,
                     "unique_buyers": unique_buyers,
