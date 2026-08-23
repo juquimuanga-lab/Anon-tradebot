@@ -13,11 +13,11 @@ from app.bot.telegram_app import build_application
 from app.config.settings import settings
 from app.connectors.anoncoin import AnoncoinClient
 from app.connectors.helius import HeliusClient
-from app.connectors.fourmeme import fourmeme_client
 from app.execution.onchain.jupiter import JupiterClient
 from app.execution.router import ExecutionRouter
 from app.metrics import metrics
 from app.positions.manager import PositionManager
+from app.scanners.pumpfun_compat import install_pumpfun_compat
 from app.scanners.scanner import ScannerService
 from app.security.secrets_manager import secrets_manager
 from app.storage import repository as repo
@@ -33,6 +33,11 @@ _background_tasks: list[asyncio.Task] = []
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     await init_db()
+
+    # Install the narrow Pump.fun RPC compatibility fallback before the
+    # scanner starts. This only affects transaction decoding failures; the
+    # global launch-safety gate and active Telegram ruleset remain unchanged.
+    install_pumpfun_compat()
 
     anoncoin_client = AnoncoinClient(settings.anoncoin_base_url, secrets_manager.get_anoncoin_api_key)
     holders_client = HeliusClient(settings.helius_base_url, settings.helius_api_key)
@@ -50,15 +55,8 @@ async def lifespan(app: FastAPI):
 
     telegram_app.bot_data["position_manager"] = position_manager
 
-    await fourmeme_client.start()
-    logger.info(
-        "fourmeme_discovery_startup",
-        extra={
-            "bitquery_configured": fourmeme_client.enabled,
-            "trading_enabled": settings.fourmeme_trading_enabled,
-            "mempool": True,
-        },
-    )
+    # Four.meme/Bitquery discovery is intentionally not started. Pump.fun and
+    # the existing Anoncoin path remain the active launch sources.
 
     _background_tasks.append(asyncio.create_task(scanner_service.run_forever()))
     _background_tasks.append(asyncio.create_task(position_manager.run_forever()))
@@ -71,7 +69,6 @@ async def lifespan(app: FastAPI):
     try:
         yield
     finally:
-        await fourmeme_client.stop()
         for task in _background_tasks:
             task.cancel()
         await telegram_app.updater.stop()
