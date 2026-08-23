@@ -1,3 +1,6 @@
+ANON_TRADEBOT_WATCHER_BUILD = 'V4_SMART_MONEY_PIPELINE_DIAGNOSTIC'
+SMART_MONEY_FIX_V3_ACTIVE = True
+
 """On-chain launch detection.
 
 This module contains two independent launch detectors:
@@ -887,7 +890,7 @@ def _instruction_program_id(
         return None
 
     # Native/parsed instructions.
-    for attr in ("program_id", "programId"):
+    for attr in ("program_id", "programId", "program"):
         program_id = getattr(instruction, attr, None)
         if program_id is not None:
             value = _pubkey_string(program_id)
@@ -895,7 +898,7 @@ def _instruction_program_id(
                 return value
 
     if isinstance(instruction, dict):
-        for key in ("programId", "program_id"):
+        for key in ("programId", "program_id", "program"):
             program_id = instruction.get(key)
             if program_id is not None:
                 value = _pubkey_string(program_id)
@@ -1478,6 +1481,8 @@ def _obj_get(obj, key: str, default=None):
 
 def _token_balance_amount(balance) -> int:
     token_amount = _obj_get(balance, "ui_token_amount")
+    if token_amount is None:
+        token_amount = _obj_get(balance, "uiTokenAmount")
     raw = _obj_get(token_amount, "amount", 0)
     try:
         return int(raw or 0)
@@ -2394,12 +2399,12 @@ async def _pumpfun_stream_worker(
                         if not launch:
                             continue
 
-                        # CreateEvent is identical for legacy `create` and
-                        # Token-2022 `create_v2`, so the event alone cannot
-                        # safely tell us which token program was used.
-                        # Verify the actual transaction before allowing the
-                        # launch into the trading pipeline. Fail closed:
-                        # if verification cannot prove a supported Pump.fun create version, skip it.
+                        # CreateEvent is authoritative for launch discovery: it
+                        # already contains the mint/creator. Transaction decoding is
+                        # supplemental only. Some RPC/provider representations can
+                        # fail to expose the outer create instruction even though the
+                        # CreateEvent is valid. Never discard a real launch merely
+                        # because optional instruction-version verification failed.
                         verified_launch = None
                         try:
                             async with AsyncClient(rpc_url) as verify_client:
@@ -2420,9 +2425,16 @@ async def _pumpfun_stream_worker(
                                 },
                             )
 
-                        if not _is_supported_pumpfun_launch(verified_launch):
+                        if _is_supported_pumpfun_launch(verified_launch):
+                            # Prefer transaction-derived metadata when the RPC
+                            # decoder can prove create/create_v2.
+                            launch = verified_launch
+                        else:
+                            # Keep the CreateEvent-derived launch. It is already
+                            # enough to identify the Pump.fun mint and continue
+                            # into the normal snapshot/trading pipeline.
                             logger.info(
-                                "pumpfun_unsupported_launch_skipped",
+                                "pumpfun_launch_version_verification_unavailable_using_event",
                                 extra={
                                     "signature": signature,
                                     "mint": launch.get("mint"),
@@ -2433,11 +2445,6 @@ async def _pumpfun_stream_worker(
                                     ),
                                 },
                             )
-                            continue
-
-                        # Use the transaction-derived launch metadata because
-                        # it includes the authoritative instruction version.
-                        launch = verified_launch
 
                         now = asyncio.get_running_loop().time()
                         state["events_seen"] = int(state.get("events_seen", 0)) + 1
@@ -2955,3 +2962,7 @@ async def poll_new_pumpfun_mints(
 
     return discovered
 
+
+
+# Build marker for deployment verification.
+logger.info("anon_tradebot_watcher_build=%s", ANON_TRADEBOT_WATCHER_BUILD)
