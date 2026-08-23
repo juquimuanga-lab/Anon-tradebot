@@ -507,8 +507,6 @@ async def confirmation_callback(update: Update, context: ContextTypes.DEFAULT_TY
             params.strategy = strategy
 
             if strategy == "smart_money":
-                # Smart Money is an independent lane. Create the rule and
-                # immediately assign it to the dedicated Smart Money slot.
                 rule = await repo.create_rule(
                     params,
                     entry.payload["user_id"],
@@ -542,7 +540,6 @@ async def confirmation_callback(update: Update, context: ContextTypes.DEFAULT_TY
                 if strategy == "smart_money"
                 else "🧠 Smart Filter"
             )
-
             if strategy == "smart_money":
                 await query.edit_message_text(
                     f"Rule '{rule.name}' saved and activated as {lane}.\n\n"
