@@ -49,9 +49,12 @@ def _parse_strategy(raw: str) -> str:
         "fast_sniper": "fast",
         "smart": "smart",
         "smart_filter": "smart",
+        "smart_money": "smart_money",
+        "smart_money_copy": "smart_money",
+        "copy": "smart_money",
     }
     if value not in aliases:
-        raise ValueError("must be one of: fast, smart")
+        raise ValueError("must be one of: fast, smart, smart_money")
     return aliases[value]
 
 
@@ -63,7 +66,7 @@ def _steps(platform: str) -> list[Step]:
         Step("name", "Step 1/20 - Name this rule set (e.g. `sniper-default`):", sanitize_text, default="default"),
         Step(
             "strategy",
-            "Step 2/20 - Entry strategy: `fast` for ⚡ Fast Sniper or `smart` for 🧠 Smart Filter:",
+            "Step 2/20 - Entry strategy: `fast` = ⚡ Fast Sniper, `smart` = 🧠 Smart Filter, `smart_money` = 🐋 Smart Money Copy:",
             _parse_strategy,
             default="smart",
         ),
@@ -165,7 +168,7 @@ async def _finish_wizard(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         f"Min holders: {params.min_holders} | Max age: {params.max_age_seconds}s\n"
         f"Market cap: ${params.min_market_cap_usd or 0:,.0f} - ${params.max_market_cap_usd:,.0f} | "
         f"SL: {params.stop_loss_pct}% | TP levels: {len(params.take_profit_levels)}\n"
-        f"Entry strategy: {'⚡ FAST SNIPER' if params.strategy == 'fast' else '🧠 SMART FILTER'}\n\n"
+        f"Entry strategy: {('⚡ FAST SNIPER' if params.strategy == 'fast' else '🐋 SMART MONEY COPY' if params.strategy == 'smart_money' else '🧠 SMART FILTER')}\n\n"
         f"Activate this *{label}* rule set now?"
     )
     keyboard = InlineKeyboardMarkup(
