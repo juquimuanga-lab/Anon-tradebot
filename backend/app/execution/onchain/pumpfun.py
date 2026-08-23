@@ -985,7 +985,7 @@ async def _get_launch_transactions(
             curve_address,
             {
                 "limit": max(1, min(int(limit), 100)),
-                "commitment": "processed",
+                "commitment": "confirmed",
             },
         ],
     )
