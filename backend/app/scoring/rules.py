@@ -8,7 +8,7 @@ from typing import List, Literal, Optional
 from pydantic import BaseModel, Field
 
 BondingCurvePhase = Literal["any", "pre_graduation", "post_graduation"]
-SniperStrategy = Literal["smart", "fast"]
+SniperStrategy = Literal["smart", "fast", "smart_money"]
 
 
 class TakeProfitLevel(BaseModel):
