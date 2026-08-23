@@ -508,6 +508,42 @@ async def _get_token_decimals(
 # ---------------------------------------------------------------------------
 # Bonding curve
 # ---------------------------------------------------------------------------
+async def _get_curve_account_data(
+    curve_address: Pubkey,
+    rpc_url: str,
+    commitment: str,
+) -> bytes:
+    """Read a Pump.fun curve account with provider fallback."""
+    candidates = _rpc_candidate_urls(rpc_url)
+    last_exc: Exception | None = None
+    for index, candidate in enumerate(candidates):
+        try:
+            async with AsyncClient(candidate) as client:
+                response = await client.get_account_info(
+                    curve_address,
+                    commitment=commitment,
+                    encoding="base64",
+                )
+                account = response.value
+                if account is not None:
+                    return _decode_account_data(account.data)
+                last_exc = PumpFunPoolNotFound(
+                    f"no Pump.fun bonding curve exists for {curve_address}"
+                )
+        except Exception as exc:
+            last_exc = exc
+            if index < len(candidates) - 1:
+                logger.warning(
+                    "pumpfun_curve_account_provider_fallback",
+                    extra={"curve": str(curve_address), "provider_index": index},
+                )
+                continue
+            raise
+    if last_exc:
+        raise last_exc
+    raise PumpFunPoolNotFound(f"no Pump.fun bonding curve exists for {curve_address}")
+
+
 
 async def get_bonding_curve(
     mint: str,
@@ -526,30 +562,11 @@ async def get_bonding_curve(
         )
     )
 
-    async with AsyncClient(
-        rpc_url
-    ) as client:
-
-        response = (
-            await client.get_account_info(
-                curve_address,
-                commitment=commitment,
-                encoding="base64",
-            )
-        )
-
-        account = response.value
-
-        if account is None:
-
-            raise PumpFunPoolNotFound(
-                "no Pump.fun bonding curve "
-                f"exists for {mint}"
-            )
-
-        data = _decode_account_data(
-            account.data
-        )
+    data = await _get_curve_account_data(
+        curve_address,
+        rpc_url,
+        commitment,
+    )
 
     return decode_bonding_curve(
         str(curve_address),
@@ -584,38 +601,16 @@ async def get_pool_info(
         )
     )
 
-    async with AsyncClient(
-        rpc_url
-    ) as client:
+    # Pump.fun launch tokens use 6 decimals. The bonding-curve account
+    # already contains the token supply/reserve values needed for pricing,
+    # so do NOT make a second GetTokenSupply RPC call here.
+    decimals = PUMPFUN_TOKEN_DECIMALS
 
-        # Pump.fun launch tokens use 6 decimals. The bonding-curve account
-        # already contains the token supply/reserve values needed for pricing,
-        # so do NOT make a second GetTokenSupply RPC call here. On a brand-new
-        # launch that extra request can be the first account to return
-        # "account not ready", causing an otherwise readable curve snapshot to
-        # be discarded and consuming another Helius request.
-        decimals = PUMPFUN_TOKEN_DECIMALS
-
-        account_response = await client.get_account_info(
-            curve_address,
-            commitment=commitment,
-            encoding="base64",
-        )
-
-        account = (
-            account_response.value
-        )
-
-        if account is None:
-
-            raise PumpFunPoolNotFound(
-                "no Pump.fun bonding curve "
-                f"exists for {mint}"
-            )
-
-        data = _decode_account_data(
-            account.data
-        )
+    data = await _get_curve_account_data(
+        curve_address,
+        rpc_url,
+        commitment,
+    )
 
     curve = decode_bonding_curve(
         str(curve_address),
@@ -855,6 +850,21 @@ def _rpc_json_value(body: dict, *, method: str = ""):
     return body.get("result")
 
 
+def _rpc_candidate_urls(rpc_url: str) -> list[str]:
+    """Return the primary Solana RPC plus optional Alchemy fallback."""
+    urls: list[str] = []
+    if rpc_url:
+        urls.append(str(rpc_url))
+    try:
+        from app.config.settings import settings
+        fallback = getattr(settings, "alchemy_solana_rpc_url", None)
+        if fallback and str(fallback) not in urls:
+            urls.append(str(fallback))
+    except Exception:
+        pass
+    return urls
+
+
 async def _raw_rpc_call(
     rpc_url: str,
     method: str,
@@ -862,19 +872,17 @@ async def _raw_rpc_call(
     *,
     retries: int = 3,
 ):
-    """Call Solana JSON-RPC with bounded retries and useful diagnostics.
+    """Call Solana JSON-RPC with bounded retries and provider fallback.
 
-    The previous implementation converted every provider failure into a bare
-    ``RuntimeError``. That made the launch-safety layer impossible to diagnose
-    from Railway logs. This version preserves the RPC method, HTTP status and
-    JSON-RPC error code/message while still retrying transient failures.
+    Helius remains primary. If it is throttled/unavailable, the optional
+    Alchemy Solana RPC is tried before the caller gives up. Deterministic
+    account/parameter errors are surfaced rather than hidden.
     """
     import httpx
 
-    if not rpc_url or not str(rpc_url).startswith(("http://", "https://")):
-        raise RuntimeError(
-            f"invalid Solana RPC URL for {method}: {rpc_url!r}"
-        )
+    candidates = _rpc_candidate_urls(rpc_url)
+    if not candidates:
+        raise RuntimeError(f"invalid Solana RPC URL for {method}: {rpc_url!r}")
 
     payload = {
         "jsonrpc": "2.0",
@@ -883,84 +891,78 @@ async def _raw_rpc_call(
         "params": params,
     }
 
-    # Retry only conditions that can reasonably clear on their own. Invalid
-    # parameters/authentication errors should surface immediately.
     delays = (0.0, 0.20, 0.50, 1.00)[: max(1, retries + 1)]
     last_exc: Exception | None = None
 
-    timeout = httpx.Timeout(
-        connect=2.5,
-        read=5.0,
-        write=5.0,
-        pool=2.5,
-    )
+    timeout = httpx.Timeout(connect=2.5, read=5.0, write=5.0, pool=2.5)
 
-    async with httpx.AsyncClient(
-        timeout=timeout,
-        headers={"Content-Type": "application/json"},
-        follow_redirects=True,
-    ) as client:
-        for attempt, delay in enumerate(delays, start=1):
-            if delay:
-                await asyncio.sleep(delay)
-
-            try:
-                response = await client.post(
-                    str(rpc_url),
-                    json=payload,
-                )
-
-                body_text = response.text[:700]
-
-                if response.status_code in {408, 425, 429, 500, 502, 503, 504}:
-                    raise RuntimeError(
-                        f"{method} HTTP {response.status_code} "
-                        f"(attempt {attempt}/{len(delays)}): {body_text}"
-                    )
-
-                response.raise_for_status()
-
+    for provider_index, candidate in enumerate(candidates):
+        async with httpx.AsyncClient(
+            timeout=timeout,
+            headers={"Content-Type": "application/json"},
+            follow_redirects=True,
+        ) as client:
+            for attempt, delay in enumerate(delays, start=1):
+                if delay:
+                    await asyncio.sleep(delay)
                 try:
-                    body = response.json()
+                    response = await client.post(candidate, json=payload)
+                    body_text = response.text[:700]
+
+                    if response.status_code in {408, 425, 429, 500, 502, 503, 504}:
+                        raise RuntimeError(
+                            f"{method} HTTP {response.status_code} "
+                            f"(attempt {attempt}/{len(delays)}): {body_text}"
+                        )
+
+                    response.raise_for_status()
+                    try:
+                        body = response.json()
+                    except Exception as exc:
+                        raise RuntimeError(
+                            f"{method} returned invalid JSON "
+                            f"(HTTP {response.status_code}): {body_text}"
+                        ) from exc
+
+                    return _rpc_json_value(body, method=method)
+
                 except Exception as exc:
-                    raise RuntimeError(
-                        f"{method} returned invalid JSON "
-                        f"(HTTP {response.status_code}): {body_text}"
-                    ) from exc
+                    last_exc = exc
+                    message = str(exc)
+                    transient = (
+                        isinstance(exc, (httpx.TimeoutException, httpx.NetworkError))
+                        or any(
+                            f" HTTP {status} " in message
+                            for status in (408, 425, 429, 500, 502, 503, 504)
+                        )
+                    )
+                    if not transient:
+                        # Deterministic errors should not be hidden by a
+                        # second provider returning a different error.
+                        raise RuntimeError(
+                            f"{method} RPC failed on provider {provider_index + 1}: {exc}"
+                        ) from exc
 
-                return _rpc_json_value(body, method=method)
+                    if attempt < len(delays):
+                        logger.warning(
+                            "pumpfun_launch_safety_rpc_retry",
+                            extra={
+                                "method": method,
+                                "attempt": attempt,
+                                "max_attempts": len(delays),
+                                "provider_index": provider_index,
+                                "error": f"{type(exc).__name__}: {exc}",
+                            },
+                        )
 
-            except Exception as exc:
-                last_exc = exc
-                message = str(exc)
-                transient = (
-                    isinstance(exc, (httpx.TimeoutException, httpx.NetworkError))
-                    or " HTTP 408 " in message
-                    or " HTTP 425 " in message
-                    or " HTTP 429 " in message
-                    or " HTTP 500 " in message
-                    or " HTTP 502 " in message
-                    or " HTTP 503 " in message
-                    or " HTTP 504 " in message
-                )
-
-                if not transient or attempt >= len(delays):
-                    raise RuntimeError(
-                        f"{method} RPC failed after {attempt} attempt(s): {exc}"
-                    ) from exc
-
-                logger.warning(
-                    "pumpfun_launch_safety_rpc_retry",
-                    extra={
-                        "method": method,
-                        "attempt": attempt,
-                        "max_attempts": len(delays),
-                        "error": f"{type(exc).__name__}: {exc}",
-                    },
-                )
+        if provider_index < len(candidates) - 1:
+            logger.warning(
+                "pumpfun_launch_safety_rpc_provider_fallback",
+                extra={"method": method, "provider_index": provider_index, "fallback": "alchemy"},
+            )
 
     raise RuntimeError(
-        f"{method} RPC failed: {last_exc}"
+        f"{method} RPC failed on all configured providers: {last_exc}"
     ) from last_exc
 
 
