@@ -52,6 +52,7 @@ def _parse_strategy(raw: str) -> str:
         "smart_money": "smart_money",
         "smart_money_copy": "smart_money",
         "copy": "smart_money",
+        "copy_wallet": "smart_money",
     }
     if value not in aliases:
         raise ValueError("must be one of: fast, smart, smart_money")
@@ -66,7 +67,7 @@ def _steps(platform: str) -> list[Step]:
         Step("name", "Step 1/20 - Name this rule set (e.g. `sniper-default`):", sanitize_text, default="default"),
         Step(
             "strategy",
-            "Step 2/20 - Entry strategy: `fast` = ⚡ Fast Sniper, `smart` = 🧠 Smart Filter, `smart_money` = 🐋 Smart Money Copy:",
+            "Step 2/20 - Entry strategy: `fast` for ⚡ Fast Sniper, `smart` for 🧠 Smart Filter, or `smart_money` for 🐋 Smart Money Copy:",
             _parse_strategy,
             default="smart",
         ),
@@ -168,21 +169,22 @@ async def _finish_wizard(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         f"Min holders: {params.min_holders} | Max age: {params.max_age_seconds}s\n"
         f"Market cap: ${params.min_market_cap_usd or 0:,.0f} - ${params.max_market_cap_usd:,.0f} | "
         f"SL: {params.stop_loss_pct}% | TP levels: {len(params.take_profit_levels)}\n"
-        f"Entry strategy: {('⚡ FAST SNIPER' if params.strategy == 'fast' else '🐋 SMART MONEY COPY' if params.strategy == 'smart_money' else '🧠 SMART FILTER')}\n\n"
-        f"Activate this *{label}* rule set in the selected lane now?"
+        f"Entry strategy: {'⚡ FAST SNIPER' if params.strategy == 'fast' else '🐋 SMART MONEY COPY' if params.strategy == 'smart_money' else '🧠 SMART FILTER'}\n\n"
+        f"Save this *{label}* rule set now?"
     )
-    # The confirmation handler uses lane-specific decisions so Fast,
-    # Smart, and Smart Money are persisted as independent strategies.
-    activate_decision = {
-        "fast": "save_fast",
-        "smart": "save_smart",
-        "smart_money": "save_smart_money",
-    }[params.strategy]
-
     keyboard = InlineKeyboardMarkup(
-        [[InlineKeyboardButton("Save & Activate", callback_data=f"confirm:{token}:{activate_decision}"),
-          InlineKeyboardButton("Save only", callback_data=f"confirm:{token}:save"),
-          InlineKeyboardButton("Discard", callback_data=f"confirm:{token}:discard")]]
+        [[InlineKeyboardButton(
+            "💾 Save & Activate",
+            callback_data=f"confirm:{token}:save_{params.strategy}"
+        )],
+         [InlineKeyboardButton(
+            "💾 Save only",
+            callback_data=f"confirm:{token}:save_only"
+        ),
+          InlineKeyboardButton(
+            "❌ Discard",
+            callback_data=f"confirm:{token}:discard"
+        )]]
     )
     await update.message.reply_text(summary, parse_mode="Markdown", reply_markup=keyboard)
     return ConversationHandler.END
