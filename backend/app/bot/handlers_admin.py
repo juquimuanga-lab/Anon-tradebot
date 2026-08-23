@@ -494,45 +494,44 @@ async def confirmation_callback(update: Update, context: ContextTypes.DEFAULT_TY
 
         params = RuleParams(**entry.payload["params"])
 
-        # The /setrule wizard presents the lane choice at the final confirmation.
-        # Fast and Smart remain independent lanes.
-        if decision in ("save_fast", "save_smart", "save_smart_money"):
-            strategy = (
-                "fast"
-                if decision == "save_fast"
-                else "smart_money"
-                if decision == "save_smart_money"
-                else "smart"
-            )
-            params.strategy = strategy
+        # Explicit lane selection from the /setrule wizard.
+        # Keep backwards compatibility with old activate/save callbacks.
+        strategy_by_decision = {
+            "save_fast": "fast",
+            "save_smart": "smart",
+            "save_smart_money": "smart_money",
+        }
 
-            if strategy == "smart_money":
-                rule = await repo.create_rule(
-                    params,
-                    entry.payload["user_id"],
-                    activate=True,
-                )
-                assigned = await repo.set_smart_money_rule(
-                    rule.id,
-                    entry.payload["user_id"],
-                )
+        if decision in strategy_by_decision:
+            strategy = strategy_by_decision[decision]
+        elif decision in ("activate", "save", "save_only"):
+            strategy = getattr(params, "strategy", "smart") or "smart"
+        else:
+            await query.edit_message_text("❌ Unknown rule confirmation. Please run /setrule again.")
+            return
+
+        params.strategy = strategy
+        owner_id = entry.payload["user_id"]
+
+        try:
+            activate = decision not in ("save", "save_only")
+            rule = await repo.create_rule(params, owner_id, activate=activate)
+
+            if strategy == "smart_money" and activate:
+                assigned = await repo.set_smart_money_rule(rule.id, owner_id)
                 if not assigned:
                     await query.edit_message_text(
-                        f"Rule '{rule.name}' was created, but Smart Money assignment failed. "
-                        f"Use /setsmartmoney {rule.id} to assign it manually."
+                        f"⚠️ Rule #{rule.id} was saved, but Smart Money assignment failed.\n\n"
+                        f"Run /setsmartmoney {rule.id} to assign it."
                     )
                     return
-            else:
-                rule = await repo.create_rule(
-                    params,
-                    entry.payload["user_id"],
-                    activate=True,
-                )
+
             await repo.write_audit_log(
                 str(update.effective_user.id),
                 "save_rule_strategy",
-                {"rule_id": rule.id, "strategy": strategy, "activated": True},
+                {"rule_id": rule.id, "strategy": strategy, "activated": activate},
             )
+
             lane = (
                 "⚡ Fast Sniper"
                 if strategy == "fast"
@@ -540,32 +539,31 @@ async def confirmation_callback(update: Update, context: ContextTypes.DEFAULT_TY
                 if strategy == "smart_money"
                 else "🧠 Smart Filter"
             )
-            if strategy == "smart_money":
-                await query.edit_message_text(
-                    f"Rule '{rule.name}' saved and activated as {lane}.\n\n"
-                    "🐋 Smart Money Copy is now assigned to this independent rule.\n"
+
+            if activate:
+                extra = (
+                    "\n🐋 Smart Money Copy is now assigned to this independent rule.\n"
                     "Use /enablesmartmoney to turn Smart Money copying ON."
+                    if strategy == "smart_money"
+                    else "\nThis changes only that sniper lane; the other lanes keep their own active rules."
+                )
+                await query.edit_message_text(
+                    f"✅ Rule '{rule.name}' saved and activated as {lane}.{extra}"
                 )
             else:
                 await query.edit_message_text(
-                    f"Rule '{rule.name}' saved and activated as {lane}.\n\n"
-                    "This changes only that sniper lane; the other lanes keep their own active rules."
+                    f"✅ Rule '{rule.name}' saved (not activated).\n\n"
+                    "Use /setfast, /setsmart, /setsmartmoney, or /pumpfunsnipers to assign it."
                 )
-        else:
-            # Save-only never activates either lane.
-            rule = await repo.create_rule(
-                params,
-                entry.payload["user_id"],
-                activate=False,
-            )
-            await repo.write_audit_log(
-                str(update.effective_user.id),
-                "save_rule",
-                {"rule_id": rule.id, "activated": False},
+        except Exception as exc:
+            logger.exception(
+                "rule_save_failed",
+                extra={"user_id": owner_id, "decision": decision, "strategy": strategy},
             )
             await query.edit_message_text(
-                f"Rule '{rule.name}' saved (not activated).\n\n"
-                "Use /setfast, /setsmart, /setsmartmoney, or /pumpfunsnipers to assign it to a lane."
+                "❌ Rule could not be saved.\n\n"
+                f"Reason: `{type(exc).__name__}: {exc}`\n\n"
+                "Check Railway logs for the full traceback."
             )
 
     elif entry.action == "close_position":
