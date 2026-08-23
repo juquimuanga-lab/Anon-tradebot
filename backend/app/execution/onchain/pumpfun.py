@@ -824,49 +824,233 @@ async def get_pool_info(
 # Early-launch organic-flow analysis
 # ---------------------------------------------------------------------------
 
-def _rpc_json_value(body: dict):
+def _rpc_json_value(body: dict, *, method: str = ""):
+    """Return a JSON-RPC result and preserve the real provider error."""
     if not isinstance(body, dict):
-        return None
-    if "error" in body:
-        raise RuntimeError(f"RPC error: {body['error']}")
+        raise RuntimeError(
+            f"{method or 'RPC'} returned non-object JSON"
+        )
+
+    error = body.get("error")
+    if error is not None:
+        if isinstance(error, dict):
+            code = error.get("code")
+            message = error.get("message") or "unknown RPC error"
+            data = error.get("data")
+            detail = f"code={code} message={message}"
+            if data is not None:
+                detail += f" data={str(data)[:500]}"
+        else:
+            detail = str(error)[:700]
+        raise RuntimeError(
+            f"{method or 'RPC'} returned JSON-RPC error: {detail}"
+        )
+
+    if "result" not in body:
+        raise RuntimeError(
+            f"{method or 'RPC'} response missing result"
+        )
+
     return body.get("result")
 
 
-async def _raw_rpc_call(rpc_url: str, method: str, params: list):
-    """RPC helper for launch safety with bounded retries and rate-limit backoff."""
+async def _raw_rpc_call(
+    rpc_url: str,
+    method: str,
+    params: list,
+    *,
+    retries: int = 3,
+):
+    """Call Solana JSON-RPC with bounded retries and useful diagnostics.
+
+    The previous implementation converted every provider failure into a bare
+    ``RuntimeError``. That made the launch-safety layer impossible to diagnose
+    from Railway logs. This version preserves the RPC method, HTTP status and
+    JSON-RPC error code/message while still retrying transient failures.
+    """
     import httpx
+
+    if not rpc_url or not str(rpc_url).startswith(("http://", "https://")):
+        raise RuntimeError(
+            f"invalid Solana RPC URL for {method}: {rpc_url!r}"
+        )
 
     payload = {
         "jsonrpc": "2.0",
-        "id": "pumpfun-launch-safety",
+        "id": f"pumpfun-safety-{method}",
         "method": method,
         "params": params,
     }
-    delays = (0.0, 0.15, 0.35, 0.75)
-    last_exc = None
-    for delay in delays:
-        if delay:
-            await asyncio.sleep(delay)
-        try:
-            async with httpx.AsyncClient(timeout=6.0) as client:
+
+    # Retry only conditions that can reasonably clear on their own. Invalid
+    # parameters/authentication errors should surface immediately.
+    delays = (0.0, 0.20, 0.50, 1.00)[: max(1, retries + 1)]
+    last_exc: Exception | None = None
+
+    timeout = httpx.Timeout(
+        connect=2.5,
+        read=5.0,
+        write=5.0,
+        pool=2.5,
+    )
+
+    async with httpx.AsyncClient(
+        timeout=timeout,
+        headers={"Content-Type": "application/json"},
+        follow_redirects=True,
+    ) as client:
+        for attempt, delay in enumerate(delays, start=1):
+            if delay:
+                await asyncio.sleep(delay)
+
+            try:
                 response = await client.post(
-                    rpc_url,
+                    str(rpc_url),
                     json=payload,
-                    headers={"Content-Type": "application/json"},
                 )
-                # Retry transient provider throttling/server failures.
+
+                body_text = response.text[:700]
+
                 if response.status_code in {408, 425, 429, 500, 502, 503, 504}:
                     raise RuntimeError(
-                        f"RPC HTTP {response.status_code}: {response.text[:300]}"
+                        f"{method} HTTP {response.status_code} "
+                        f"(attempt {attempt}/{len(delays)}): {body_text}"
                     )
+
                 response.raise_for_status()
-                return _rpc_json_value(response.json())
-        except Exception as exc:
-            last_exc = exc
+
+                try:
+                    body = response.json()
+                except Exception as exc:
+                    raise RuntimeError(
+                        f"{method} returned invalid JSON "
+                        f"(HTTP {response.status_code}): {body_text}"
+                    ) from exc
+
+                return _rpc_json_value(body, method=method)
+
+            except Exception as exc:
+                last_exc = exc
+                message = str(exc)
+                transient = (
+                    isinstance(exc, (httpx.TimeoutException, httpx.NetworkError))
+                    or " HTTP 408 " in message
+                    or " HTTP 425 " in message
+                    or " HTTP 429 " in message
+                    or " HTTP 500 " in message
+                    or " HTTP 502 " in message
+                    or " HTTP 503 " in message
+                    or " HTTP 504 " in message
+                )
+
+                if not transient or attempt >= len(delays):
+                    raise RuntimeError(
+                        f"{method} RPC failed after {attempt} attempt(s): {exc}"
+                    ) from exc
+
+                logger.warning(
+                    "pumpfun_launch_safety_rpc_retry",
+                    extra={
+                        "method": method,
+                        "attempt": attempt,
+                        "max_attempts": len(delays),
+                        "error": f"{type(exc).__name__}: {exc}",
+                    },
+                )
 
     raise RuntimeError(
-        f"{method} failed after {len(delays)} attempts: {last_exc}"
+        f"{method} RPC failed: {last_exc}"
+    ) from last_exc
+
+
+async def _get_launch_transactions(
+    rpc_url: str,
+    curve_address: str,
+    *,
+    limit: int,
+) -> list[dict]:
+    """Fetch the newest curve transactions with an RPC-compatible fallback.
+
+    Helius has a paid-only ``getTransactionsForAddress`` method that can return
+    full transactions in one request. We use it opportunistically when the
+    provider exposes it, but the standard Solana RPC path remains authoritative
+    and works on ordinary RPC endpoints as well.
+    """
+    # First use the standard Solana method. It is universally supported and
+    # gives us signatures without requiring an archival/paid extension.
+    signatures = await _raw_rpc_call(
+        rpc_url,
+        "getSignaturesForAddress",
+        [
+            curve_address,
+            {
+                "limit": max(1, min(int(limit), 100)),
+                "commitment": "processed",
+            },
+        ],
     )
+
+    if not isinstance(signatures, list):
+        raise RuntimeError(
+            "getSignaturesForAddress returned a non-list result"
+        )
+
+    transactions: list[dict] = []
+
+    for item in signatures:
+        if not isinstance(item, dict) or item.get("err") is not None:
+            continue
+
+        signature = item.get("signature")
+        if not signature:
+            continue
+
+        tx = None
+        # A transaction can briefly be visible through gSFA before its full
+        # record is queryable. Retry the detail lookup at processed first, then
+        # confirmed as a consistency fallback.
+        for commitment in ("processed", "confirmed"):
+            for _ in range(3):
+                try:
+                    tx = await _raw_rpc_call(
+                        rpc_url,
+                        "getTransaction",
+                        [
+                            signature,
+                            {
+                                "encoding": "jsonParsed",
+                                "maxSupportedTransactionVersion": 0,
+                                "commitment": commitment,
+                            },
+                        ],
+                        retries=2,
+                    )
+                except Exception as exc:
+                    logger.warning(
+                        "pumpfun_launch_safety_transaction_fetch_failed",
+                        extra={
+                            "signature": signature,
+                            "commitment": commitment,
+                            "error": f"{type(exc).__name__}: {exc}",
+                        },
+                    )
+                    tx = None
+                    break
+
+                if tx is not None:
+                    break
+                await asyncio.sleep(0.10)
+
+            if tx is not None:
+                break
+
+        if isinstance(tx, dict):
+            transactions.append(tx)
+
+        if len(transactions) >= min(8, max(1, int(limit))):
+            break
+
+    return transactions
 
 def _account_key_list(tx: dict) -> list[str]:
     message = ((tx or {}).get("transaction") or {}).get("message") or {}
@@ -1021,42 +1205,14 @@ async def analyze_launch_safety(
 
     try:
         curve_address, _ = get_bonding_curve_address(mint)
-        signatures = await _raw_rpc_call(
+        transactions = await _get_launch_transactions(
             rpc_url,
-            "getSignaturesForAddress",
-            [
-                str(curve_address),
-                {
-                    "limit": PUMPFUN_LAUNCH_SAFETY_SIGNATURE_LIMIT,
-                    "commitment": "processed",
-                },
-            ],
+            str(curve_address),
+            limit=PUMPFUN_LAUNCH_SAFETY_SIGNATURE_LIMIT,
         )
-        signatures = signatures if isinstance(signatures, list) else []
 
         events = []
-        for item in signatures:
-            if not isinstance(item, dict) or item.get("err") is not None:
-                continue
-            signature = item.get("signature")
-            if not signature:
-                continue
-
-            tx = await _raw_rpc_call(
-                rpc_url,
-                "getTransaction",
-                [
-                    signature,
-                    {
-                        "encoding": "jsonParsed",
-                        "maxSupportedTransactionVersion": 0,
-                        "commitment": "processed",
-                    },
-                ],
-            )
-            if not tx:
-                continue
-
+        for tx in transactions:
             event = _extract_buy_sell_event(tx, mint)
             if not event:
                 continue
@@ -1068,7 +1224,8 @@ async def analyze_launch_safety(
                 if float(block_time) < float(created_at) - 2.0:
                     continue
 
-            event["signature"] = signature
+            signatures = ((tx.get("transaction") or {}).get("signatures") or [])
+            event["signature"] = signatures[0] if signatures else ""
             event["block_time"] = block_time
             event["funders"] = {
                 buyer: _extract_direct_funder(tx, buyer)
@@ -1076,7 +1233,6 @@ async def analyze_launch_safety(
             }
             events.append(event)
 
-            # Avoid turning the safety gate into a high-rate RPC consumer.
             if len(events) >= 8:
                 break
 
@@ -1222,9 +1378,8 @@ async def analyze_launch_safety(
             }
         )
     except Exception as exc:
-        # Safety telemetry is fail-open when the optional analysis RPC is
-        # unavailable; normal RuleParams, late-entry, and execution safeguards
-        # still decide whether the trade can proceed.
+        # Keep the safety gate fail-closed when its analysis cannot be
+        # completed. The scanner treats safe=False as a hard rejection.
         result.update(
             {
                 "status": "degraded",
@@ -1237,8 +1392,8 @@ async def analyze_launch_safety(
             }
         )
         logger.warning(
-            "pumpfun_launch_safety_degraded",
-            extra={"mint": mint, "error": f"{type(exc).__name__}: {exc}"},
+            "pumpfun_launch_safety_degraded "
+            f"mint={mint} error={type(exc).__name__}: {exc}"
         )
 
     _pumpfun_launch_safety_cache[mint] = (now, dict(result))
