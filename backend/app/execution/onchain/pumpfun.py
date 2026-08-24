@@ -61,6 +61,7 @@ SOL_LAMPORTS_PER_SOL = 1_000_000_000
 
 # Avoid duplicate bonding-curve reads during rapid qualification passes.
 PUMPFUN_POOL_CACHE_SECONDS = 1.25
+PUMPFUN_DECIMALS_CACHE_SECONDS = 30.0
 PUMPFUN_TOKEN_DECIMALS = 6
 _pumpfun_pool_cache: dict[str, tuple[float, dict]] = {}
 _pumpfun_decimals_cache: dict[str, tuple[float, int]] = {}
@@ -1144,16 +1145,16 @@ def _round_trade_size(sol_spent: float) -> float:
 
 
 def _parsed_system_transfers(tx: dict, curve_address: str) -> tuple[dict[str, int], dict[str, int]]:
-    """Extract SOL flowing into/out of the Pump.fun bonding curve.
+    """Extract native SOL transfers involving the Pump.fun curve.
 
-    Token-account ``accountIndex`` values are SPL token accounts, not the
-    owner's wallet account.  Using their lamport deltas therefore measures
-    token-account rent/maintenance rather than the trader's SOL amount.
+    Preferred source:
+      * source=buyer, destination=curve -> buy SOL
+      * source=curve, destination=seller -> sell SOL
 
-    Pump.fun buy/sell instructions expose the economically meaningful SOL
-    movement as parsed System Program transfers involving the bonding curve:
-      * source=buyer, destination=curve  -> buy SOL
-      * source=curve, destination=seller  -> sell SOL
+    Some RPC responses / newer Pump.fun instruction paths do not expose the
+    economically relevant System transfer as a parsed inner instruction.
+    In that case the caller can use the curve account's pre/post lamport delta
+    as a transaction-level fallback.
 
     Returns:
         (buy_sol_by_wallet_lamports, sell_sol_by_wallet_lamports)
@@ -1201,6 +1202,96 @@ def _parsed_system_transfers(tx: dict, curve_address: str) -> tuple[dict[str, in
     return dict(buys), dict(sells)
 
 
+def _curve_lamport_delta(tx: dict, curve_address: str) -> int | None:
+    """Return the curve PDA's post-pre native SOL lamport delta.
+
+    ``preBalances``/``postBalances`` are indexed by the transaction message's
+    account keys. This is a transaction-level fallback for providers that omit
+    the parsed System transfer used by Pump.fun's buy/sell instruction.
+    """
+    if not curve_address:
+        return None
+
+    meta = (tx or {}).get("meta") or {}
+    pre_balances = meta.get("preBalances") or []
+    post_balances = meta.get("postBalances") or []
+    if not pre_balances or not post_balances:
+        return None
+
+    message = ((tx or {}).get("transaction") or {}).get("message") or {}
+    keys = []
+    for item in message.get("accountKeys") or []:
+        if isinstance(item, str):
+            keys.append(item)
+        elif isinstance(item, dict):
+            keys.append(str(item.get("pubkey") or item.get("address") or ""))
+        else:
+            keys.append(str(item))
+
+    loaded = meta.get("loadedAddresses") or {}
+    keys.extend(str(x) for x in (loaded.get("writable") or []))
+    keys.extend(str(x) for x in (loaded.get("readonly") or []))
+
+    try:
+        index = keys.index(curve_address)
+        pre = int(pre_balances[index])
+        post = int(post_balances[index])
+    except (ValueError, IndexError, TypeError):
+        return None
+
+    return post - pre
+
+
+def _allocate_curve_delta_to_traders(
+    delta_lamports: int | None,
+    buyers: dict[str, int],
+    sellers: dict[str, int],
+) -> tuple[dict[str, int], dict[str, int]]:
+    """Attribute a curve balance delta to token-side traders.
+
+    Normally a Pump.fun launch transaction has one economically active buyer
+    or seller. If a transaction contains multiple token owners, distribute
+    the absolute curve delta proportionally to token volume.
+    """
+    buys: dict[str, int] = defaultdict(int)
+    sells: dict[str, int] = defaultdict(int)
+
+    if delta_lamports is None or delta_lamports == 0:
+        return dict(buys), dict(sells)
+
+    if delta_lamports > 0 and buyers:
+        total = sum(max(0, int(v)) for v in buyers.values())
+        if total > 0:
+            remaining = delta_lamports
+            items = list(buyers.items())
+            for pos, (wallet, amount) in enumerate(items):
+                if pos == len(items) - 1:
+                    allocated = remaining
+                else:
+                    allocated = int(delta_lamports * int(amount) / total)
+                    allocated = max(0, min(allocated, remaining))
+                if allocated > 0:
+                    buys[wallet] += allocated
+                    remaining -= allocated
+
+    elif delta_lamports < 0 and sellers:
+        absolute = abs(delta_lamports)
+        total = sum(max(0, int(v)) for v in sellers.values())
+        if total > 0:
+            remaining = absolute
+            items = list(sellers.items())
+            for pos, (wallet, amount) in enumerate(items):
+                if pos == len(items) - 1:
+                    allocated = remaining
+                else:
+                    allocated = int(absolute * int(amount) / total)
+                    allocated = max(0, min(allocated, remaining))
+                if allocated > 0:
+                    sells[wallet] += allocated
+                    remaining -= allocated
+
+    return dict(buys), dict(sells)
+
 def _extract_buy_sell_event(
     tx: dict,
     mint: str,
@@ -1237,6 +1328,21 @@ def _extract_buy_sell_event(
         curve_address,
     )
 
+    # Fallback for RPC responses/instruction paths where the parsed System
+    # transfer is missing: use the curve PDA's native lamport delta and
+    # attribute it to the token-side trader(s).
+    curve_delta = _curve_lamport_delta(tx, curve_address)
+    if curve_delta is not None:
+        fallback_buys, fallback_sells = _allocate_curve_delta_to_traders(
+            curve_delta,
+            buyers,
+            sellers,
+        )
+        if not buy_sol_lamports and fallback_buys:
+            buy_sol_lamports = fallback_buys
+        if not sell_sol_lamports and fallback_sells:
+            sell_sol_lamports = fallback_sells
+
     buyer_sol = {
         buyer: amount / SOL_LAMPORTS_PER_SOL
         for buyer, amount in buy_sol_lamports.items()
@@ -1246,10 +1352,11 @@ def _extract_buy_sell_event(
         for seller, amount in sell_sol_lamports.items()
     }
 
-    # A parsed transfer is the preferred source of truth.  If a provider
-    # omits parsed System transfers, do not manufacture a zero: the caller
-    # must treat the SOL metric as unavailable rather than as "0 SOL".
-    sol_flow_available = bool(buy_sol_lamports or sell_sol_lamports)
+    # Never manufacture a zero when the provider exposed neither parsed
+    # transfers nor a usable curve balance delta.
+    sol_flow_available = bool(
+        buy_sol_lamports or sell_sol_lamports
+    )
 
     slot = (tx or {}).get("slot")
     return {
@@ -1344,10 +1451,21 @@ async def analyze_launch_safety(
         total_buy_sol = 0.0
         total_sell_sol = 0.0
         sol_flow_events = 0
+        sol_flow_buy_events = 0
+        sol_flow_sell_events = 0
 
-        for event in buy_events:
+        for event in events:
             if event.get("sol_flow_available"):
                 sol_flow_events += 1
+
+        sol_flow_buy_events = sum(
+            1 for event in buy_events if event.get("buyer_sol")
+        )
+        sol_flow_sell_events = sum(
+            1 for event in sell_events if event.get("seller_sol")
+        )
+
+        for event in buy_events:
             for buyer, amount in event["buyers"].items():
                 buyer_volume[buyer] += int(amount)
                 total_buy_tokens += int(amount)
@@ -1568,6 +1686,8 @@ async def analyze_launch_safety(
                         else None
                     ),
                     "sol_flow_events": sol_flow_events,
+                    "sol_flow_buy_events": sol_flow_buy_events,
+                    "sol_flow_sell_events": sol_flow_sell_events,
                     "sol_flow_available": bool(total_buy_sol or total_sell_sol),
                     "creator_sell_share": round(creator_sell_share, 4),
                 },
