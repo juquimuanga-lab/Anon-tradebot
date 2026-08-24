@@ -86,7 +86,7 @@ PUMPFUN_SAFETY_SHARED_FUNDER_VOLUME_SHARE = 0.45
 PUMPFUN_SAFETY_CREATOR_BUY_SHARE = 0.20
 PUMPFUN_SAFETY_MIN_BUY_PRESSURE = 0.55
 PUMPFUN_SAFETY_MIN_BUY_EVENTS_FOR_PRESSURE = 4
-PUMPFUN_SAFETY_PATCH_VERSION = "V6_TX_RETRIEVAL"
+PUMPFUN_SAFETY_PATCH_VERSION = "V7_SOL_FLOW_FIX"
 
 _pumpfun_launch_safety_cache: dict[str, tuple[float, dict]] = {}
 
@@ -1143,21 +1143,77 @@ def _round_trade_size(sol_spent: float) -> float:
     return round(sol_spent, 3)
 
 
-def _extract_buy_sell_event(tx: dict, mint: str) -> dict | None:
+def _parsed_system_transfers(tx: dict, curve_address: str) -> tuple[dict[str, int], dict[str, int]]:
+    """Extract SOL flowing into/out of the Pump.fun bonding curve.
+
+    Token-account ``accountIndex`` values are SPL token accounts, not the
+    owner's wallet account.  Using their lamport deltas therefore measures
+    token-account rent/maintenance rather than the trader's SOL amount.
+
+    Pump.fun buy/sell instructions expose the economically meaningful SOL
+    movement as parsed System Program transfers involving the bonding curve:
+      * source=buyer, destination=curve  -> buy SOL
+      * source=curve, destination=seller  -> sell SOL
+
+    Returns:
+        (buy_sol_by_wallet_lamports, sell_sol_by_wallet_lamports)
+    """
+    buys: dict[str, int] = defaultdict(int)
+    sells: dict[str, int] = defaultdict(int)
+
+    if not curve_address:
+        return dict(buys), dict(sells)
+
+    def inspect(ix):
+        if not isinstance(ix, dict):
+            return
+        parsed = ix.get("parsed")
+        if not isinstance(parsed, dict) or parsed.get("type") != "transfer":
+            return
+        program = ix.get("program")
+        program_id = ix.get("programId")
+        if program != "system" and program_id != "11111111111111111111111111111111":
+            return
+
+        info = parsed.get("info") or {}
+        source = str(info.get("source") or "")
+        destination = str(info.get("destination") or "")
+        try:
+            lamports = int(info.get("lamports") or 0)
+        except (TypeError, ValueError):
+            lamports = 0
+        if lamports <= 0:
+            return
+
+        if destination == curve_address and source and source != curve_address:
+            buys[source] += lamports
+        elif source == curve_address and destination and destination != curve_address:
+            sells[destination] += lamports
+
+    message = ((tx or {}).get("transaction") or {}).get("message") or {}
+    for ix in message.get("instructions") or []:
+        inspect(ix)
+
+    for group in (tx.get("meta") or {}).get("innerInstructions") or []:
+        for ix in group.get("instructions") or []:
+            inspect(ix)
+
+    return dict(buys), dict(sells)
+
+
+def _extract_buy_sell_event(
+    tx: dict,
+    mint: str,
+    curve_address: str = "",
+) -> dict | None:
     meta = (tx or {}).get("meta") or {}
     pre = _token_balance_map(meta.get("preTokenBalances") or [], mint)
     post = _token_balance_map(meta.get("postTokenBalances") or [], mint)
     if not post and not pre:
         return None
 
-    keys = _account_key_list(tx)
-    fee = int(meta.get("fee") or 0)
-    pre_lamports = meta.get("preBalances") or []
-    post_lamports = meta.get("postBalances") or []
-
     buyers = defaultdict(int)
     sellers = defaultdict(int)
-    buyer_sol = defaultdict(float)
 
     indices = set(pre) | set(post)
     for index in indices:
@@ -1165,29 +1221,43 @@ def _extract_buy_sell_event(tx: dict, mint: str) -> dict | None:
         pre_owner, pre_amount = pre.get(index, (owner, 0))
         owner = owner or pre_owner
         delta = post_amount - pre_amount
-        if not owner and 0 <= index < len(keys):
-            owner = keys[index]
         if not owner or delta == 0:
             continue
 
         if delta > 0:
             buyers[owner] += delta
-            if 0 <= index < len(pre_lamports) and 0 <= index < len(post_lamports):
-                spent_lamports = max(0, int(pre_lamports[index]) - int(post_lamports[index]))
-                if index == 0:
-                    spent_lamports = max(0, spent_lamports - fee)
-                buyer_sol[owner] += spent_lamports / SOL_LAMPORTS_PER_SOL
         else:
             sellers[owner] += abs(delta)
 
     if not buyers and not sellers:
         return None
 
+    buy_sol_lamports, sell_sol_lamports = _parsed_system_transfers(
+        tx,
+        curve_address,
+    )
+
+    buyer_sol = {
+        buyer: amount / SOL_LAMPORTS_PER_SOL
+        for buyer, amount in buy_sol_lamports.items()
+    }
+    seller_sol = {
+        seller: amount / SOL_LAMPORTS_PER_SOL
+        for seller, amount in sell_sol_lamports.items()
+    }
+
+    # A parsed transfer is the preferred source of truth.  If a provider
+    # omits parsed System transfers, do not manufacture a zero: the caller
+    # must treat the SOL metric as unavailable rather than as "0 SOL".
+    sol_flow_available = bool(buy_sol_lamports or sell_sol_lamports)
+
     slot = (tx or {}).get("slot")
     return {
         "buyers": dict(buyers),
         "sellers": dict(sellers),
-        "buyer_sol": dict(buyer_sol),
+        "buyer_sol": buyer_sol,
+        "seller_sol": seller_sol,
+        "sol_flow_available": sol_flow_available,
         "slot": int(slot) if slot is not None else None,
     }
 
@@ -1233,7 +1303,7 @@ async def analyze_launch_safety(
 
         events = []
         for tx in transactions:
-            event = _extract_buy_sell_event(tx, mint)
+            event = _extract_buy_sell_event(tx, mint, str(curve_address))
             if not event:
                 continue
 
@@ -1260,7 +1330,9 @@ async def analyze_launch_safety(
         sell_events = [e for e in events if e["sellers"]]
 
         buyer_volume = defaultdict(int)
+        seller_volume = defaultdict(int)
         buyer_sol = defaultdict(float)
+        seller_sol = defaultdict(float)
         slot_volume = defaultdict(int)
         size_volume = defaultdict(int)
         funder_volume = defaultdict(int)
@@ -1270,19 +1342,29 @@ async def analyze_launch_safety(
         total_buy_tokens = 0
         total_sell_tokens = 0
         total_buy_sol = 0.0
+        total_sell_sol = 0.0
+        sol_flow_events = 0
 
         for event in buy_events:
+            if event.get("sol_flow_available"):
+                sol_flow_events += 1
             for buyer, amount in event["buyers"].items():
                 buyer_volume[buyer] += int(amount)
                 total_buy_tokens += int(amount)
-                sol_amount = float(event["buyer_sol"].get(buyer, 0.0))
-                buyer_sol[buyer] += sol_amount
-                total_buy_sol += sol_amount
+
+                # Only count SOL when the transaction contained an
+                # authoritative curve System transfer for this wallet.
+                sol_amount = event["buyer_sol"].get(buyer)
+                if sol_amount is not None and sol_amount > 0:
+                    buyer_sol[buyer] += float(sol_amount)
+                    total_buy_sol += float(sol_amount)
+                    size_bucket = _round_trade_size(float(sol_amount))
+                    if size_bucket > 0:
+                        size_volume[size_bucket] += int(amount)
+
                 if event.get("slot") is not None:
                     slot_volume[event["slot"]] += int(amount)
-                size_bucket = _round_trade_size(sol_amount)
-                if size_bucket > 0:
-                    size_volume[size_bucket] += int(amount)
+
                 funder = event["funders"].get(buyer)
                 if funder:
                     funder_volume[funder] += int(amount)
@@ -1291,7 +1373,13 @@ async def analyze_launch_safety(
                     creator_volume += int(amount)
 
         for event in sell_events:
-            total_sell_tokens += sum(int(v) for v in event["sellers"].values())
+            for seller, amount in event["sellers"].items():
+                seller_volume[seller] += int(amount)
+                total_sell_tokens += int(amount)
+                sol_amount = event["seller_sol"].get(seller)
+                if sol_amount is not None and sol_amount > 0:
+                    seller_sol[seller] += float(sol_amount)
+                    total_sell_sol += float(sol_amount)
 
         unique_buyers = len(buyer_volume)
         buy_count = sum(len(e["buyers"]) for e in buy_events)
@@ -1303,8 +1391,15 @@ async def analyze_launch_safety(
         sorted_buyer = sorted(buyer_volume.values(), reverse=True)
         top1_share = share(sorted_buyer[0] if sorted_buyer else 0, total_buy_tokens)
         top3_share = share(sum(sorted_buyer[:3]), total_buy_tokens)
+
+        # Wallet concentration is meaningful only when actual SOL flow was
+        # observed. Never turn "unknown" into a fake 100% concentration.
         sorted_buyer_sol = sorted(buyer_sol.values(), reverse=True)
-        top10_sol_share = share(sum(sorted_buyer_sol[:10]), total_buy_sol)
+        top10_sol_share = (
+            share(sum(sorted_buyer_sol[:10]), total_buy_sol)
+            if total_buy_sol > 0
+            else None
+        )
 
         creator_sell_volume = 0
         if creator:
@@ -1323,8 +1418,30 @@ async def analyze_launch_safety(
             flow_span_seconds = max(1.0, max(event_times) - float(created_at))
         else:
             flow_span_seconds = max(1.0, float(len(events)))
-        buy_velocity_sol = total_buy_sol / flow_span_seconds
-        buy_sell_ratio = (total_buy_sol / max(total_sell_sol, 0.001)) if total_buy_sol > 0 else 0.0
+
+        buy_velocity_sol = (
+            total_buy_sol / flow_span_seconds
+            if total_buy_sol > 0
+            else None
+        )
+
+        if total_buy_sol > 0 or total_sell_sol > 0:
+            buy_pressure = share(
+                total_buy_sol,
+                total_buy_sol + total_sell_sol,
+            )
+            buy_sell_ratio = (
+                total_buy_sol / total_sell_sol
+                if total_sell_sol > 0
+                else None
+            )
+        else:
+            buy_pressure = None
+            buy_sell_ratio = None
+
+        # Preserve the original buyer-event diversity metric. It is based on
+        # token-account ownership/events and remains useful independently of
+        # whether SOL attribution was available for every wallet.
         buyer_diversity = unique_buyers / max(1, buy_count)
 
         max_slot_share = 0.0
@@ -1345,12 +1462,6 @@ async def analyze_launch_safety(
             )
 
         creator_buy_share = share(creator_volume, total_buy_tokens)
-        buy_pressure = share(total_buy_tokens, total_buy_tokens + total_sell_tokens)
-        # Pump.fun's parsed transaction shape gives authoritative buyer SOL
-        # outflow, while sell-side SOL attribution is not reliable from wallet
-        # balances alone. Use buy-pressure as the primary sell-pressure signal
-        # and expose a conservative buy/sell proxy for Graduation Hunter.
-        buy_sell_ratio = buy_pressure / max(1.0 - buy_pressure, 0.01) if buy_pressure > 0 else 0.0
 
         risk = 0
         reasons = []
@@ -1391,6 +1502,7 @@ async def analyze_launch_safety(
 
         if (
             buy_count >= PUMPFUN_SAFETY_MIN_BUY_EVENTS_FOR_PRESSURE
+            and buy_pressure is not None
             and buy_pressure < PUMPFUN_SAFETY_MIN_BUY_PRESSURE
         ):
             risk += 25
@@ -1412,6 +1524,7 @@ async def analyze_launch_safety(
                 "reason": "; ".join(reasons[:4]) if reject else "",
                 "risk_score": min(100, risk),
                 "signals": {
+                    "patch_version": PUMPFUN_SAFETY_PATCH_VERSION,
                     "transactions_examined": len(events),
                     "transaction_records_retrieved": len(transactions),
                     "transaction_data_complete": bool(transactions),
@@ -1425,14 +1538,37 @@ async def analyze_launch_safety(
                     "shared_funder_buyers": max_shared_funder_buyers,
                     "shared_funder_volume_share": round(max_shared_funder_volume_share, 4),
                     "creator_buy_share": round(creator_buy_share, 4),
-                    "buy_pressure": round(buy_pressure, 4),
+                    "buy_pressure": (
+                        round(buy_pressure, 4)
+                        if buy_pressure is not None
+                        else None
+                    ),
                     "total_buy_sol": round(total_buy_sol, 6),
-                    "buy_sell_ratio": round(buy_sell_ratio, 4),
-                    "buy_sell_ratio_basis": "token_flow_pressure_proxy",
-                    "buy_velocity_sol_per_sec": round(buy_velocity_sol, 6),
+                    "total_sell_sol": round(total_sell_sol, 6),
+                    "buy_sell_ratio": (
+                        round(buy_sell_ratio, 4)
+                        if buy_sell_ratio is not None
+                        else None
+                    ),
+                    "buy_sell_ratio_basis": "curve_system_transfers",
+                    "buy_velocity_sol_per_sec": (
+                        round(buy_velocity_sol, 6)
+                        if buy_velocity_sol is not None
+                        else None
+                    ),
                     "flow_span_seconds": round(flow_span_seconds, 3),
-                    "buyer_diversity": round(buyer_diversity, 4),
-                    "top10_buyer_sol_share": round(top10_sol_share, 4),
+                    "buyer_diversity": (
+                        round(buyer_diversity, 4)
+                        if buyer_diversity is not None
+                        else None
+                    ),
+                    "top10_buyer_sol_share": (
+                        round(top10_sol_share, 4)
+                        if top10_sol_share is not None
+                        else None
+                    ),
+                    "sol_flow_events": sol_flow_events,
+                    "sol_flow_available": bool(total_buy_sol or total_sell_sol),
                     "creator_sell_share": round(creator_sell_share, 4),
                 },
             }
