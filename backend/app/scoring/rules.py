@@ -53,6 +53,21 @@ class RuleParams(BaseModel):
     late_entry_max_short_runup_pct: float = 35.0
     late_entry_max_runup_from_first_pct: float = 90.0
 
+    # Pump.fun Graduation Hunter deployment defaults. These are deliberately
+    # rule-level defaults so existing database rows work without a migration.
+    graduation_hunter_enabled: bool = True
+    graduation_hunter_min_observation_seconds: float = 20.0
+    graduation_hunter_max_observation_seconds: float = 120.0
+    graduation_hunter_target_real_sol: float = 85.0
+    graduation_hunter_min_real_sol: float = 10.0
+    graduation_hunter_max_real_sol: float = 35.0
+    graduation_hunter_min_buy_sell_ratio: float = 3.0
+    graduation_hunter_min_unique_buyers: int = 20
+    graduation_hunter_min_buyer_diversity: float = 0.35
+    graduation_hunter_max_top10_buyer_share: float = 0.60
+    graduation_hunter_min_holder_growth_per_minute: float = 10.0
+    graduation_hunter_score_threshold: float = 75.0
+
 
 @dataclass
 class TokenSnapshot:
@@ -64,6 +79,10 @@ class TokenSnapshot:
     price_usd: float = 0.0
     market_cap_usd: float = 0.0
     liquidity_usd: float = 0.0
+    # Pump.fun real bonding-curve SOL reserve. This is the progression signal
+    # used by Graduation Hunter; virtual reserves are intentionally ignored.
+    real_sol_reserves_sol: float = 0.0
+    real_sol_progress_pct: float = 0.0
     holders: Optional[int] = None
     volume_24h_usd: float = 0.0
     is_migrated: bool = False
