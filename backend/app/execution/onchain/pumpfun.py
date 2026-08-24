@@ -74,7 +74,7 @@ _pumpfun_decimals_cache: dict[str, tuple[float, int]] = {}
 # The gate is designed to reject strong coordination signals without requiring
 # a large holder count or a long observation window.
 PUMPFUN_LAUNCH_SAFETY_CACHE_SECONDS = 2.0
-PUMPFUN_LAUNCH_SAFETY_SIGNATURE_LIMIT = 10
+PUMPFUN_LAUNCH_SAFETY_SIGNATURE_LIMIT = 30
 PUMPFUN_LAUNCH_SAFETY_MAX_AGE_SECONDS = 20.0
 
 PUMPFUN_SAFETY_TOP_BUYER_SHARE = 0.50
@@ -1253,7 +1253,7 @@ async def analyze_launch_safety(
             }
             events.append(event)
 
-            if len(events) >= 8:
+            if len(events) >= 25:
                 break
 
         buy_events = [e for e in events if e["buyers"]]
@@ -1269,6 +1269,7 @@ async def analyze_launch_safety(
 
         total_buy_tokens = 0
         total_sell_tokens = 0
+        total_buy_sol = 0.0
 
         for event in buy_events:
             for buyer, amount in event["buyers"].items():
@@ -1276,6 +1277,7 @@ async def analyze_launch_safety(
                 total_buy_tokens += int(amount)
                 sol_amount = float(event["buyer_sol"].get(buyer, 0.0))
                 buyer_sol[buyer] += sol_amount
+                total_buy_sol += sol_amount
                 if event.get("slot") is not None:
                     slot_volume[event["slot"]] += int(amount)
                 size_bucket = _round_trade_size(sol_amount)
@@ -1301,6 +1303,29 @@ async def analyze_launch_safety(
         sorted_buyer = sorted(buyer_volume.values(), reverse=True)
         top1_share = share(sorted_buyer[0] if sorted_buyer else 0, total_buy_tokens)
         top3_share = share(sum(sorted_buyer[:3]), total_buy_tokens)
+        sorted_buyer_sol = sorted(buyer_sol.values(), reverse=True)
+        top10_sol_share = share(sum(sorted_buyer_sol[:10]), total_buy_sol)
+
+        creator_sell_volume = 0
+        if creator:
+            for event in sell_events:
+                creator_sell_volume += int(event["sellers"].get(creator, 0))
+        creator_sell_share = share(creator_sell_volume, total_sell_tokens)
+
+        event_times = [
+            float(e["block_time"])
+            for e in events
+            if e.get("block_time") is not None
+        ]
+        if len(event_times) >= 2:
+            flow_span_seconds = max(1.0, max(event_times) - min(event_times))
+        elif created_at and event_times:
+            flow_span_seconds = max(1.0, max(event_times) - float(created_at))
+        else:
+            flow_span_seconds = max(1.0, float(len(events)))
+        buy_velocity_sol = total_buy_sol / flow_span_seconds
+        buy_sell_ratio = (total_buy_sol / max(total_sell_sol, 0.001)) if total_buy_sol > 0 else 0.0
+        buyer_diversity = unique_buyers / max(1, buy_count)
 
         max_slot_share = 0.0
         if slot_volume:
@@ -1321,6 +1346,11 @@ async def analyze_launch_safety(
 
         creator_buy_share = share(creator_volume, total_buy_tokens)
         buy_pressure = share(total_buy_tokens, total_buy_tokens + total_sell_tokens)
+        # Pump.fun's parsed transaction shape gives authoritative buyer SOL
+        # outflow, while sell-side SOL attribution is not reliable from wallet
+        # balances alone. Use buy-pressure as the primary sell-pressure signal
+        # and expose a conservative buy/sell proxy for Graduation Hunter.
+        buy_sell_ratio = buy_pressure / max(1.0 - buy_pressure, 0.01) if buy_pressure > 0 else 0.0
 
         risk = 0
         reasons = []
@@ -1396,6 +1426,14 @@ async def analyze_launch_safety(
                     "shared_funder_volume_share": round(max_shared_funder_volume_share, 4),
                     "creator_buy_share": round(creator_buy_share, 4),
                     "buy_pressure": round(buy_pressure, 4),
+                    "total_buy_sol": round(total_buy_sol, 6),
+                    "buy_sell_ratio": round(buy_sell_ratio, 4),
+                    "buy_sell_ratio_basis": "token_flow_pressure_proxy",
+                    "buy_velocity_sol_per_sec": round(buy_velocity_sol, 6),
+                    "flow_span_seconds": round(flow_span_seconds, 3),
+                    "buyer_diversity": round(buyer_diversity, 4),
+                    "top10_buyer_sol_share": round(top10_sol_share, 4),
+                    "creator_sell_share": round(creator_sell_share, 4),
                 },
             }
         )
