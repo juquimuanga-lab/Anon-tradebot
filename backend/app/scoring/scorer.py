@@ -127,6 +127,105 @@ def _late_entry_risk(token: TokenSnapshot, rule: RuleParams) -> float:
     return min(100.0, round(risk, 2))
 
 
+def compute_graduation_score(token: TokenSnapshot, rule: RuleParams) -> ScoreResult:
+    """Score Pump.fun launches for probability of continued curve progress.
+
+    This is intentionally separate from the legacy 0-100 score. The legacy
+    score rewards generic quality/momentum; this score measures the signals
+    we actually want for graduation: real curve progress, capital velocity,
+    buy pressure, buyer diversity, holder growth and concentration.
+    """
+    if token.source != "pumpfun":
+        return ScoreResult(score=0.0, creator_match=False, breakdown={"applicable": False})
+
+    safety = (getattr(token, "raw_enrichment", {}) or {}).get("pumpfun_launch_safety") or {}
+    sig = safety.get("signals") or {}
+    history = (getattr(token, "raw_enrichment", {}) or {}).get("graduation_history") or {}
+
+    reserves = float(getattr(token, "real_sol_reserves_sol", 0.0) or 0.0)
+    target = max(1.0, float(getattr(rule, "graduation_hunter_target_real_sol", 85.0) or 85.0))
+    progress = min(100.0, max(0.0, reserves / target * 100.0))
+
+    min_sol = float(getattr(rule, "graduation_hunter_min_real_sol", 10.0) or 10.0)
+    max_sol = float(getattr(rule, "graduation_hunter_max_real_sol", 35.0) or 35.0)
+    if min_sol <= reserves <= max_sol:
+        progress_score = 10.0 * min(1.0, (reserves - min_sol) / max(max_sol - min_sol, 1.0) * 0.75 + 0.25)
+    elif reserves > max_sol:
+        progress_score = 0.0
+    else:
+        progress_score = 0.0
+
+    velocity = float(sig.get("buy_velocity_sol_per_sec", 0.0) or 0.0)
+    velocity_score = min(20.0, max(0.0, velocity / 0.20 * 20.0))
+
+    buy_sell = float(sig.get("buy_sell_ratio", 0.0) or 0.0)
+    buy_sell_score = min(15.0, max(0.0, buy_sell / 5.0 * 15.0))
+
+    unique_buyers = int(sig.get("unique_buyers", 0) or 0)
+    unique_score = min(15.0, unique_buyers / 40.0 * 15.0)
+
+    diversity = float(sig.get("buyer_diversity", 0.0) or 0.0)
+    diversity_score = min(10.0, diversity / 0.50 * 10.0)
+
+    holder_growth = float(history.get("holder_growth_per_minute", 0.0) or 0.0)
+    holder_score = min(10.0, max(0.0, holder_growth / 15.0 * 10.0))
+
+    top10 = float(sig.get("top10_buyer_sol_share", 1.0) or 1.0)
+    concentration_score = 10.0 if top10 <= 0.60 else 5.0 if top10 <= 0.75 else 0.0
+
+    creator_buy = float(sig.get("creator_buy_share", 0.0) or 0.0)
+    creator_sell = float(sig.get("creator_sell_share", 0.0) or 0.0)
+    if creator_buy > 0.0 and creator_sell < max(0.05, creator_buy * 0.50):
+        creator_score = 5.0
+    elif creator_buy == 0.0:
+        creator_score = 3.0
+    else:
+        creator_score = 0.0
+
+    same_slot = float(sig.get("same_slot_share", 1.0) or 1.0)
+    same_size = float(sig.get("same_size_share", 1.0) or 1.0)
+    shared_funder = float(sig.get("shared_funder_volume_share", 0.0) or 0.0)
+    bot_score = 5.0
+    if same_slot >= 0.80:
+        bot_score -= 2.0
+    if same_size >= 0.80:
+        bot_score -= 2.0
+    if shared_funder >= 0.45:
+        bot_score -= 3.0
+    bot_score = max(0.0, bot_score)
+
+    score = min(100.0, round(
+        progress_score + velocity_score + buy_sell_score + unique_score
+        + diversity_score + holder_score + concentration_score
+        + creator_score + bot_score,
+        2,
+    ))
+
+    breakdown = {
+        "real_sol_progress_score": round(progress_score, 2),
+        "buy_velocity_score": round(velocity_score, 2),
+        "buy_sell_pressure_score": round(buy_sell_score, 2),
+        "unique_buyer_score": round(unique_score, 2),
+        "buyer_diversity_score": round(diversity_score, 2),
+        "holder_growth_score": round(holder_score, 2),
+        "wallet_concentration_score": round(concentration_score, 2),
+        "creator_behavior_score": round(creator_score, 2),
+        "organic_flow_score": round(bot_score, 2),
+        "real_sol_reserves": round(reserves, 4),
+        "real_sol_progress_pct": round(progress, 2),
+        "buy_velocity_sol_per_sec": round(velocity, 6),
+        "buy_sell_ratio": round(buy_sell, 4),
+        "unique_buyers": unique_buyers,
+        "buyer_diversity": round(diversity, 4),
+        "holder_growth_per_minute": round(holder_growth, 2),
+        "top10_buyer_sol_share": round(top10, 4),
+        "creator_buy_share": round(creator_buy, 4),
+        "creator_sell_share": round(creator_sell, 4),
+        "threshold": float(getattr(rule, "graduation_hunter_score_threshold", 75.0) or 75.0),
+    }
+    return ScoreResult(score=score, creator_match=False, breakdown=breakdown)
+
+
 def compute_score(token: TokenSnapshot, rule: RuleParams, creator_watchlist: List[str]) -> ScoreResult:
     creator_match = bool(token.creator_wallet) and token.creator_wallet in creator_watchlist
     breakdown = {
