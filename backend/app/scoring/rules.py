@@ -36,7 +36,7 @@ class RuleParams(BaseModel):
     qualify_score_threshold: float = 55.0
     max_trades_per_hour: int = 5
     cooldown_seconds: int = 120
-    take_profit_levels: List[TakeProfitLevel] = Field(default_factory=list)
+    take_profit_levels: List[TakeProfitLevel] = Field(default_factory=lambda: [TakeProfitLevel(gain_pct=15.0, sell_pct=80.0)])
     stop_loss_pct: float = 20.0
     trailing_stop_pct: Optional[float] = None
     sell_on_volume_drop_pct: Optional[float] = None
