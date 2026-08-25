@@ -57,9 +57,9 @@ class RuleParams(BaseModel):
     # rule-level defaults so existing database rows work without a migration.
     graduation_hunter_enabled: bool = True
     graduation_hunter_min_observation_seconds: float = 20.0
-    graduation_hunter_max_observation_seconds: float = 300.0
+    graduation_hunter_max_observation_seconds: float = 800.0
     graduation_hunter_target_real_sol: float = 85.0
-    graduation_hunter_min_real_sol: float = 3.0
+    graduation_hunter_min_real_sol: float = 1.0
     graduation_hunter_max_real_sol: float = 35.0
     graduation_hunter_min_buy_sell_ratio: float = 1.2
     graduation_hunter_min_unique_buyers: int = 3
