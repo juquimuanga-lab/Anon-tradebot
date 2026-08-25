@@ -74,8 +74,19 @@ class Notifier:
     async def rule_violation(self, recipient_id: int, ticker: str, reasons: list[str]) -> None:
         await self._send_to(recipient_id, f"*Skipped* `{ticker}`\n- " + "\n- ".join(reasons[:5]))
 
+    async def buy_attempt(self, recipient_id: int, ticker: str, amount_sol: float, mode: str) -> None:
+        """Tell the user a buy execution has started, not that it was filled."""
+        await self._send_to(
+            recipient_id,
+            f"*Buy attempt* `{ticker}` for {amount_sol:.3f} SOL ({mode} mode)\\n"
+            "Transaction has not been confirmed yet.",
+        )
+
+    # Backward-compatible alias for scanner/execution callers that still use
+    # buy_placed. The wording intentionally remains "Buy attempt" until the
+    # transaction is actually confirmed on-chain.
     async def buy_placed(self, recipient_id: int, ticker: str, amount_sol: float, mode: str) -> None:
-        await self._send_to(recipient_id, f"*Buy placed* `{ticker}` for {amount_sol:.3f} native units ({mode} mode)")
+        await self.buy_attempt(recipient_id, ticker, amount_sol, mode)
 
     async def buy_filled(self, recipient_id: int, ticker: str, price_usd: float, mode: str, tx_signature: str | None = None) -> None:
         link = f"\n[View on Solscan](https://solscan.io/tx/{tx_signature})" if tx_signature else ""
