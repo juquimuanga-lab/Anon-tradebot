@@ -1328,20 +1328,45 @@ def _extract_buy_sell_event(
         curve_address,
     )
 
-    # Fallback for RPC responses/instruction paths where the parsed System
-    # transfer is missing: use the curve PDA's native lamport delta and
-    # attribute it to the token-side trader(s).
+    # Reconcile against the curve PDA balance delta as a second source of
+    # truth. Some RPCs expose only part of Pump.fun's System transfers (or
+    # expose them through a different instruction path). The old V7 logic only
+    # used the curve fallback when *no* parsed transfer existed, which meant a
+    # partial parsed result could still leave legitimate buy SOL at zero.
+    #
+    # We therefore allocate only the residual curve delta not already explained
+    # by parsed curve transfers. This avoids double-counting while recovering
+    # missing buy/sell flow.
     curve_delta = _curve_lamport_delta(tx, curve_address)
     if curve_delta is not None:
-        fallback_buys, fallback_sells = _allocate_curve_delta_to_traders(
-            curve_delta,
-            buyers,
-            sellers,
-        )
-        if not buy_sol_lamports and fallback_buys:
-            buy_sol_lamports = fallback_buys
-        if not sell_sol_lamports and fallback_sells:
-            sell_sol_lamports = fallback_sells
+        parsed_buy_total = sum(max(0, int(v)) for v in buy_sol_lamports.values())
+        parsed_sell_total = sum(max(0, int(v)) for v in sell_sol_lamports.values())
+
+        if curve_delta > 0 and buyers:
+            residual_buy = max(0, int(curve_delta) - parsed_buy_total)
+            if residual_buy > 0:
+                fallback_buys, _ = _allocate_curve_delta_to_traders(
+                    residual_buy,
+                    buyers,
+                    {},
+                )
+                for wallet, lamports in fallback_buys.items():
+                    buy_sol_lamports[wallet] = (
+                        buy_sol_lamports.get(wallet, 0) + int(lamports)
+                    )
+
+        elif curve_delta < 0 and sellers:
+            residual_sell = max(0, abs(int(curve_delta)) - parsed_sell_total)
+            if residual_sell > 0:
+                _, fallback_sells = _allocate_curve_delta_to_traders(
+                    -residual_sell,
+                    {},
+                    sellers,
+                )
+                for wallet, lamports in fallback_sells.items():
+                    sell_sol_lamports[wallet] = (
+                        sell_sol_lamports.get(wallet, 0) + int(lamports)
+                    )
 
     buyer_sol = {
         buyer: amount / SOL_LAMPORTS_PER_SOL
