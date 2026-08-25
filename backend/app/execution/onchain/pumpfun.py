@@ -1626,13 +1626,45 @@ async def analyze_launch_safety(
             risk += 25
             reasons.append(f"early buy pressure is only {buy_pressure:.0%}")
 
-        # Hard red flags require either strong evidence or several signals.
+        # Hard red flags require strong evidence. Moderate early-wallet
+        # concentration is deferred to the Graduation Hunter when there is
+        # genuine buying momentum and no creator/funder/same-slot red flag.
+        strong_momentum = (
+            buy_pressure is not None
+            and buy_pressure >= 0.60
+            and buy_sell_ratio is not None
+            and buy_sell_ratio >= 1.50
+            and unique_buyers >= 3
+        )
+        moderate_concentration = (
+            strong_momentum
+            and top1_share < 0.80
+            and top3_share < 0.98
+            and max_slot_share < 0.70
+            and max_size_share < 0.80
+            and max_shared_funder_buyers < 3
+            and max_shared_funder_volume_share < 0.45
+            and creator_buy_share < 0.20
+        )
+
         reject = (
             (max_shared_funder_buyers >= 3 and max_shared_funder_volume_share >= 0.45)
             or creator_buy_share >= 0.35
-            or top1_share >= 0.60
-            or (top3_share >= 0.90 and unique_buyers <= 4)
-            or risk >= 55
+            or max_slot_share >= 0.90
+            or (top1_share >= 0.80 and not moderate_concentration)
+            or (top3_share >= 0.98 and not moderate_concentration)
+            or (risk >= 70 and not moderate_concentration)
+            or (
+                top1_share >= 0.60
+                and not moderate_concentration
+                and (
+                    buy_pressure is None
+                    or buy_pressure < 0.60
+                    or buy_sell_ratio is None
+                    or buy_sell_ratio < 1.50
+                    or unique_buyers < 3
+                )
+            )
         )
 
         result.update(
@@ -1641,6 +1673,9 @@ async def analyze_launch_safety(
                 "safe": not reject,
                 "reason": "; ".join(reasons[:4]) if reject else "",
                 "risk_score": min(100, risk),
+                "moderate_concentration_deferred_to_hunter": bool(
+                    moderate_concentration and not reject
+                ),
                 "signals": {
                     "patch_version": PUMPFUN_SAFETY_PATCH_VERSION,
                     "transactions_examined": len(events),
