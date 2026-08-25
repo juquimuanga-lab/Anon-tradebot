@@ -61,12 +61,12 @@ class RuleParams(BaseModel):
     graduation_hunter_target_real_sol: float = 85.0
     graduation_hunter_min_real_sol: float = 3.0
     graduation_hunter_max_real_sol: float = 35.0
-    graduation_hunter_min_buy_sell_ratio: float = 1.5
-    graduation_hunter_min_unique_buyers: int = 5
-    graduation_hunter_min_buyer_diversity: float = 0.20
+    graduation_hunter_min_buy_sell_ratio: float = 1.2
+    graduation_hunter_min_unique_buyers: int = 3
+    graduation_hunter_min_buyer_diversity: float = 0.15
     graduation_hunter_max_top10_buyer_share: float = 1.0
     graduation_hunter_min_holder_growth_per_minute: float = 5.0
-    graduation_hunter_score_threshold: float = 65.0
+    graduation_hunter_score_threshold: float = 60.0
 
 
 @dataclass
