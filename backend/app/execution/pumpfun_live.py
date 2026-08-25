@@ -21,6 +21,7 @@ Security:
   bonding curve program) - only to Jupiter, and only post-migration.
 """
 
+import inspect
 import logging
 from decimal import Decimal, ROUND_DOWN
 
@@ -437,11 +438,43 @@ class PumpFunExecutionAdapter(
                     )
                 )
 
+                async def _on_submitted(submitted_signature: str) -> None:
+                    logger.info(
+                        "pumpfun_buy_submitted",
+                        extra={
+                            "mint": token.mint,
+                            "owner": self._pubkey,
+                            "amount_sol": amount_sol_float,
+                            "amount_lamports": amount_lamports,
+                            "attempt": attempt + 1,
+                            "tx_signature": submitted_signature,
+                            "blockhash": blockhash,
+                            "last_valid_block_height": last_valid_block_height,
+                            "priority_fee_micro_lamports": built.get(
+                                "priority_fee_micro_lamports"
+                            ),
+                            "priority_fee_source": built.get(
+                                "priority_fee_source"
+                            ),
+                        },
+                    )
+
+                # Current and older deployed solana_rpc.py versions may differ.
+                # Only pass on_submitted when the deployed function supports it;
+                # otherwise preserve the existing call signature.
+                send_kwargs = {}
+                try:
+                    if "on_submitted" in inspect.signature(send_and_confirm).parameters:
+                        send_kwargs["on_submitted"] = _on_submitted
+                except (TypeError, ValueError):
+                    pass
+
                 signature = (
                     await send_and_confirm(
                         self._rpc_url,
                         signed,
                         last_valid_block_height,
+                        **send_kwargs,
                     )
                 )
 
@@ -1083,6 +1116,8 @@ class PumpFunExecutionAdapter(
                             attempt + 1
                         ),
                         "error": str(exc),
+                        "error_type": type(exc).__name__,
+                        "execution_stage": "build_or_sign_or_broadcast",
                     },
                 )
 
