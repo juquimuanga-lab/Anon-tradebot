@@ -833,10 +833,20 @@ class PumpFunExecutionAdapter(
                         )
                     )
 
+                    # Jupiter returns a recent blockhash/expiry with the
+                    # built transaction on supported builder versions. Pass
+                    # the expiry through to the shared confirmation loop so
+                    # a post-migration exit cannot wait indefinitely on a
+                    # transaction whose blockhash is no longer valid.
+                    jupiter_last_valid_block_height = built.get(
+                        "last_valid_block_height"
+                    )
+
                     signature = (
                         await send_and_confirm(
                             self._rpc_url,
                             signed,
+                            jupiter_last_valid_block_height,
                         )
                     )
 
@@ -867,6 +877,9 @@ class PumpFunExecutionAdapter(
                             ),
                             "attempt": attempt + 1,
                             "tx_signature": signature,
+                            "last_valid_block_height": (
+                                jupiter_last_valid_block_height
+                            ),
                         },
                     )
 
