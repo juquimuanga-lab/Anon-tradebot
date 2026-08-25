@@ -17,6 +17,7 @@ import asyncio
 import base64
 import logging
 import time
+import inspect
 from typing import Any, Optional
 
 import httpx
@@ -1269,6 +1270,7 @@ async def send_and_confirm(
     rpc_url: str,
     signed_tx_bytes: bytes,
     last_valid_block_height: int | None = None,
+    on_submitted: Any = None,
 ) -> str:
     """Send and track a Solana transaction until success or expiration.
 
@@ -1658,6 +1660,22 @@ async def send_and_confirm(
 
                 send_count += 1
                 last_send_time = now
+
+                # This is the first point where the RPC has actually accepted
+                # the signed transaction and returned a transaction signature.
+                # Callers can use this for precise "submitted" telemetry
+                # without confusing it with a confirmed fill.
+                if on_submitted is not None:
+                    try:
+                        callback_result = on_submitted(signature)
+                        if inspect.isawaitable(callback_result):
+                            await callback_result
+                    except Exception:
+                        logger.warning(
+                            "transaction_submission_callback_failed",
+                            extra={"signature": signature},
+                            exc_info=True,
+                        )
 
                 if returned_signature != signature:
 
