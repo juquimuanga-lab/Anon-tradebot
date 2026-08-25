@@ -70,7 +70,7 @@ class RuleParams(BaseModel):
     graduation_hunter_momentum_override_enabled: bool = True
     graduation_hunter_momentum_min_buy_pressure: float = 0.70
     graduation_hunter_momentum_min_buy_sell_ratio: float = 2.50
-    graduation_hunter_momentum_min_buy_velocity_sol_per_sec: float = 0.40
+    graduation_hunter_momentum_min_buy_velocity_sol_per_sec: float = 0.015
     graduation_hunter_momentum_min_unique_buyers: int = 5
     graduation_hunter_momentum_max_top_buyer_share: float = 0.50
     graduation_hunter_momentum_max_top3_buyer_share: float = 0.85
