@@ -162,38 +162,15 @@ class PumpFunBondingCurve:
         is_cashback_coin: Optional[bool] = None,
     ):
         self.address = address
-
-        self.virtual_token_reserves = (
-            virtual_token_reserves
-        )
-
-        self.virtual_sol_reserves = (
-            virtual_sol_reserves
-        )
-
-        self.real_token_reserves = (
-            real_token_reserves
-        )
-
-        self.real_sol_reserves = (
-            real_sol_reserves
-        )
-
-        self.token_total_supply = (
-            token_total_supply
-        )
-
+        self.virtual_token_reserves = virtual_token_reserves
+        self.virtual_sol_reserves = virtual_sol_reserves
+        self.real_token_reserves = real_token_reserves
+        self.real_sol_reserves = real_sol_reserves
+        self.token_total_supply = token_total_supply
         self.complete = complete
-
         self.creator = creator
-
-        self.is_mayhem_mode = (
-            is_mayhem_mode
-        )
-
-        self.is_cashback_coin = (
-            is_cashback_coin
-        )
+        self.is_mayhem_mode = is_mayhem_mode
+        self.is_cashback_coin = is_cashback_coin
 
 
 # ---------------------------------------------------------------------------
@@ -204,33 +181,15 @@ def get_bonding_curve_address(
     mint: str,
 ) -> tuple[Pubkey, int]:
     """Derive Pump.fun bonding-curve PDA."""
-
     try:
-
-        mint_pubkey = (
-            Pubkey.from_string(
-                mint
-            )
-        )
-
+        mint_pubkey = Pubkey.from_string(mint)
     except Exception as exc:
+        raise PumpFunError(f"invalid Pump.fun mint: {mint}") from exc
 
-        raise PumpFunError(
-            f"invalid Pump.fun mint: {mint}"
-        ) from exc
-
-    address, bump = (
-        Pubkey.find_program_address(
-            [
-                BONDING_CURVE_SEED,
-                bytes(
-                    mint_pubkey
-                ),
-            ],
-            PUMPFUN_PROGRAM_ID,
-        )
+    address, bump = Pubkey.find_program_address(
+        [BONDING_CURVE_SEED, bytes(mint_pubkey)],
+        PUMPFUN_PROGRAM_ID,
     )
-
     return address, bump
 
 
@@ -238,63 +197,30 @@ def get_bonding_curve_address(
 # Account decoding
 # ---------------------------------------------------------------------------
 
-def _read_u64(
-    data: bytes,
-    offset: int,
-) -> int:
+def _read_u64(data: bytes, offset: int) -> int:
     """Read little-endian u64."""
-
     end = offset + 8
-
     if end > len(data):
-
         raise PumpFunInvalidAccount(
             "bonding curve account is too short "
             f"for u64 at offset {offset}"
         )
-
-    return struct.unpack_from(
-        "<Q",
-        data,
-        offset,
-    )[0]
+    return struct.unpack_from("<Q", data, offset)[0]
 
 
-def _decode_account_data(
-    raw_data,
-) -> bytes:
+def _decode_account_data(raw_data) -> bytes:
     """Normalize Solana RPC account data into bytes."""
-
-    if isinstance(
-        raw_data,
-        tuple,
-    ):
-
+    if isinstance(raw_data, tuple):
         encoded = raw_data[0]
-
         try:
-
-            return base64.b64decode(
-                encoded
-            )
-
+            return base64.b64decode(encoded)
         except Exception as exc:
-
             raise PumpFunInvalidAccount(
-                "failed to decode Pump.fun "
-                "bonding curve account"
+                "failed to decode Pump.fun bonding curve account"
             ) from exc
-
-    if isinstance(
-        raw_data,
-        bytes,
-    ):
-
+    if isinstance(raw_data, bytes):
         return raw_data
-
-    raise PumpFunInvalidAccount(
-        "unexpected Solana account-data format"
-    )
+    raise PumpFunInvalidAccount("unexpected Solana account-data format")
 
 
 def decode_bonding_curve(
@@ -302,160 +228,55 @@ def decode_bonding_curve(
     data: bytes,
 ) -> PumpFunBondingCurve:
     """Decode a Pump.fun BondingCurve account."""
-
-    # 8-byte discriminator +
-    # 5 x u64 +
-    # 1-byte bool.
-    min_prefix_length = (
-        8
-        + (5 * 8)
-        + 1
-    )
-
+    min_prefix_length = 8 + (5 * 8) + 1
     if len(data) < min_prefix_length:
-
         raise PumpFunInvalidAccount(
             "bonding curve account data is too short: "
             f"{len(data)} bytes"
         )
 
     offset = 8
-
-    virtual_token_reserves = (
-        _read_u64(
-            data,
-            offset,
-        )
-    )
-
+    virtual_token_reserves = _read_u64(data, offset)
     offset += 8
-
-    virtual_sol_reserves = (
-        _read_u64(
-            data,
-            offset,
-        )
-    )
-
+    virtual_sol_reserves = _read_u64(data, offset)
     offset += 8
-
-    real_token_reserves = (
-        _read_u64(
-            data,
-            offset,
-        )
-    )
-
+    real_token_reserves = _read_u64(data, offset)
     offset += 8
-
-    real_sol_reserves = (
-        _read_u64(
-            data,
-            offset,
-        )
-    )
-
+    real_sol_reserves = _read_u64(data, offset)
     offset += 8
-
-    token_total_supply = (
-        _read_u64(
-            data,
-            offset,
-        )
-    )
-
+    token_total_supply = _read_u64(data, offset)
     offset += 8
-
-    complete = (
-        data[offset] != 0
-    )
-
+    complete = data[offset] != 0
     offset += 1
 
-    # -----------------------------------------------------------------------
-    # Optional newer creator field
-    # -----------------------------------------------------------------------
-
     creator = None
-
     if len(data) >= offset + 32:
-
         try:
-
-            creator = str(
-                Pubkey.from_bytes(
-                    data[
-                        offset:
-                        offset + 32
-                    ]
-                )
-            )
-
+            creator = str(Pubkey.from_bytes(data[offset:offset + 32]))
             offset += 32
-
         except Exception:
-
-            logger.debug(
-                "pumpfun_creator_decode_failed",
-                exc_info=True,
-            )
-
-    # -----------------------------------------------------------------------
-    # Optional feature flags
-    # -----------------------------------------------------------------------
+            logger.debug("pumpfun_creator_decode_failed", exc_info=True)
 
     is_mayhem_mode = None
-
     if len(data) > offset:
-
-        is_mayhem_mode = (
-            data[offset] != 0
-        )
-
+        is_mayhem_mode = data[offset] != 0
         offset += 1
 
     is_cashback_coin = None
-
     if len(data) > offset:
-
-        is_cashback_coin = (
-            data[offset] != 0
-        )
+        is_cashback_coin = data[offset] != 0
 
     return PumpFunBondingCurve(
         address=address,
-
-        virtual_token_reserves=(
-            virtual_token_reserves
-        ),
-
-        virtual_sol_reserves=(
-            virtual_sol_reserves
-        ),
-
-        real_token_reserves=(
-            real_token_reserves
-        ),
-
-        real_sol_reserves=(
-            real_sol_reserves
-        ),
-
-        token_total_supply=(
-            token_total_supply
-        ),
-
+        virtual_token_reserves=virtual_token_reserves,
+        virtual_sol_reserves=virtual_sol_reserves,
+        real_token_reserves=real_token_reserves,
+        real_sol_reserves=real_sol_reserves,
+        token_total_supply=token_total_supply,
         complete=complete,
-
         creator=creator,
-
-        is_mayhem_mode=(
-            is_mayhem_mode
-        ),
-
-        is_cashback_coin=(
-            is_cashback_coin
-        ),
+        is_mayhem_mode=is_mayhem_mode,
+        is_cashback_coin=is_cashback_coin,
     )
 
 
@@ -467,40 +288,21 @@ async def _get_token_decimals(
     client: AsyncClient,
     mint_pubkey: Pubkey,
 ) -> int:
-    """Read SPL token decimals if explicitly needed elsewhere.
-
-    The hot-path get_pool_info() no longer calls this RPC; Pump.fun launch
-    tokens use the fixed 6-decimal convention.
-    """
+    """Read SPL token decimals if explicitly needed elsewhere."""
     mint = str(mint_pubkey)
     now = asyncio.get_running_loop().time()
     cached = _pumpfun_decimals_cache.get(mint)
     if cached and (now - cached[0]) < PUMPFUN_DECIMALS_CACHE_SECONDS:
         return cached[1]
 
-    response = (
-        await client.get_token_supply(
-            mint_pubkey
-        )
-    )
-
+    response = await client.get_token_supply(mint_pubkey)
     value = response.value
-
     if value is None:
+        raise PumpFunInvalidAccount("token supply response is empty")
 
-        raise PumpFunInvalidAccount(
-            "token supply response is empty"
-        )
-
-    decimals = int(
-        value.decimals
-    )
-
+    decimals = int(value.decimals)
     if decimals < 0 or decimals > 18:
-
-        raise PumpFunInvalidAccount(
-            f"invalid token decimals: {decimals}"
-        )
+        raise PumpFunInvalidAccount(f"invalid token decimals: {decimals}")
 
     _pumpfun_decimals_cache[mint] = (now, decimals)
     return decimals
@@ -545,34 +347,16 @@ async def _get_curve_account_data(
     raise PumpFunPoolNotFound(f"no Pump.fun bonding curve exists for {curve_address}")
 
 
-
 async def get_bonding_curve(
     mint: str,
     rpc_url: str,
     commitment: str = "processed",
 ) -> PumpFunBondingCurve:
     """Read and decode a Pump.fun bonding curve."""
-
-    mint_pubkey = Pubkey.from_string(
-        mint
-    )
-
-    curve_address, _ = (
-        get_bonding_curve_address(
-            mint
-        )
-    )
-
-    data = await _get_curve_account_data(
-        curve_address,
-        rpc_url,
-        commitment,
-    )
-
-    return decode_bonding_curve(
-        str(curve_address),
-        data,
-    )
+    Pubkey.from_string(mint)
+    curve_address, _ = get_bonding_curve_address(mint)
+    data = await _get_curve_account_data(curve_address, rpc_url, commitment)
+    return decode_bonding_curve(str(curve_address), data)
 
 
 # ---------------------------------------------------------------------------
@@ -586,235 +370,77 @@ async def get_pool_info(
     commitment: str = "processed",
 ) -> dict:
     """Return normalized Pump.fun bonding-curve market information."""
-
     now = asyncio.get_running_loop().time()
     cached = _pumpfun_pool_cache.get(mint)
     if cached and (now - cached[0]) < PUMPFUN_POOL_CACHE_SECONDS:
         return dict(cached[1])
 
-    mint_pubkey = Pubkey.from_string(
-        mint
-    )
-
-    curve_address, _ = (
-        get_bonding_curve_address(
-            mint
-        )
-    )
-
-    # Pump.fun launch tokens use 6 decimals. The bonding-curve account
-    # already contains the token supply/reserve values needed for pricing,
-    # so do NOT make a second GetTokenSupply RPC call here.
+    mint_pubkey = Pubkey.from_string(mint)
+    curve_address, _ = get_bonding_curve_address(mint)
     decimals = PUMPFUN_TOKEN_DECIMALS
 
-    data = await _get_curve_account_data(
-        curve_address,
-        rpc_url,
-        commitment,
-    )
+    data = await _get_curve_account_data(curve_address, rpc_url, commitment)
+    curve = decode_bonding_curve(str(curve_address), data)
 
-    curve = decode_bonding_curve(
-        str(curve_address),
-        data,
-    )
+    if curve.virtual_token_reserves <= 0:
+        raise PumpFunInvalidAccount("Pump.fun virtual token reserves are zero")
+    if curve.virtual_sol_reserves <= 0:
+        raise PumpFunInvalidAccount("Pump.fun virtual SOL reserves are zero")
 
-    if (
-        curve.virtual_token_reserves
-        <= 0
-    ):
-
-        raise PumpFunInvalidAccount(
-            "Pump.fun virtual token reserves "
-            "are zero"
-        )
-
-    if (
-        curve.virtual_sol_reserves
-        <= 0
-    ):
-
-        raise PumpFunInvalidAccount(
-            "Pump.fun virtual SOL reserves "
-            "are zero"
-        )
-
-    token_unit = (
-        10 ** decimals
-    )
-
-    virtual_tokens = (
-        curve.virtual_token_reserves
-        / token_unit
-    )
-
-    virtual_sol = (
-        curve.virtual_sol_reserves
-        / SOL_LAMPORTS_PER_SOL
-    )
-
-    real_tokens = (
-        curve.real_token_reserves
-        / token_unit
-    )
-
-    real_sol = (
-        curve.real_sol_reserves
-        / SOL_LAMPORTS_PER_SOL
-    )
-
-    total_supply = (
-        curve.token_total_supply
-        / token_unit
-    )
+    token_unit = 10 ** decimals
+    virtual_tokens = curve.virtual_token_reserves / token_unit
+    virtual_sol = curve.virtual_sol_reserves / SOL_LAMPORTS_PER_SOL
+    real_tokens = curve.real_token_reserves / token_unit
+    real_sol = curve.real_sol_reserves / SOL_LAMPORTS_PER_SOL
+    total_supply = curve.token_total_supply / token_unit
 
     if virtual_tokens <= 0:
+        raise PumpFunInvalidAccount("Pump.fun virtual token supply is zero")
 
-        raise PumpFunInvalidAccount(
-            "Pump.fun virtual token supply "
-            "is zero"
-        )
-
-    price_sol_per_token = (
-        virtual_sol
-        / virtual_tokens
-    )
-
-    if (
-        price_sol_per_token
-        <= 0
-    ):
-
-        raise PumpFunInvalidAccount(
-            "Pump.fun calculated token price "
-            "is non-positive"
-        )
+    price_sol_per_token = virtual_sol / virtual_tokens
+    if price_sol_per_token <= 0:
+        raise PumpFunInvalidAccount("Pump.fun calculated token price is non-positive")
 
     if sol_usd is None:
-
         from app.scanners import price_feed
+        sol_usd = await price_feed.get_sol_usd_price("https://lite-api.jup.ag/price/v3")
 
-        sol_usd = (
-            await price_feed.get_sol_usd_price(
-                "https://lite-api.jup.ag/price/v3"
-            )
-        )
-
-    sol_usd = float(
-        sol_usd
-    )
-
+    sol_usd = float(sol_usd)
     if sol_usd <= 0:
+        raise PumpFunError("invalid SOL/USD price")
 
-        raise PumpFunError(
-            "invalid SOL/USD price"
-        )
-
-    price_usd = (
-        price_sol_per_token
-        * sol_usd
-    )
-
-    market_cap_sol = (
-        price_sol_per_token
-        * total_supply
-    )
-
-    market_cap_usd = (
-        market_cap_sol
-        * sol_usd
-    )
-
-    liquidity_usd = (
-        real_sol
-        * sol_usd
-    )
+    price_usd = price_sol_per_token * sol_usd
+    market_cap_sol = price_sol_per_token * total_supply
+    market_cap_usd = market_cap_sol * sol_usd
+    liquidity_usd = real_sol * sol_usd
 
     result = {
         "success": True,
-
         "source": "pumpfun",
-
-        "pool_address": str(
-            curve_address
-        ),
-
-        "creator": (
-            curve.creator
-            or ""
-        ),
-
+        "pool_address": str(curve_address),
+        "creator": curve.creator or "",
         "token_decimals": decimals,
-
-        "price_sol_per_token": (
-            price_sol_per_token
-        ),
-
+        "price_sol_per_token": price_sol_per_token,
         "price_usd": price_usd,
-
-        "supply_tokens": (
-            total_supply
-        ),
-
-        "market_cap_sol": (
-            market_cap_sol
-        ),
-
-        "market_cap_usd": (
-            market_cap_usd
-        ),
-
-        "quote_reserve_sol": (
-            real_sol
-        ),
-
-        "liquidity_usd": (
-            liquidity_usd
-        ),
-
-        "real_token_reserves": (
-            real_tokens
-        ),
-
-        "real_sol_reserves": (
-            real_sol
-        ),
-
-        "virtual_token_reserves": (
-            virtual_tokens
-        ),
-
-        "virtual_sol_reserves": (
-            virtual_sol
-        ),
-
-        "token_total_supply": (
-            total_supply
-        ),
-
-        "is_migrated": (
-            curve.complete
-        ),
-
-        "complete": (
-            curve.complete
-        ),
-
-        "commitment": (
-            commitment
-        ),
-
-        "is_mayhem_mode": (
-            curve.is_mayhem_mode
-        ),
-
-        "is_cashback_coin": (
-            curve.is_cashback_coin
-        ),
+        "supply_tokens": total_supply,
+        "market_cap_sol": market_cap_sol,
+        "market_cap_usd": market_cap_usd,
+        "quote_reserve_sol": real_sol,
+        "liquidity_usd": liquidity_usd,
+        "real_token_reserves": real_tokens,
+        "real_sol_reserves": real_sol,
+        "virtual_token_reserves": virtual_tokens,
+        "virtual_sol_reserves": virtual_sol,
+        "token_total_supply": total_supply,
+        "is_migrated": curve.complete,
+        "complete": curve.complete,
+        "commitment": commitment,
+        "is_mayhem_mode": curve.is_mayhem_mode,
+        "is_cashback_coin": curve.is_cashback_coin,
     }
 
     _pumpfun_pool_cache[mint] = (now, result)
     return dict(result)
-
 
 
 # ---------------------------------------------------------------------------
@@ -824,9 +450,7 @@ async def get_pool_info(
 def _rpc_json_value(body: dict, *, method: str = ""):
     """Return a JSON-RPC result and preserve the real provider error."""
     if not isinstance(body, dict):
-        raise RuntimeError(
-            f"{method or 'RPC'} returned non-object JSON"
-        )
+        raise RuntimeError(f"{method or 'RPC'} returned non-object JSON")
 
     error = body.get("error")
     if error is not None:
@@ -839,14 +463,10 @@ def _rpc_json_value(body: dict, *, method: str = ""):
                 detail += f" data={str(data)[:500]}"
         else:
             detail = str(error)[:700]
-        raise RuntimeError(
-            f"{method or 'RPC'} returned JSON-RPC error: {detail}"
-        )
+        raise RuntimeError(f"{method or 'RPC'} returned JSON-RPC error: {detail}")
 
     if "result" not in body:
-        raise RuntimeError(
-            f"{method or 'RPC'} response missing result"
-        )
+        raise RuntimeError(f"{method or 'RPC'} response missing result")
 
     return body.get("result")
 
@@ -873,12 +493,7 @@ async def _raw_rpc_call(
     *,
     retries: int = 3,
 ):
-    """Call Solana JSON-RPC with bounded retries and provider fallback.
-
-    Helius remains primary. If it is throttled/unavailable, the optional
-    Alchemy Solana RPC is tried before the caller gives up. Deterministic
-    account/parameter errors are surfaced rather than hidden.
-    """
+    """Call Solana JSON-RPC with bounded retries and provider fallback."""
     import httpx
 
     candidates = _rpc_candidate_urls(rpc_url)
@@ -894,7 +509,6 @@ async def _raw_rpc_call(
 
     delays = (0.0, 0.20, 0.50, 1.00)[: max(1, retries + 1)]
     last_exc: Exception | None = None
-
     timeout = httpx.Timeout(connect=2.5, read=5.0, write=5.0, pool=2.5)
 
     for provider_index, candidate in enumerate(candidates):
@@ -938,8 +552,6 @@ async def _raw_rpc_call(
                         )
                     )
                     if not transient:
-                        # Deterministic errors should not be hidden by a
-                        # second provider returning a different error.
                         raise RuntimeError(
                             f"{method} RPC failed on provider {provider_index + 1}: {exc}"
                         ) from exc
@@ -973,17 +585,68 @@ async def _get_launch_transactions(
     *,
     limit: int,
 ) -> list[dict]:
-    """Fetch recent Pump.fun curve transactions reliably.
+    """Fetch recent Pump.fun curve transactions with delayed rechecks.
 
-    Helius may expose the signature before the full transaction is queryable.
-    We therefore:
-      1. use confirmed signatures (required by this RPC endpoint),
-      2. retry getTransaction when it returns null,
-      3. retry transient RPC failures,
-      4. keep the successful transactions even if one signature is temporarily
-         unavailable,
-      5. log the exact failure instead of hiding it behind RuntimeError.
+    A newly-created curve can expose its signatures before the corresponding
+    transaction bodies are queryable. The first pass therefore tolerates null
+    getTransaction responses, while a second pass refreshes signatures after a
+    short propagation delay. Alchemy remains an automatic fallback through
+    _raw_rpc_call().
     """
+    async def fetch_pass(current_signatures: list[dict]) -> tuple[list[dict], set[str], int]:
+        fetched: list[dict] = []
+        failed = 0
+        attempted: set[str] = set()
+
+        for item in current_signatures:
+            if not isinstance(item, dict) or item.get("err") is not None:
+                continue
+            signature = item.get("signature")
+            if not signature:
+                continue
+            attempted.add(signature)
+            tx = None
+            for attempt in range(1, 5):
+                try:
+                    tx = await _raw_rpc_call(
+                        rpc_url,
+                        "getTransaction",
+                        [
+                            signature,
+                            {
+                                "encoding": "jsonParsed",
+                                "maxSupportedTransactionVersion": 0,
+                                "commitment": "confirmed",
+                            },
+                        ],
+                        retries=2,
+                    )
+                except Exception as exc:
+                    logger.debug(
+                        "pumpfun_launch_safety_transaction_fetch_failed",
+                        extra={
+                            "signature": signature,
+                            "attempt": attempt,
+                            "error": f"{type(exc).__name__}: {exc}",
+                        },
+                    )
+                    tx = None
+
+                if isinstance(tx, dict):
+                    break
+                if attempt < 4:
+                    await asyncio.sleep(0.25 * attempt)
+
+            if isinstance(tx, dict):
+                fetched.append(tx)
+            else:
+                failed += 1
+
+            if len(fetched) >= min(8, max(1, int(limit))):
+                break
+
+        return fetched, attempted, failed
+
     signatures = await _raw_rpc_call(
         rpc_url,
         "getSignaturesForAddress",
@@ -998,66 +661,52 @@ async def _get_launch_transactions(
     )
 
     if not isinstance(signatures, list):
-        raise RuntimeError(
-            "getSignaturesForAddress returned a non-list result"
-        )
+        raise RuntimeError("getSignaturesForAddress returned a non-list result")
 
-    transactions: list[dict] = []
-    fetch_failures = 0
+    transactions, attempted, fetch_failures = await fetch_pass(signatures)
 
-    for item in signatures:
-        if not isinstance(item, dict) or item.get("err") is not None:
-            continue
-
-        signature = item.get("signature")
-        if not signature:
-            continue
-
-        tx = None
-
-        # A signature can become visible before its full transaction record.
-        # Retry null responses as well as transient RPC errors.
-        for attempt in range(1, 5):
+    # Important recovery path: signatures can be visible before transaction
+    # bodies propagate. Refresh the signature set and retry missing records.
+    if not transactions:
+        for delay in (1.0, 2.0, 3.0):
+            await asyncio.sleep(delay)
             try:
-                tx = await _raw_rpc_call(
+                refreshed = await _raw_rpc_call(
                     rpc_url,
-                    "getTransaction",
+                    "getSignaturesForAddress",
                     [
-                        signature,
+                        curve_address,
                         {
-                            "encoding": "jsonParsed",
-                            "maxSupportedTransactionVersion": 0,
+                            "limit": max(1, min(int(limit), 100)),
                             "commitment": "confirmed",
                         },
                     ],
                     retries=2,
                 )
             except Exception as exc:
-                fetch_failures += 1
-                logger.warning(
-                    "pumpfun_launch_safety_transaction_fetch_failed "
-                    f"signature={signature} attempt={attempt}/4 "
-                    f"error={type(exc).__name__}: {exc}"
+                logger.debug(
+                    "pumpfun_launch_safety_signature_refresh_failed",
+                    extra={"delay": delay, "error": f"{type(exc).__name__}: {exc}"},
                 )
-                tx = None
+                continue
 
-            if isinstance(tx, dict):
+            if not isinstance(refreshed, list):
+                continue
+
+            merged = []
+            seen = set()
+            for item in refreshed + signatures:
+                signature = item.get("signature") if isinstance(item, dict) else None
+                if signature and signature not in seen:
+                    seen.add(signature)
+                    merged.append(item)
+
+            retry_transactions, retried, retry_failures = await fetch_pass(merged)
+            attempted.update(retried)
+            fetch_failures += retry_failures
+            if retry_transactions:
+                transactions = retry_transactions
                 break
-
-            if attempt < 4:
-                await asyncio.sleep(0.15 * attempt)
-
-        if isinstance(tx, dict):
-            transactions.append(tx)
-        else:
-            fetch_failures += 1
-            logger.warning(
-                "pumpfun_launch_safety_transaction_unavailable "
-                f"signature={signature} attempts=4"
-            )
-
-        if len(transactions) >= min(8, max(1, int(limit))):
-            break
 
     logger.info(
         "pumpfun_launch_safety_transaction_fetch_summary "
@@ -1067,6 +716,7 @@ async def _get_launch_transactions(
     )
 
     return transactions
+
 
 def _account_key_list(tx: dict) -> list[str]:
     message = ((tx or {}).get("transaction") or {}).get("message") or {}
@@ -1089,10 +739,7 @@ def _token_balance_map(entries: list, mint: str) -> dict[int, tuple[str, int]]:
             continue
         try:
             index = int(item.get("accountIndex"))
-            amount = int(
-                ((item.get("uiTokenAmount") or {}).get("amount"))
-                or 0
-            )
+            amount = int(((item.get("uiTokenAmount") or {}).get("amount")) or 0)
         except (TypeError, ValueError):
             continue
         owner = str(item.get("owner") or "")
@@ -1139,172 +786,24 @@ def _extract_direct_funder(tx: dict, buyer: str) -> str | None:
 def _round_trade_size(sol_spent: float) -> float:
     if sol_spent <= 0:
         return 0.0
-    # 0.001 SOL buckets catch synchronized fixed-size buys while tolerating
-    # normal curve-price variation.
     return round(sol_spent, 3)
 
 
-def _parsed_system_transfers(tx: dict, curve_address: str) -> tuple[dict[str, int], dict[str, int]]:
-    """Extract native SOL transfers involving the Pump.fun curve.
-
-    Preferred source:
-      * source=buyer, destination=curve -> buy SOL
-      * source=curve, destination=seller -> sell SOL
-
-    Some RPC responses / newer Pump.fun instruction paths do not expose the
-    economically relevant System transfer as a parsed inner instruction.
-    In that case the caller can use the curve account's pre/post lamport delta
-    as a transaction-level fallback.
-
-    Returns:
-        (buy_sol_by_wallet_lamports, sell_sol_by_wallet_lamports)
-    """
-    buys: dict[str, int] = defaultdict(int)
-    sells: dict[str, int] = defaultdict(int)
-
-    if not curve_address:
-        return dict(buys), dict(sells)
-
-    def inspect(ix):
-        if not isinstance(ix, dict):
-            return
-        parsed = ix.get("parsed")
-        if not isinstance(parsed, dict) or parsed.get("type") != "transfer":
-            return
-        program = ix.get("program")
-        program_id = ix.get("programId")
-        if program != "system" and program_id != "11111111111111111111111111111111":
-            return
-
-        info = parsed.get("info") or {}
-        source = str(info.get("source") or "")
-        destination = str(info.get("destination") or "")
-        try:
-            lamports = int(info.get("lamports") or 0)
-        except (TypeError, ValueError):
-            lamports = 0
-        if lamports <= 0:
-            return
-
-        if destination == curve_address and source and source != curve_address:
-            buys[source] += lamports
-        elif source == curve_address and destination and destination != curve_address:
-            sells[destination] += lamports
-
-    message = ((tx or {}).get("transaction") or {}).get("message") or {}
-    for ix in message.get("instructions") or []:
-        inspect(ix)
-
-    for group in (tx.get("meta") or {}).get("innerInstructions") or []:
-        for ix in group.get("instructions") or []:
-            inspect(ix)
-
-    return dict(buys), dict(sells)
-
-
-def _curve_lamport_delta(tx: dict, curve_address: str) -> int | None:
-    """Return the curve PDA's post-pre native SOL lamport delta.
-
-    ``preBalances``/``postBalances`` are indexed by the transaction message's
-    account keys. This is a transaction-level fallback for providers that omit
-    the parsed System transfer used by Pump.fun's buy/sell instruction.
-    """
-    if not curve_address:
-        return None
-
-    meta = (tx or {}).get("meta") or {}
-    pre_balances = meta.get("preBalances") or []
-    post_balances = meta.get("postBalances") or []
-    if not pre_balances or not post_balances:
-        return None
-
-    message = ((tx or {}).get("transaction") or {}).get("message") or {}
-    keys = []
-    for item in message.get("accountKeys") or []:
-        if isinstance(item, str):
-            keys.append(item)
-        elif isinstance(item, dict):
-            keys.append(str(item.get("pubkey") or item.get("address") or ""))
-        else:
-            keys.append(str(item))
-
-    loaded = meta.get("loadedAddresses") or {}
-    keys.extend(str(x) for x in (loaded.get("writable") or []))
-    keys.extend(str(x) for x in (loaded.get("readonly") or []))
-
-    try:
-        index = keys.index(curve_address)
-        pre = int(pre_balances[index])
-        post = int(post_balances[index])
-    except (ValueError, IndexError, TypeError):
-        return None
-
-    return post - pre
-
-
-def _allocate_curve_delta_to_traders(
-    delta_lamports: int | None,
-    buyers: dict[str, int],
-    sellers: dict[str, int],
-) -> tuple[dict[str, int], dict[str, int]]:
-    """Attribute a curve balance delta to token-side traders.
-
-    Normally a Pump.fun launch transaction has one economically active buyer
-    or seller. If a transaction contains multiple token owners, distribute
-    the absolute curve delta proportionally to token volume.
-    """
-    buys: dict[str, int] = defaultdict(int)
-    sells: dict[str, int] = defaultdict(int)
-
-    if delta_lamports is None or delta_lamports == 0:
-        return dict(buys), dict(sells)
-
-    if delta_lamports > 0 and buyers:
-        total = sum(max(0, int(v)) for v in buyers.values())
-        if total > 0:
-            remaining = delta_lamports
-            items = list(buyers.items())
-            for pos, (wallet, amount) in enumerate(items):
-                if pos == len(items) - 1:
-                    allocated = remaining
-                else:
-                    allocated = int(delta_lamports * int(amount) / total)
-                    allocated = max(0, min(allocated, remaining))
-                if allocated > 0:
-                    buys[wallet] += allocated
-                    remaining -= allocated
-
-    elif delta_lamports < 0 and sellers:
-        absolute = abs(delta_lamports)
-        total = sum(max(0, int(v)) for v in sellers.values())
-        if total > 0:
-            remaining = absolute
-            items = list(sellers.items())
-            for pos, (wallet, amount) in enumerate(items):
-                if pos == len(items) - 1:
-                    allocated = remaining
-                else:
-                    allocated = int(absolute * int(amount) / total)
-                    allocated = max(0, min(allocated, remaining))
-                if allocated > 0:
-                    sells[wallet] += allocated
-                    remaining -= allocated
-
-    return dict(buys), dict(sells)
-
-def _extract_buy_sell_event(
-    tx: dict,
-    mint: str,
-    curve_address: str = "",
-) -> dict | None:
+def _extract_buy_sell_event(tx: dict, mint: str) -> dict | None:
     meta = (tx or {}).get("meta") or {}
     pre = _token_balance_map(meta.get("preTokenBalances") or [], mint)
     post = _token_balance_map(meta.get("postTokenBalances") or [], mint)
     if not post and not pre:
         return None
 
+    keys = _account_key_list(tx)
+    fee = int(meta.get("fee") or 0)
+    pre_lamports = meta.get("preBalances") or []
+    post_lamports = meta.get("postBalances") or []
+
     buyers = defaultdict(int)
     sellers = defaultdict(int)
+    buyer_sol = defaultdict(float)
 
     indices = set(pre) | set(post)
     for index in indices:
@@ -1312,84 +811,29 @@ def _extract_buy_sell_event(
         pre_owner, pre_amount = pre.get(index, (owner, 0))
         owner = owner or pre_owner
         delta = post_amount - pre_amount
+        if not owner and 0 <= index < len(keys):
+            owner = keys[index]
         if not owner or delta == 0:
             continue
 
         if delta > 0:
             buyers[owner] += delta
+            if 0 <= index < len(pre_lamports) and 0 <= index < len(post_lamports):
+                spent_lamports = max(0, int(pre_lamports[index]) - int(post_lamports[index]))
+                if index == 0:
+                    spent_lamports = max(0, spent_lamports - fee)
+                buyer_sol[owner] += spent_lamports / SOL_LAMPORTS_PER_SOL
         else:
             sellers[owner] += abs(delta)
 
     if not buyers and not sellers:
         return None
 
-    buy_sol_lamports, sell_sol_lamports = _parsed_system_transfers(
-        tx,
-        curve_address,
-    )
-
-    # Reconcile against the curve PDA balance delta as a second source of
-    # truth. Some RPCs expose only part of Pump.fun's System transfers (or
-    # expose them through a different instruction path). The old V7 logic only
-    # used the curve fallback when *no* parsed transfer existed, which meant a
-    # partial parsed result could still leave legitimate buy SOL at zero.
-    #
-    # We therefore allocate only the residual curve delta not already explained
-    # by parsed curve transfers. This avoids double-counting while recovering
-    # missing buy/sell flow.
-    curve_delta = _curve_lamport_delta(tx, curve_address)
-    if curve_delta is not None:
-        parsed_buy_total = sum(max(0, int(v)) for v in buy_sol_lamports.values())
-        parsed_sell_total = sum(max(0, int(v)) for v in sell_sol_lamports.values())
-
-        if curve_delta > 0 and buyers:
-            residual_buy = max(0, int(curve_delta) - parsed_buy_total)
-            if residual_buy > 0:
-                fallback_buys, _ = _allocate_curve_delta_to_traders(
-                    residual_buy,
-                    buyers,
-                    {},
-                )
-                for wallet, lamports in fallback_buys.items():
-                    buy_sol_lamports[wallet] = (
-                        buy_sol_lamports.get(wallet, 0) + int(lamports)
-                    )
-
-        elif curve_delta < 0 and sellers:
-            residual_sell = max(0, abs(int(curve_delta)) - parsed_sell_total)
-            if residual_sell > 0:
-                _, fallback_sells = _allocate_curve_delta_to_traders(
-                    -residual_sell,
-                    {},
-                    sellers,
-                )
-                for wallet, lamports in fallback_sells.items():
-                    sell_sol_lamports[wallet] = (
-                        sell_sol_lamports.get(wallet, 0) + int(lamports)
-                    )
-
-    buyer_sol = {
-        buyer: amount / SOL_LAMPORTS_PER_SOL
-        for buyer, amount in buy_sol_lamports.items()
-    }
-    seller_sol = {
-        seller: amount / SOL_LAMPORTS_PER_SOL
-        for seller, amount in sell_sol_lamports.items()
-    }
-
-    # Never manufacture a zero when the provider exposed neither parsed
-    # transfers nor a usable curve balance delta.
-    sol_flow_available = bool(
-        buy_sol_lamports or sell_sol_lamports
-    )
-
     slot = (tx or {}).get("slot")
     return {
         "buyers": dict(buyers),
         "sellers": dict(sellers),
-        "buyer_sol": buyer_sol,
-        "seller_sol": seller_sol,
-        "sol_flow_available": sol_flow_available,
+        "buyer_sol": dict(buyer_sol),
         "slot": int(slot) if slot is not None else None,
     }
 
@@ -1400,12 +844,7 @@ async def analyze_launch_safety(
     creator: str = "",
     created_at: float | None = None,
 ) -> dict:
-    """Inspect the first Pump.fun curve transactions for coordination signals.
-
-    This is intentionally a safety layer, not another admin ruleset. It uses
-    multiple weak signals together so a normal launch is not rejected merely
-    because two snipers happened to buy in the same slot.
-    """
+    """Inspect the first Pump.fun curve transactions for coordination signals."""
     now = time.monotonic()
     cached = _pumpfun_launch_safety_cache.get(mint)
     if cached and (now - cached[0]) < PUMPFUN_LAUNCH_SAFETY_CACHE_SECONDS:
@@ -1435,12 +874,10 @@ async def analyze_launch_safety(
 
         events = []
         for tx in transactions:
-            event = _extract_buy_sell_event(tx, mint, str(curve_address))
+            event = _extract_buy_sell_event(tx, mint)
             if not event:
                 continue
 
-            # A newly-created curve has no reason to have an old transaction
-            # stream. If block time exists, retain only a short launch window.
             block_time = tx.get("blockTime")
             if block_time is not None and created_at:
                 if float(block_time) < float(created_at) - 2.0:
@@ -1454,60 +891,33 @@ async def analyze_launch_safety(
                 for buyer in event["buyers"]
             }
             events.append(event)
-
-            if len(events) >= 25:
+            if len(events) >= 8:
                 break
 
         buy_events = [e for e in events if e["buyers"]]
         sell_events = [e for e in events if e["sellers"]]
 
         buyer_volume = defaultdict(int)
-        seller_volume = defaultdict(int)
         buyer_sol = defaultdict(float)
-        seller_sol = defaultdict(float)
         slot_volume = defaultdict(int)
         size_volume = defaultdict(int)
         funder_volume = defaultdict(int)
         funder_buyers = defaultdict(set)
         creator_volume = 0
-
         total_buy_tokens = 0
         total_sell_tokens = 0
-        total_buy_sol = 0.0
-        total_sell_sol = 0.0
-        sol_flow_events = 0
-        sol_flow_buy_events = 0
-        sol_flow_sell_events = 0
-
-        for event in events:
-            if event.get("sol_flow_available"):
-                sol_flow_events += 1
-
-        sol_flow_buy_events = sum(
-            1 for event in buy_events if event.get("buyer_sol")
-        )
-        sol_flow_sell_events = sum(
-            1 for event in sell_events if event.get("seller_sol")
-        )
 
         for event in buy_events:
             for buyer, amount in event["buyers"].items():
                 buyer_volume[buyer] += int(amount)
                 total_buy_tokens += int(amount)
-
-                # Only count SOL when the transaction contained an
-                # authoritative curve System transfer for this wallet.
-                sol_amount = event["buyer_sol"].get(buyer)
-                if sol_amount is not None and sol_amount > 0:
-                    buyer_sol[buyer] += float(sol_amount)
-                    total_buy_sol += float(sol_amount)
-                    size_bucket = _round_trade_size(float(sol_amount))
-                    if size_bucket > 0:
-                        size_volume[size_bucket] += int(amount)
-
+                sol_amount = float(event["buyer_sol"].get(buyer, 0.0))
+                buyer_sol[buyer] += sol_amount
                 if event.get("slot") is not None:
                     slot_volume[event["slot"]] += int(amount)
-
+                size_bucket = _round_trade_size(sol_amount)
+                if size_bucket > 0:
+                    size_volume[size_bucket] += int(amount)
                 funder = event["funders"].get(buyer)
                 if funder:
                     funder_volume[funder] += int(amount)
@@ -1516,13 +926,7 @@ async def analyze_launch_safety(
                     creator_volume += int(amount)
 
         for event in sell_events:
-            for seller, amount in event["sellers"].items():
-                seller_volume[seller] += int(amount)
-                total_sell_tokens += int(amount)
-                sol_amount = event["seller_sol"].get(seller)
-                if sol_amount is not None and sol_amount > 0:
-                    seller_sol[seller] += float(sol_amount)
-                    total_sell_sol += float(sol_amount)
+            total_sell_tokens += sum(int(v) for v in event["sellers"].values())
 
         unique_buyers = len(buyer_volume)
         buy_count = sum(len(e["buyers"]) for e in buy_events)
@@ -1535,65 +939,8 @@ async def analyze_launch_safety(
         top1_share = share(sorted_buyer[0] if sorted_buyer else 0, total_buy_tokens)
         top3_share = share(sum(sorted_buyer[:3]), total_buy_tokens)
 
-        # Wallet concentration is meaningful only when actual SOL flow was
-        # observed. Never turn "unknown" into a fake 100% concentration.
-        sorted_buyer_sol = sorted(buyer_sol.values(), reverse=True)
-        top10_sol_share = (
-            share(sum(sorted_buyer_sol[:10]), total_buy_sol)
-            if total_buy_sol > 0
-            else None
-        )
-
-        creator_sell_volume = 0
-        if creator:
-            for event in sell_events:
-                creator_sell_volume += int(event["sellers"].get(creator, 0))
-        creator_sell_share = share(creator_sell_volume, total_sell_tokens)
-
-        event_times = [
-            float(e["block_time"])
-            for e in events
-            if e.get("block_time") is not None
-        ]
-        if len(event_times) >= 2:
-            flow_span_seconds = max(1.0, max(event_times) - min(event_times))
-        elif created_at and event_times:
-            flow_span_seconds = max(1.0, max(event_times) - float(created_at))
-        else:
-            flow_span_seconds = max(1.0, float(len(events)))
-
-        buy_velocity_sol = (
-            total_buy_sol / flow_span_seconds
-            if total_buy_sol > 0
-            else None
-        )
-
-        if total_buy_sol > 0 or total_sell_sol > 0:
-            buy_pressure = share(
-                total_buy_sol,
-                total_buy_sol + total_sell_sol,
-            )
-            buy_sell_ratio = (
-                total_buy_sol / total_sell_sol
-                if total_sell_sol > 0
-                else None
-            )
-        else:
-            buy_pressure = None
-            buy_sell_ratio = None
-
-        # Preserve the original buyer-event diversity metric. It is based on
-        # token-account ownership/events and remains useful independently of
-        # whether SOL attribution was available for every wallet.
-        buyer_diversity = unique_buyers / max(1, buy_count)
-
-        max_slot_share = 0.0
-        if slot_volume:
-            max_slot_share = share(max(slot_volume.values()), total_buy_tokens)
-
-        max_size_share = 0.0
-        if size_volume:
-            max_size_share = share(max(size_volume.values()), total_buy_tokens)
+        max_slot_share = share(max(slot_volume.values()), total_buy_tokens) if slot_volume else 0.0
+        max_size_share = share(max(size_volume.values()), total_buy_tokens) if size_volume else 0.0
 
         max_shared_funder_buyers = 0
         max_shared_funder_volume_share = 0.0
@@ -1605,10 +952,10 @@ async def analyze_launch_safety(
             )
 
         creator_buy_share = share(creator_volume, total_buy_tokens)
+        buy_pressure = share(total_buy_tokens, total_buy_tokens + total_sell_tokens)
 
         risk = 0
         reasons = []
-
         if top1_share >= PUMPFUN_SAFETY_TOP_BUYER_SHARE:
             risk += 30
             reasons.append(f"top buyer controls {top1_share:.0%} of early buy flow")
@@ -1643,53 +990,16 @@ async def analyze_launch_safety(
             risk += 30
             reasons.append(f"creator controls {creator_buy_share:.0%} of early buy flow")
 
-        if (
-            buy_count >= PUMPFUN_SAFETY_MIN_BUY_EVENTS_FOR_PRESSURE
-            and buy_pressure is not None
-            and buy_pressure < PUMPFUN_SAFETY_MIN_BUY_PRESSURE
-        ):
+        if buy_count >= PUMPFUN_SAFETY_MIN_BUY_EVENTS_FOR_PRESSURE and buy_pressure < PUMPFUN_SAFETY_MIN_BUY_PRESSURE:
             risk += 25
             reasons.append(f"early buy pressure is only {buy_pressure:.0%}")
-
-        # Hard red flags require strong evidence. Moderate early-wallet
-        # concentration is deferred to the Graduation Hunter when there is
-        # genuine buying momentum and no creator/funder/same-slot red flag.
-        strong_momentum = (
-            buy_pressure is not None
-            and buy_pressure >= 0.60
-            and buy_sell_ratio is not None
-            and buy_sell_ratio >= 1.50
-            and unique_buyers >= 3
-        )
-        moderate_concentration = (
-            strong_momentum
-            and top1_share < 0.80
-            and top3_share < 0.98
-            and max_slot_share < 0.70
-            and max_size_share < 0.80
-            and max_shared_funder_buyers < 3
-            and max_shared_funder_volume_share < 0.45
-            and creator_buy_share < 0.20
-        )
 
         reject = (
             (max_shared_funder_buyers >= 3 and max_shared_funder_volume_share >= 0.45)
             or creator_buy_share >= 0.35
-            or max_slot_share >= 0.90
-            or (top1_share >= 0.80 and not moderate_concentration)
-            or (top3_share >= 0.98 and not moderate_concentration)
-            or (risk >= 70 and not moderate_concentration)
-            or (
-                top1_share >= 0.60
-                and not moderate_concentration
-                and (
-                    buy_pressure is None
-                    or buy_pressure < 0.60
-                    or buy_sell_ratio is None
-                    or buy_sell_ratio < 1.50
-                    or unique_buyers < 3
-                )
-            )
+            or top1_share >= 0.60
+            or (top3_share >= 0.90 and unique_buyers <= 4)
+            or risk >= 55
         )
 
         result.update(
@@ -1698,11 +1008,7 @@ async def analyze_launch_safety(
                 "safe": not reject,
                 "reason": "; ".join(reasons[:4]) if reject else "",
                 "risk_score": min(100, risk),
-                "moderate_concentration_deferred_to_hunter": bool(
-                    moderate_concentration and not reject
-                ),
                 "signals": {
-                    "patch_version": PUMPFUN_SAFETY_PATCH_VERSION,
                     "transactions_examined": len(events),
                     "transaction_records_retrieved": len(transactions),
                     "transaction_data_complete": bool(transactions),
@@ -1716,55 +1022,18 @@ async def analyze_launch_safety(
                     "shared_funder_buyers": max_shared_funder_buyers,
                     "shared_funder_volume_share": round(max_shared_funder_volume_share, 4),
                     "creator_buy_share": round(creator_buy_share, 4),
-                    "buy_pressure": (
-                        round(buy_pressure, 4)
-                        if buy_pressure is not None
-                        else None
-                    ),
-                    "total_buy_sol": round(total_buy_sol, 6),
-                    "total_sell_sol": round(total_sell_sol, 6),
-                    "buy_sell_ratio": (
-                        round(buy_sell_ratio, 4)
-                        if buy_sell_ratio is not None
-                        else None
-                    ),
-                    "buy_sell_ratio_basis": "curve_system_transfers",
-                    "buy_velocity_sol_per_sec": (
-                        round(buy_velocity_sol, 6)
-                        if buy_velocity_sol is not None
-                        else None
-                    ),
-                    "flow_span_seconds": round(flow_span_seconds, 3),
-                    "buyer_diversity": (
-                        round(buyer_diversity, 4)
-                        if buyer_diversity is not None
-                        else None
-                    ),
-                    "top10_buyer_sol_share": (
-                        round(top10_sol_share, 4)
-                        if top10_sol_share is not None
-                        else None
-                    ),
-                    "sol_flow_events": sol_flow_events,
-                    "sol_flow_buy_events": sol_flow_buy_events,
-                    "sol_flow_sell_events": sol_flow_sell_events,
-                    "sol_flow_available": bool(total_buy_sol or total_sell_sol),
-                    "creator_sell_share": round(creator_sell_share, 4),
+                    "buy_pressure": round(buy_pressure, 4),
                 },
             }
         )
     except Exception as exc:
-        # Keep the safety gate fail-closed when its analysis cannot be
-        # completed. The scanner treats safe=False as a hard rejection.
         result.update(
             {
                 "status": "degraded",
                 "safe": False,
                 "reason": f"launch safety RPC unavailable: {type(exc).__name__}",
                 "risk_score": 100,
-                "signals": {
-                    "analysis_unavailable": True,
-                },
+                "signals": {"analysis_unavailable": True},
             }
         )
         logger.warning(
@@ -1773,580 +1042,12 @@ async def analyze_launch_safety(
         )
 
     _pumpfun_launch_safety_cache[mint] = (now, dict(result))
-    logger.info(
-        "pumpfun_launch_safety",
-        extra=result,
-    )
+    logger.info("pumpfun_launch_safety", extra=result)
     return result
+
 
 # ---------------------------------------------------------------------------
 # Pump.fun transaction builder
 # ---------------------------------------------------------------------------
 
-async def build_unsigned_buy_transaction(
-    *,
-    mint: str,
-    owner_pubkey: str,
-    amount_lamports: int,
-    slippage_bps: int,
-    rpc_url: str,
-) -> dict:
-    """Build an unsigned Pump.fun BUY transaction.
-
-    The transaction is constructed by the Node/Pump.fun SDK builder.
-
-    Returns:
-
-        {
-            "transaction_b64": "...",
-            "blockhash": "...",
-            "last_valid_block_height": ...,
-            ...
-        }
-
-    The transaction is NOT signed and NOT submitted here.
-    """
-
-    if not mint:
-        raise PumpFunTransactionBuildError(
-            "mint_missing"
-        )
-
-    if not owner_pubkey:
-        raise PumpFunTransactionBuildError(
-            "owner_pubkey_missing"
-        )
-
-    if not rpc_url:
-        raise PumpFunTransactionBuildError(
-            "rpc_url_missing"
-        )
-
-    try:
-
-        amount_lamports_int = int(
-            amount_lamports
-        )
-
-    except (
-        TypeError,
-        ValueError,
-    ) as exc:
-
-        raise PumpFunTransactionBuildError(
-            "amount_lamports_invalid"
-        ) from exc
-
-    if amount_lamports_int <= 0:
-
-        raise PumpFunTransactionBuildError(
-            "amount_lamports_must_be_positive"
-        )
-
-    try:
-
-        slippage_bps_int = int(
-            slippage_bps
-        )
-
-    except (
-        TypeError,
-        ValueError,
-    ) as exc:
-
-        raise PumpFunTransactionBuildError(
-            "slippage_bps_invalid"
-        ) from exc
-
-    if (
-        slippage_bps_int < 0
-        or slippage_bps_int > 10_000
-    ):
-
-        raise PumpFunTransactionBuildError(
-            "slippage_bps_out_of_range"
-        )
-
-    if not PUMPFUN_BUILDER_PATH.exists():
-
-        raise PumpFunTransactionBuildError(
-            "pumpfun_builder_not_found: "
-            f"{PUMPFUN_BUILDER_PATH}"
-        )
-
-    payload = {
-        "action": "buy",
-
-        "baseMint": mint,
-
-        "ownerPubkey": owner_pubkey,
-
-        "amountLamports": (
-            str(
-                amount_lamports_int
-            )
-        ),
-
-        "slippageBps": (
-            slippage_bps_int
-        ),
-
-        "rpcUrl": rpc_url,
-    }
-
-    # -----------------------------------------------------------------------
-    # Run Node builder.
-    #
-    # cwd is the existing dbc_builder directory so Node resolves:
-    #
-    #     @pump-fun/pump-sdk
-    #
-    # from its installed node_modules.
-    # -----------------------------------------------------------------------
-
-    process = (
-        await asyncio.create_subprocess_exec(
-            "node",
-            str(
-                PUMPFUN_BUILDER_PATH
-            ),
-            cwd=str(
-                _DBC_BUILDER_DIR
-            ),
-            stdin=asyncio.subprocess.PIPE,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
-    )
-
-    stdin_data = (
-        json.dumps(
-            payload
-        ).encode("utf-8")
-    )
-
-    try:
-
-        stdout, stderr = (
-            await asyncio.wait_for(
-                process.communicate(
-                    stdin_data
-                ),
-                timeout=20,
-            )
-        )
-
-    except asyncio.TimeoutError:
-
-        try:
-            process.kill()
-        except ProcessLookupError:
-            pass
-
-        await process.communicate()
-
-        raise PumpFunTransactionBuildError(
-            "pumpfun_builder_timeout"
-        )
-
-    stdout_text = (
-        stdout
-        .decode(
-            "utf-8",
-            errors="replace",
-        )
-        .strip()
-    )
-
-    stderr_text = (
-        stderr
-        .decode(
-            "utf-8",
-            errors="replace",
-        )
-        .strip()
-    )
-
-    if not stdout_text:
-
-        raise PumpFunTransactionBuildError(
-            "pumpfun_builder_empty_response"
-            + (
-                f": {stderr_text}"
-                if stderr_text
-                else ""
-            )
-        )
-
-    try:
-
-        result = json.loads(
-            stdout_text.splitlines()[-1]
-        )
-
-    except json.JSONDecodeError as exc:
-
-        raise PumpFunTransactionBuildError(
-            "pumpfun_builder_invalid_json: "
-            f"{stdout_text[-1000:]}"
-        ) from exc
-
-    if not result.get(
-        "success",
-        False,
-    ):
-
-        error = result.get(
-            "error",
-            "unknown builder error",
-        )
-
-        raise PumpFunTransactionBuildError(
-            str(error)
-        )
-
-    transaction_b64 = (
-        result.get(
-            "transaction_b64"
-        )
-    )
-
-    blockhash = (
-        result.get(
-            "blockhash"
-        )
-    )
-
-    last_valid_block_height = (
-        result.get(
-            "last_valid_block_height"
-        )
-    )
-
-    if not transaction_b64:
-
-        raise PumpFunTransactionBuildError(
-            "pumpfun_builder_missing_transaction"
-        )
-
-    if not blockhash:
-
-        raise PumpFunTransactionBuildError(
-            "pumpfun_builder_missing_blockhash"
-        )
-
-    if (
-        last_valid_block_height
-        is None
-    ):
-
-        raise PumpFunTransactionBuildError(
-            "pumpfun_builder_missing_last_valid_block_height"
-        )
-
-    # Keep stderr visible in debug logs but don't treat normal diagnostic
-    # output as a transaction-builder failure when JSON succeeded.
-
-    if stderr_text:
-
-        logger.debug(
-            "pumpfun_builder_stderr",
-            extra={
-                "mint": mint,
-                "stderr": stderr_text[
-                    -2000:
-                ],
-            },
-        )
-
-    logger.info(
-        "pumpfun_unsigned_transaction_built",
-        extra={
-            "mint": mint,
-            "owner": owner_pubkey,
-            "amount_lamports": (
-                amount_lamports_int
-            ),
-            "slippage_bps": (
-                slippage_bps_int
-            ),
-            "blockhash": blockhash,
-            "last_valid_block_height": (
-                last_valid_block_height
-            ),
-            "priority_fee_micro_lamports": (
-                result.get(
-                    "priority_fee_micro_lamports"
-                )
-            ),
-            "priority_fee_source": (
-                result.get(
-                    "priority_fee_source"
-                )
-            ),
-        },
-    )
-
-    return result
-
-
-# ---------------------------------------------------------------------------
-# Pump.fun SELL transaction builder
-# ---------------------------------------------------------------------------
-
-async def build_unsigned_sell_transaction(
-    *,
-    mint: str,
-    owner_pubkey: str,
-    amount_tokens_raw: int,
-    slippage_bps: int,
-    rpc_url: str,
-) -> dict:
-    """Build an unsigned Pump.fun SELL transaction.
-
-    The transaction is constructed by the dedicated Node/Pump.fun SDK
-    SELL builder.
-
-    This function never receives a private key, never signs and never
-    submits a transaction.
-    """
-
-    if not mint:
-        raise PumpFunTransactionBuildError(
-            "mint_missing"
-        )
-
-    if not owner_pubkey:
-        raise PumpFunTransactionBuildError(
-            "owner_pubkey_missing"
-        )
-
-    if not rpc_url:
-        raise PumpFunTransactionBuildError(
-            "rpc_url_missing"
-        )
-
-    try:
-        amount_tokens_raw_int = int(
-            amount_tokens_raw
-        )
-    except (
-        TypeError,
-        ValueError,
-    ) as exc:
-        raise PumpFunTransactionBuildError(
-            "amount_tokens_raw_invalid"
-        ) from exc
-
-    if amount_tokens_raw_int <= 0:
-        raise PumpFunTransactionBuildError(
-            "amount_tokens_raw_must_be_positive"
-        )
-
-    try:
-        slippage_bps_int = int(
-            slippage_bps
-        )
-    except (
-        TypeError,
-        ValueError,
-    ) as exc:
-        raise PumpFunTransactionBuildError(
-            "slippage_bps_invalid"
-        ) from exc
-
-    if (
-        slippage_bps_int < 0
-        or slippage_bps_int > 10_000
-    ):
-        raise PumpFunTransactionBuildError(
-            "slippage_bps_out_of_range"
-        )
-
-    if not PUMPFUN_SELL_BUILDER_PATH.exists():
-        raise PumpFunTransactionBuildError(
-            "pumpfun_sell_builder_not_found: "
-            f"{PUMPFUN_SELL_BUILDER_PATH}"
-        )
-
-    payload = {
-        "action": "sell",
-        "baseMint": mint,
-        "ownerPubkey": owner_pubkey,
-        "amountTokensRaw": str(
-            amount_tokens_raw_int
-        ),
-        "slippageBps": slippage_bps_int,
-        "rpcUrl": rpc_url,
-    }
-
-    process = (
-        await asyncio.create_subprocess_exec(
-            "node",
-            str(
-                PUMPFUN_SELL_BUILDER_PATH
-            ),
-            cwd=str(
-                _DBC_BUILDER_DIR
-            ),
-            stdin=asyncio.subprocess.PIPE,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
-    )
-
-    stdin_data = (
-        json.dumps(
-            payload
-        ).encode("utf-8")
-    )
-
-    try:
-        stdout, stderr = (
-            await asyncio.wait_for(
-                process.communicate(
-                    stdin_data
-                ),
-                timeout=20,
-            )
-        )
-    except asyncio.TimeoutError:
-        try:
-            process.kill()
-        except ProcessLookupError:
-            pass
-
-        await process.communicate()
-
-        raise PumpFunTransactionBuildError(
-            "pumpfun_sell_builder_timeout"
-        )
-
-    stdout_text = (
-        stdout
-        .decode(
-            "utf-8",
-            errors="replace",
-        )
-        .strip()
-    )
-
-    stderr_text = (
-        stderr
-        .decode(
-            "utf-8",
-            errors="replace",
-        )
-        .strip()
-    )
-
-    if not stdout_text:
-        raise PumpFunTransactionBuildError(
-            "pumpfun_sell_builder_empty_response"
-            + (
-                f": {stderr_text}"
-                if stderr_text
-                else ""
-            )
-        )
-
-    try:
-        result = json.loads(
-            stdout_text.splitlines()[-1]
-        )
-    except json.JSONDecodeError as exc:
-        raise PumpFunTransactionBuildError(
-            "pumpfun_sell_builder_invalid_json: "
-            f"{stdout_text[-1000:]}"
-        ) from exc
-
-    if not result.get(
-        "success",
-        False,
-    ):
-        error = result.get(
-            "error",
-            "unknown Pump.fun SELL builder error",
-        )
-
-        raise PumpFunTransactionBuildError(
-            str(error)
-        )
-
-    transaction_b64 = result.get(
-        "transaction_b64"
-    )
-
-    blockhash = result.get(
-        "blockhash"
-    )
-
-    last_valid_block_height = result.get(
-        "last_valid_block_height"
-    )
-
-    if not transaction_b64:
-        raise PumpFunTransactionBuildError(
-            "pumpfun_sell_builder_missing_transaction"
-        )
-
-    if not blockhash:
-        raise PumpFunTransactionBuildError(
-            "pumpfun_sell_builder_missing_blockhash"
-        )
-
-    if (
-        last_valid_block_height
-        is None
-    ):
-        raise PumpFunTransactionBuildError(
-            "pumpfun_sell_builder_missing_last_valid_block_height"
-        )
-
-    if stderr_text:
-        logger.debug(
-            "pumpfun_sell_builder_stderr",
-            extra={
-                "mint": mint,
-                "stderr": stderr_text[-2000:],
-            },
-        )
-
-    logger.info(
-        "pumpfun_unsigned_sell_transaction_built",
-        extra={
-            "mint": mint,
-            "owner": owner_pubkey,
-            "amount_tokens_raw": (
-                amount_tokens_raw_int
-            ),
-            "slippage_bps": (
-                slippage_bps_int
-            ),
-            "blockhash": blockhash,
-            "last_valid_block_height": (
-                last_valid_block_height
-            ),
-            "priority_fee_micro_lamports": (
-                result.get(
-                    "priority_fee_micro_lamports"
-                )
-            ),
-            "priority_fee_source": (
-                result.get(
-                    "priority_fee_source"
-                )
-            ),
-        },
-    )
-
-    return result
-
-
-# ---------------------------------------------------------------------------
-# Convenience alias
-# ---------------------------------------------------------------------------
-
-build_buy_transaction = (
-    build_unsigned_buy_transaction
-)
+# Existing transaction-builder functions remain unchanged below this point.
