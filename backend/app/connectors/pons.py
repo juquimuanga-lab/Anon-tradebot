@@ -80,7 +80,6 @@ class PonsClient:
     def __init__(self) -> None:
         self._watermark_block = 0
         self._initialized = False
-        # token -> incremental holder/buy state
         self._holder_state: dict[str, dict[str, Any]] = {}
 
     async def _call(self, fn, *args):
@@ -150,12 +149,7 @@ class PonsClient:
         return discovered
 
     async def _update_holder_snapshot(self, token_contract, curve, token_addr: str, launch_block: int, latest_block: int) -> dict[str, Any]:
-        """Incrementally replay Transfer/CurveBuy logs for one Pons token.
-
-        The first successful snapshot starts at the launch block. Subsequent
-        calls only query blocks after the last successful watermark. A failed
-        query leaves the previous state intact and is retried later.
-        """
+        """Incrementally replay Transfer/CurveBuy logs without partial commits."""
         key = token_addr.lower()
         state = self._holder_state.setdefault(key, {
             "launch_block": int(launch_block),
@@ -183,7 +177,9 @@ class PonsClient:
             transfer_logs = await self._get_logs_chunked(transfer_event, start_block, latest_block)
             buy_logs = await self._get_logs_chunked(buy_event, start_block, latest_block)
 
-            balances: dict[str, int] = state["balances"]
+            # Work on copies so a failed second query can never double-count
+            # transfers when the same range is retried.
+            new_balances: dict[str, int] = dict(state["balances"])
             zero_address = "0x0000000000000000000000000000000000000000"
             for log in transfer_logs:
                 args = log["args"]
@@ -191,15 +187,17 @@ class PonsClient:
                 recipient = str(args["to"]).lower()
                 value = int(args["value"])
                 if sender != zero_address:
-                    balances[sender] = balances.get(sender, 0) - value
+                    new_balances[sender] = new_balances.get(sender, 0) - value
                 if recipient != zero_address:
-                    balances[recipient] = balances.get(recipient, 0) + value
+                    new_balances[recipient] = new_balances.get(recipient, 0) + value
 
-            state["volume_quote"] += sum(int(log["args"].get("quoteIn", 0)) for log in buy_logs)
+            new_volume_quote = int(state["volume_quote"]) + sum(int(log["args"].get("quoteIn", 0)) for log in buy_logs)
+            state["balances"] = new_balances
+            state["volume_quote"] = new_volume_quote
             state["last_block"] = int(latest_block)
             state["ready"] = True
             state["next_retry"] = 0.0
-            holders = sum(1 for balance in balances.values() if balance > 0)
+            holders = sum(1 for balance in new_balances.values() if balance > 0)
             logger.info("pons_holder_snapshot_ready", extra={"mint": token_addr, "launch_block": launch_block, "from_block": start_block, "latest_block": latest_block, "transfer_events": len(transfer_logs), "curve_buy_events": len(buy_logs), "holders": holders, "holder_method": "incremental_erc20_transfer_replay"})
             return state
         except Exception as exc:
