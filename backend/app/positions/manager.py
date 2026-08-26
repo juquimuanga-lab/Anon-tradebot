@@ -271,10 +271,44 @@ class PositionManager:
         self,
         position,
     ) -> bool:
-        if position.source == "fourmeme":
-            # BSC positions are reconciled by the Four.meme adapter on sell;
-            # the Solana SPL balance reconciler must never touch an EVM token.
-            return False
+        if position.source in {"fourmeme", "pons"}:
+            # EVM positions must never be reconciled through Solana RPC/SPL balance calls.
+            if position.source == "fourmeme":
+                return False
+
+            wallet_pubkey = await self._get_wallet_pubkey(position)
+            if not wallet_pubkey:
+                return False
+            rpc_url = getattr(settings, "robinhood_rpc_url", None) or getattr(settings, "robinhood_rpc_override_url", None)
+            if not rpc_url:
+                return False
+            try:
+                from app.execution.pons_live import get_robinhood_token_balance
+                actual_balance = await get_robinhood_token_balance(rpc_url, wallet_pubkey, position.mint)
+            except Exception as exc:
+                logger.warning("robinhood_wallet_token_reconciliation_failed", extra={"position_id": position.id, "mint": position.mint, "error": str(exc)})
+                return False
+
+            original_amount = max(0.0, float(position.amount_tokens or 0.0))
+            tracked_remaining_pct = max(0.0, float(position.remaining_pct or 0.0))
+            expected_balance = original_amount * (tracked_remaining_pct / 100.0)
+            if actual_balance >= expected_balance:
+                return False
+            if expected_balance > 0:
+                difference_pct = ((expected_balance - actual_balance) / expected_balance) * 100.0
+                if difference_pct < WALLET_RECONCILIATION_TOLERANCE_PCT:
+                    return False
+            actual_remaining_pct = max(0.0, min((actual_balance / original_amount * 100.0) if original_amount else 0.0, tracked_remaining_pct))
+            if actual_balance <= 0:
+                await repo.update_position(position.id, status="closed", remaining_pct=0.0, closed_at=datetime.now(timezone.utc), close_reason="position closed externally from Robinhood wallet")
+                position.remaining_pct = 0.0
+                position.status = "closed"
+                logger.info("position_reconciled_external_close", extra={"position_id": position.id, "mint": position.mint, "wallet": wallet_pubkey, "source": position.source})
+                return True
+            position.remaining_pct = actual_remaining_pct
+            await repo.update_position(position.id, remaining_pct=actual_remaining_pct)
+            logger.info("position_reconciled_external_partial_sell", extra={"position_id": position.id, "mint": position.mint, "wallet": wallet_pubkey, "source": position.source, "actual_remaining_pct": actual_remaining_pct})
+            return True
         """Reconcile a live position against the actual wallet balance.
 
         Returns:
@@ -557,7 +591,7 @@ class PositionManager:
         if (
             position.mode != "live"
             or not result.tx_signature
-            or position.source == "fourmeme"
+            or position.source in {"fourmeme", "pons"}
         ):
             return None
 
