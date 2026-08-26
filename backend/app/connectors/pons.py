@@ -14,15 +14,12 @@ from web3 import Web3
 
 from app.config.settings import settings
 
-
 PONS_CHAIN_ID = 4663
 PONS_FACTORY_ADDRESS = "0x7eD598BcEf8bd9Edd8C97A195C6d13f40801EC7e"
 PONS_NATIVE_QUOTE = "0x0000000000000000000000000000000000000000"
 
 FACTORY_ABI = [{"anonymous": False, "inputs": [{"indexed": True, "name": "token", "type": "address"}, {"indexed": True, "name": "curve", "type": "address"}, {"indexed": True, "name": "deployer", "type": "address"}, {"indexed": False, "name": "pairToken", "type": "address"}, {"indexed": False, "name": "launchConfigId", "type": "uint256"}, {"indexed": False, "name": "graduationThreshold", "type": "uint256"}], "name": "TokenLaunched", "type": "event"}]
-
 LAUNCHED_TOKEN_ABI = [{"inputs": [{"name": "token", "type": "address"}], "name": "getLaunchedToken", "outputs": [{"name": "token", "type": "address"}, {"name": "curve", "type": "address"}, {"name": "deployer", "type": "address"}, {"name": "creatorFeeRecipient", "type": "address"}, {"name": "pairToken", "type": "address"}, {"name": "graduationThreshold", "type": "uint256"}, {"name": "poolFee", "type": "uint24"}, {"name": "tickSpacing", "type": "int24"}, {"name": "creatorTaxBps", "type": "uint16"}, {"name": "buybackEnabled", "type": "bool"}, {"name": "phase", "type": "uint8"}, {"name": "sweptQuote", "type": "uint256"}, {"name": "sweptTokens", "type": "uint256"}, {"name": "sweptAt", "type": "uint256"}, {"name": "exists", "type": "bool"}], "stateMutability": "view", "type": "function"}]
-
 CURVE_ABI = [
     {"inputs": [], "name": "getReserves", "outputs": [{"type": "uint256"}, {"type": "uint256"}], "stateMutability": "view", "type": "function"},
     {"inputs": [], "name": "sellableTokens", "outputs": [{"type": "uint256"}], "stateMutability": "view", "type": "function"},
@@ -33,7 +30,6 @@ CURVE_ABI = [
     {"inputs": [], "name": "readyToGraduate", "outputs": [{"type": "bool"}], "stateMutability": "view", "type": "function"},
     {"anonymous": False, "inputs": [{"indexed": True, "name": "buyer", "type": "address"}, {"indexed": True, "name": "recipient", "type": "address"}, {"indexed": False, "name": "quoteIn", "type": "uint256"}, {"indexed": False, "name": "tokensOut", "type": "uint256"}, {"indexed": False, "name": "fee", "type": "uint256"}, {"indexed": False, "name": "tax", "type": "uint256"}], "name": "CurveBuy", "type": "event"},
 ]
-
 ERC20_ABI = [
     {"inputs": [], "name": "name", "outputs": [{"type": "string"}], "stateMutability": "view", "type": "function"},
     {"inputs": [], "name": "symbol", "outputs": [{"type": "string"}], "stateMutability": "view", "type": "function"},
@@ -43,17 +39,14 @@ ERC20_ABI = [
     {"anonymous": False, "inputs": [{"indexed": True, "name": "from", "type": "address"}, {"indexed": True, "name": "to", "type": "address"}, {"indexed": False, "name": "value", "type": "uint256"}], "name": "Transfer", "type": "event"},
 ]
 
-
 def _rpc_url() -> Optional[str]:
     return getattr(settings, "robinhood_rpc_url", None) or getattr(settings, "robinhood_alchemy_rpc_url", None)
-
 
 def _build_web3() -> Web3:
     url = _rpc_url()
     if not url:
         raise RuntimeError("Robinhood Chain RPC is not configured")
-    return Web3(Web3.HTTPProvider(url, request_kwargs={"timeout": 5}))
-
+    return Web3(Web3.HTTPProvider(url, request_kwargs={"timeout": 8}))
 
 def _eth_usd_sync() -> float:
     key = getattr(settings, "robinhood_alchemy_api_key", None) or getattr(settings, "alchemy_api_key", None)
@@ -71,13 +64,11 @@ def _eth_usd_sync() -> float:
             return float(price["value"])
     return 0.0
 
-
 async def get_eth_usd_price() -> float:
     try:
         return await asyncio.to_thread(_eth_usd_sync)
     except Exception:
         return 0.0
-
 
 class PonsClient:
     def __init__(self) -> None:
@@ -87,26 +78,30 @@ class PonsClient:
     async def _call(self, fn, *args):
         return await asyncio.to_thread(fn, *args)
 
-    async def _get_logs_chunked(self, event, start_block: int, end_block: int, initial_chunk: int = 10):
-        """Read logs in provider-safe windows, shrinking on RPC 400/range errors."""
+    async def _get_logs_chunked(self, event, start_block: int, end_block: int, initial_chunk: int = 10, max_chunk: int = 10):
+        """Read logs in small provider-safe windows with bounded retries."""
         logs = []
         cursor = int(start_block)
-        chunk_size = max(1, int(initial_chunk))
+        chunk_size = max(1, min(int(initial_chunk), int(max_chunk)))
         while cursor <= int(end_block):
             chunk_end = min(cursor + chunk_size - 1, int(end_block))
-            try:
-                part = await self._call(
-                    lambda s=cursor, e=chunk_end: event.get_logs(from_block=s, to_block=e)
-                )
-                logs.extend(part)
-                cursor = chunk_end + 1
-                if chunk_size < initial_chunk:
-                    chunk_size = min(initial_chunk, chunk_size * 2)
-            except Exception as exc:
+            last_exc = None
+            for delay in (0.0, 0.4, 1.0):
+                if delay:
+                    await asyncio.sleep(delay)
+                try:
+                    part = await self._call(lambda s=cursor, e=chunk_end: event.get_logs(from_block=s, to_block=e))
+                    logs.extend(part)
+                    last_exc = None
+                    break
+                except Exception as exc:
+                    last_exc = exc
+            if last_exc is not None:
                 if chunk_size > 1:
                     chunk_size = max(1, chunk_size // 2)
                     continue
-                raise exc
+                raise last_exc
+            cursor = chunk_end + 1
         return logs
 
     async def poll_new_launches(self, from_block: int = 0, max_blocks: int = 250) -> list[dict[str, Any]]:
@@ -118,16 +113,13 @@ class PonsClient:
             start = latest - int(max_blocks)
         if start > latest:
             return []
-
         factory_address = getattr(settings, "pons_factory_address", None) or PONS_FACTORY_ADDRESS
         factory = w3.eth.contract(address=Web3.to_checksum_address(factory_address), abi=FACTORY_ABI)
-        event = factory.events.TokenLaunched()
-        entries = await self._get_logs_chunked(event, start, latest, initial_chunk=10)
+        entries = await self._get_logs_chunked(factory.events.TokenLaunched(), start, latest, initial_chunk=5, max_chunk=5)
         self._watermark_block = latest + 1
         if not self._initialized:
             self._initialized = True
             return []
-
         discovered: list[dict[str, Any]] = []
         for item in entries:
             args = item["args"]
@@ -156,16 +148,13 @@ class PonsClient:
         token_contract = w3.eth.contract(address=token_addr, abi=ERC20_ABI)
         factory_address = getattr(settings, "pons_factory_address", None) or PONS_FACTORY_ADDRESS
         launch_contract = w3.eth.contract(address=Web3.to_checksum_address(factory_address), abi=LAUNCHED_TOKEN_ABI)
-
         launch = await self._call(lambda: launch_contract.functions.getLaunchedToken(token_addr).call())
         if not launch[-1]:
             raise RuntimeError("token is not registered by the active Pons factory")
-
         curve_addr = Web3.to_checksum_address(launch[1])
         pair_token = Web3.to_checksum_address(launch[4])
         if pair_token.lower() != PONS_NATIVE_QUOTE.lower():
             raise RuntimeError("Pons custom-pair launches are not enabled in this first Robinhood integration")
-
         curve = w3.eth.contract(address=curve_addr, abi=CURVE_ABI)
         reserve_quote, reserve_token = await self._call(lambda: curve.functions.getReserves().call())
         sellable = await self._call(lambda: curve.functions.sellableTokens().call())
@@ -178,22 +167,19 @@ class PonsClient:
         decimals = int(await self._call(lambda: token_contract.functions.decimals().call()))
         total_supply = int(await self._call(lambda: token_contract.functions.totalSupply().call()))
         eth_usd = await get_eth_usd_price()
-
         price_eth = (reserve_quote / 10**18) / (reserve_token / 10**decimals) if reserve_token else 0.0
         price_usd = price_eth * eth_usd
         market_cap_usd = (total_supply / 10**decimals) * price_usd
         liquidity_usd = 2.0 * (reserve_quote / 10**18) * eth_usd
-
         holders = 0
         holders_ready = False
         volume_quote = 0
         launch_block = int(metadata.get("launch_block") or 0)
-
+        latest_block = int(await self._call(lambda: w3.eth.block_number))
         if launch_block:
-            latest_block = int(await self._call(lambda: w3.eth.block_number))
+            transfer_event = token_contract.events.Transfer()
             try:
-                transfer_event = token_contract.events.Transfer()
-                transfer_logs = await self._get_logs_chunked(transfer_event, launch_block, latest_block, initial_chunk=10)
+                transfer_logs = await self._get_logs_chunked(transfer_event, launch_block, latest_block, initial_chunk=5, max_chunk=5)
                 balances: dict[str, int] = {}
                 zero_address = "0x0000000000000000000000000000000000000000"
                 for log in transfer_logs:
@@ -207,21 +193,27 @@ class PonsClient:
                         balances[recipient] = balances.get(recipient, 0) + value
                 holders = sum(1 for balance in balances.values() if balance > 0)
                 holders_ready = True
-
                 buy_event = curve.events.CurveBuy()
-                buy_logs = await self._get_logs_chunked(buy_event, launch_block, latest_block, initial_chunk=10)
-                volume_quote = sum(int(log["args"].get("quoteIn", 0)) for log in buy_logs)
-                logger.info("pons_holder_snapshot_ready", extra={"mint": token_addr, "launch_block": launch_block, "latest_block": latest_block, "transfer_events": len(transfer_logs), "curve_buy_events": len(buy_logs), "holders": holders})
+                try:
+                    buy_logs = await self._get_logs_chunked(buy_event, launch_block, latest_block, initial_chunk=5, max_chunk=5)
+                    volume_quote = sum(int(log["args"].get("quoteIn", 0)) for log in buy_logs)
+                    buy_log_error = ""
+                except Exception as exc:
+                    buy_logs = []
+                    buy_log_error = f"{type(exc).__name__}: {exc}"
+                logger.info("pons_holder_snapshot_ready", extra={"mint": token_addr, "launch_block": launch_block, "latest_block": latest_block, "transfer_events": len(transfer_logs), "curve_buy_events": len(buy_logs), "holders": holders, "holder_method": "erc20_transfer_replay", "buy_log_error": buy_log_error})
             except Exception as exc:
-                logger.warning("pons_holder_snapshot_not_ready", extra={"mint": token_addr, "launch_block": launch_block, "error": str(exc)})
+                logger.warning("pons_holder_snapshot_not_ready", extra={"mint": token_addr, "launch_block": launch_block, "latest_block": latest_block, "reason": "transfer_log_query_failed", "error_type": type(exc).__name__, "error": str(exc)})
         else:
-            logger.warning("pons_holder_snapshot_not_ready", extra={"mint": token_addr, "error": "launch_block missing from discovery metadata"})
+            logger.warning("pons_holder_snapshot_not_ready", extra={"mint": token_addr, "reason": "launch_block_missing"})
 
-        progress = 0.0
+        if eth_usd <= 0:
+            raise RuntimeError("ETH/USD price unavailable")
+        if price_usd <= 0 or market_cap_usd <= 0:
+            raise RuntimeError(f"invalid Pons valuation price_usd={price_usd} market_cap_usd={market_cap_usd}")
+
         threshold = int(launch[5])
-        if threshold:
-            progress = min(100.0, max(0.0, ((reserve_quote / 10**18) / (threshold / 10**18)) * 100.0))
-
+        progress = min(100.0, max(0.0, (reserve_quote / threshold) * 100.0)) if threshold else 0.0
         return {
             "price_usd": price_usd,
             "price_eth": price_eth,
@@ -248,6 +240,5 @@ class PonsClient:
             "progress_pct": progress,
             "eth_usd": eth_usd,
         }
-
 
 pons_client = PonsClient()
