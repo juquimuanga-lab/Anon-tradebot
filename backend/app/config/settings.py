@@ -103,6 +103,21 @@ class Settings(BaseSettings):
     solscan_api_key: Optional[str] = None
 
     # ------------------------------------------------------------------
+    # Robinhood Chain / Pons v2
+    # ------------------------------------------------------------------
+
+    robinhood_chain_id: int = Field(default=4663, validation_alias="ROBINHOOD_CHAIN_ID")
+    robinhood_alchemy_api_key: Optional[str] = Field(default=None, validation_alias="ROBINHOOD_ALCHEMY_API_KEY")
+    robinhood_rpc_url: Optional[str] = Field(default=None, validation_alias="ROBINHOOD_RPC_URL")
+    robinhood_rpc_override_url: Optional[str] = Field(default=None, validation_alias="ROBINHOOD_ALCHEMY_RPC_URL")
+    robinhood_pons_trading_enabled: bool = Field(default=False, validation_alias="ROBINHOOD_PONS_TRADING_ENABLED")
+    pons_factory_address: str = Field(default="0x7eD598BcEf8bd9Edd8C97A195C6d13f40801EC7e", validation_alias="PONS_FACTORY_ADDRESS")
+    pons_factory_start_block: int = Field(default=0, validation_alias="PONS_FACTORY_START_BLOCK")
+    pons_scan_interval_seconds: float = Field(default=0.5, validation_alias="PONS_SCAN_INTERVAL_SECONDS")
+    pons_buy_slippage_bps: int = Field(default=1000, validation_alias="PONS_BUY_SLIPPAGE_BPS")
+    pons_sell_slippage_bps: int = Field(default=1000, validation_alias="PONS_SELL_SLIPPAGE_BPS")
+
+    # ------------------------------------------------------------------
     # Helius
     # ------------------------------------------------------------------
 
@@ -383,6 +398,15 @@ class Settings(BaseSettings):
             "https://solana-mainnet.g.alchemy.com/v2/"
             f"{self.alchemy_api_key}"
         )
+
+    @property
+    def robinhood_alchemy_rpc_url(self) -> Optional[str]:
+        if self.robinhood_rpc_override_url:
+            return self.robinhood_rpc_override_url
+        key = self.robinhood_alchemy_api_key or self.alchemy_api_key
+        if key:
+            return f"https://robinhood-mainnet.g.alchemy.com/v2/{key}"
+        return None
 
     @property
     def alchemy_solana_ws_url(self) -> Optional[str]:
