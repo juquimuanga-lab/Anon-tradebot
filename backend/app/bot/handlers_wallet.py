@@ -228,7 +228,10 @@ async def disconnectrobinhoodwallet_callback(update: Update, context: ContextTyp
 async def robinhoodwallet_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user_id = update.effective_user.id
     raw_key = await secrets_manager.get_robinhood_wallet_private_key(user_id)
-    rpc_url = getattr(settings, "robinhood_rpc_url", None) or getattr(settings, "robinhood_rpc_override_url", None)
+    try:
+        rpc_url = resolve_robinhood_rpc_url(settings)
+    except Exception:
+        rpc_url = None
     if not raw_key:
         await update.message.reply_text("No Robinhood Chain wallet is connected. Use /connectrobinhoodwallet.")
         return
