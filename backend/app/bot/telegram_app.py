@@ -10,7 +10,7 @@ from telegram.ext import (
 )
 
 from app.bot import handlers_admin, handlers_basic, handlers_wallet
-from app.bot.setrule_wizard import COLLECTING, setrule_collect, setrule_start, setrule_fourmeme_start
+from app.bot.setrule_wizard import COLLECTING, setrule_collect, setrule_start, setrule_fourmeme_start, setrule_pons_start
 from app.config.settings import settings
 
 
@@ -34,11 +34,18 @@ async def set_bot_commands(application: Application) -> None:
         BotCommand("disablesmartmoney", "Disable Smart Money copy"),
         BotCommand("enablepumpfun", "Enable Pump.fun trading"),
         BotCommand("disablepumpfun", "Disable Pump.fun trading"),
-        BotCommand("connectwallet", "Connect your live wallet"),
-        BotCommand("disconnectwallet", "Disconnect your live wallet"),
+        BotCommand("connectwallet", "Connect Solana wallet"),
+        BotCommand("disconnectwallet", "Disconnect Solana wallet"),
+        BotCommand("connectrobinhoodwallet", "Connect Robinhood Chain wallet"),
+        BotCommand("robinhoodwallet", "Show Robinhood wallet"),
+        BotCommand("disconnectrobinhoodwallet", "Disconnect Robinhood wallet"),
         BotCommand("paper", "Switch to paper mode"),
-        BotCommand("live", "Switch to live mode"),
+        BotCommand("live", "Switch Solana to live mode"),
+        BotCommand("ponslive", "Switch Pons to live mode"),
+        BotCommand("ponspaper", "Switch Pons to paper mode"),
+        BotCommand("ponsstatus", "Show Pons/Robinhood status"),
         BotCommand("setrule", "Create a Solana rule"),
+        BotCommand("setrulepons", "Create a Robinhood/Pons ETH rule"),
         BotCommand("recoverent", "Recover token-account rent"),
         BotCommand("burnclose", "Burn and close token accounts"),
         BotCommand("guardian", "GO Guardian AI dashboard"),
@@ -84,6 +91,9 @@ def build_application() -> Application:
     application.add_handler(CommandHandler("disablefourmeme", handlers_admin.disablefourmeme_cmd))
     application.add_handler(CommandHandler("paper", handlers_admin.paper_cmd))
     application.add_handler(CommandHandler("live", handlers_admin.live_cmd))
+    application.add_handler(CommandHandler("ponslive", handlers_admin.ponslive_cmd))
+    application.add_handler(CommandHandler("ponspaper", handlers_admin.ponspaper_cmd))
+    application.add_handler(CommandHandler("ponsstatus", handlers_admin.ponsstatus_cmd))
     application.add_handler(CommandHandler("disconnectwallet", handlers_wallet.disconnectwallet_cmd))
     application.add_handler(CommandHandler("disconnectbscwallet", handlers_wallet.disconnectbscwallet_cmd))
     application.add_handler(CommandHandler("disconnectrobinhoodwallet", handlers_wallet.disconnectrobinhoodwallet_cmd))
@@ -179,6 +189,21 @@ def build_application() -> Application:
         name="rent_recovery_conversation",
     )
     application.add_handler(rent_recovery_conv)
+
+    setrule_pons_conv = ConversationHandler(
+        entry_points=[CommandHandler("setrulepons", setrule_pons_start)],
+        states={
+            COLLECTING: [
+                MessageHandler(
+                    filters.TEXT & ~filters.COMMAND | filters.Regex("^/(skip|cancel)$"),
+                    setrule_collect,
+                )
+            ]
+        },
+        fallbacks=[CommandHandler("cancel", setrule_collect)],
+        name="setrule_pons_conversation",
+    )
+    application.add_handler(setrule_pons_conv)
 
     setrule_fourmeme_conv = ConversationHandler(
         entry_points=[CommandHandler("setrulefourmeme", setrule_fourmeme_start)],
