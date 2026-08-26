@@ -1265,14 +1265,22 @@ class PositionManager:
                 sell_pct,
             )
 
-            await self._notifier.sell_filled(
-                position.owner_user_id,
-                token.ticker_symbol
-                or token.mint[:8],
-                exit_price,
-                pnl_amount,
-                result.tx_signature,
-            )
+            if position.source == "pons" and hasattr(self._notifier, "_send_to"):
+                sign = "+" if pnl_amount >= 0 else ""
+                await self._notifier._send_to(
+                    position.owner_user_id,
+                    f"*Pons sell filled* `{token.ticker_symbol or token.mint[:8]}` @ ${exit_price:.6f}\n"
+                    f"PnL: {sign}${pnl_amount:.2f}\n"
+                    f"Robinhood Chain tx: `{result.tx_signature or 'n/a'}`",
+                )
+            else:
+                await self._notifier.sell_filled(
+                    position.owner_user_id,
+                    token.ticker_symbol or token.mint[:8],
+                    exit_price,
+                    pnl_amount,
+                    result.tx_signature,
+                )
 
             return True
 
