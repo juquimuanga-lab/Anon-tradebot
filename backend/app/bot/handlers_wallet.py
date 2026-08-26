@@ -11,6 +11,7 @@ from app.execution.onchain.robinhood_wallet import (
     InvalidRobinhoodWalletKeyError,
     build_robinhood_web3,
     get_native_balance_eth,
+    resolve_robinhood_rpc_url,
     load_robinhood_account,
 )
 from app.config.settings import settings
@@ -146,9 +147,9 @@ async def connectrobinhoodwallet_receive(update: Update, context: ContextTypes.D
 
     try:
         account = load_robinhood_account(text)
-        rpc_url = getattr(settings, "robinhood_rpc_url", None) or getattr(settings, "robinhood_rpc_override_url", None)
-        if not rpc_url:
-            raise RuntimeError("Robinhood Chain RPC is not configured")
+        # Resolve the public/Alchemy RPC from the configured app settings.
+        # The wallet private key itself is never taken from an environment variable.
+        rpc_url = resolve_robinhood_rpc_url(settings)
         # Validate the live RPC network and the wallet balance before storing.
         w3 = build_robinhood_web3(rpc_url)
         balance_eth = int(w3.eth.get_balance(account.address)) / 10**18
