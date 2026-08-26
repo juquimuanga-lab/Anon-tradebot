@@ -1,4 +1,4 @@
-"""Platform-scoped /setrule wizards for Solana and Four.meme."""
+"""Platform-scoped rule wizards for Solana, Four.meme and Robinhood/Pons."""
 import logging
 from dataclasses import dataclass
 from typing import Any, Callable
@@ -61,8 +61,12 @@ def _parse_strategy(raw: str) -> str:
 
 def _steps(platform: str) -> list[Step]:
     buy_key = "max_buy_size_bnb" if platform == "fourmeme" else "max_buy_size_sol"
-    buy_unit = "BNB" if platform == "fourmeme" else "SOL"
-    buy_default = 0.01 if platform == "fourmeme" else 0.1
+    if platform == "pons":
+        buy_unit = "ETH"
+        buy_default = 0.005
+    else:
+        buy_unit = "BNB" if platform == "fourmeme" else "SOL"
+        buy_default = 0.01 if platform == "fourmeme" else 0.1
     return [
         Step("name", "Step 1/20 - Name this rule set (e.g. `sniper-default`):", sanitize_text, default="default"),
         Step(
@@ -102,9 +106,15 @@ async def setrule_fourmeme_start(update: Update, context: ContextTypes.DEFAULT_T
     return await _start(update, context, "fourmeme")
 
 
+@admin_required
+async def setrule_pons_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    return await _start(update, context, "pons")
+
+
 async def _start(update: Update, context: ContextTypes.DEFAULT_TYPE, platform: str) -> int:
     context.user_data["setrule"] = {"index": 0, "answers": {}, "platform": platform}
-    label = "FOUR.MEME / BSC" if platform == "fourmeme" else "SOLANA (Anoncoin + Pump.fun)"
+    labels = {"fourmeme": "FOUR.MEME / BSC", "pons": "ROBINHOOD CHAIN / PONS (ETH)", "solana": "SOLANA (Anoncoin + Pump.fun)"}
+    label = labels.get(platform, "SOLANA (Anoncoin + Pump.fun)")
     await update.message.reply_text(
         f"Let's build a new *{label}* rule set. Send /cancel anytime to stop.\n\n"
         + _steps(platform)[0].prompt,
@@ -151,17 +161,22 @@ async def _finish_wizard(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     state = context.user_data.pop("setrule")
     answers = state["answers"]
     platform = state.get("platform", "solana")
-    answers["platform"] = platform
-    # Ensure the unused currency field remains valid for the shared model/storage.
+    # The deployed RuleParams model predates the Pons platform literal.
+    # Validate against its Solana-compatible shape, then restore the explicit
+    # Pons platform tag before persisting.
+    requested_platform = platform
+    answers["platform"] = "solana" if platform == "pons" else platform
     if platform == "fourmeme":
         answers.setdefault("max_buy_size_sol", 0.1)
     else:
         answers.setdefault("max_buy_size_bnb", 0.01)
 
     params = RuleParams(**answers)
+    if requested_platform == "pons":
+        params.platform = "pons"
     token = confirmation_store.create("save_rule", {"params": params.model_dump(), "user_id": update.effective_user.id})
-    unit = "BNB" if platform == "fourmeme" else "SOL"
-    label = "FOUR.MEME" if platform == "fourmeme" else "SOLANA"
+    unit = "BNB" if platform == "fourmeme" else ("ETH" if platform == "pons" else "SOL")
+    label = "FOUR.MEME" if platform == "fourmeme" else ("ROBINHOOD / PONS" if platform == "pons" else "SOLANA")
     buy = params.max_buy_size_bnb if platform == "fourmeme" else params.max_buy_size_sol
     summary = (
         f"*{label} rule '{params.name}' ready*\n"
