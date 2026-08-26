@@ -173,6 +173,57 @@ async def live_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 @admin_required
+async def ponslive_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user_id = update.effective_user.id
+    if not getattr(settings, "robinhood_pons_trading_enabled", False):
+        await update.message.reply_text("Pons/Robinhood live trading is disabled at deployment level. Set ROBINHOOD_PONS_TRADING_ENABLED=true in Railway first.")
+        return
+    if not await secrets_manager.get_robinhood_wallet_private_key(user_id):
+        await update.message.reply_text("No Robinhood Chain wallet is connected. Run /connectrobinhoodwallet first.")
+        return
+    keyboard = InlineKeyboardMarkup(
+        [[InlineKeyboardButton("Confirm Pons LIVE", callback_data="actionconfirm:ponslive:yes"),
+          InlineKeyboardButton("Cancel", callback_data="actionconfirm:ponslive:no")]]
+    )
+    await update.message.reply_text(
+        "*Warning:* this enables real Pons trades only.\n\n"
+        "Network: Robinhood Chain (4663)\n"
+        "Currency: ETH\n"
+        "Solana /live mode is unchanged.\n\n"
+        "Confirm Pons LIVE mode?",
+        parse_mode="Markdown",
+        reply_markup=keyboard,
+    )
+
+
+@admin_required
+async def ponspaper_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user_id = update.effective_user.id
+    await secrets_manager.set_pons_mode(user_id, "paper")
+    await repo.write_audit_log(str(user_id), "pons_mode", {"mode": "paper"})
+    await update.message.reply_text("🟡 *Pons trading is PAPER.*\n\nNetwork: Robinhood Chain (4663)\nNative currency: ETH\nSolana /live mode is unchanged.", parse_mode="Markdown")
+
+
+@admin_required
+async def ponsstatus_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user_id = update.effective_user.id
+    mode = await secrets_manager.get_pons_mode(user_id) or "paper"
+    raw_key = await secrets_manager.get_robinhood_wallet_private_key(user_id)
+    enabled = bool(getattr(settings, "robinhood_pons_trading_enabled", False))
+    if not raw_key:
+        await update.message.reply_text(f"*Pons / Robinhood Status*\n\nDeployment: `{'ON' if enabled else 'OFF'}`\nMode: `{mode.upper()}`\nWallet: `NOT CONNECTED`\nCurrency: `ETH`\nNetwork: `Robinhood Chain (4663)`\n\nUse /connectrobinhoodwallet.", parse_mode="Markdown")
+        return
+    try:
+        from app.execution.onchain.robinhood_wallet import load_robinhood_account, build_robinhood_web3, resolve_robinhood_rpc_url
+        account = load_robinhood_account(raw_key)
+        w3 = build_robinhood_web3(resolve_robinhood_rpc_url(settings))
+        balance_eth = int(w3.eth.get_balance(account.address)) / 10**18
+        await update.message.reply_text(f"*Pons / Robinhood Status*\n\nDeployment: `{'ON' if enabled else 'OFF'}`\nMode: `{mode.upper()}`\nWallet: `CONNECTED`\nAddress: `{account.address}`\nNetwork: `Robinhood Chain ({int(w3.eth.chain_id)})`\nBalance: `{balance_eth:.6f} ETH`\nRule currency: `ETH`\nSolana wallet/mode: `SEPARATE`", parse_mode="Markdown")
+    except Exception:
+        await update.message.reply_text("Robinhood wallet is stored, but the RPC could not be read. Check ROBINHOOD_RPC_URL.")
+
+
+@admin_required
 async def pumpfun_snipers_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Show and control the independent Pump.fun Fast/Smart/Smart-Money lanes."""
     owner_id = update.effective_user.id
@@ -435,6 +486,18 @@ async def action_confirmation_callback(update: Update, context: ContextTypes.DEF
         await query.edit_message_text("Four.meme trading paused. Pump.fun and Anoncoin are unaffected.")
         return
 
+    if action == "ponslive":
+        if not getattr(settings, "robinhood_pons_trading_enabled", False):
+            await query.edit_message_text("Pons/Robinhood live trading is disabled at deployment level.")
+            return
+        if not await secrets_manager.get_robinhood_wallet_private_key(owner_id):
+            await query.edit_message_text("No Robinhood Chain wallet is connected. Run /connectrobinhoodwallet first.")
+            return
+        await secrets_manager.set_pons_mode(owner_id, "live")
+        await repo.write_audit_log(str(owner_id), "pons_mode", {"mode": "live"})
+        await query.edit_message_text("🟢 Pons trading switched to LIVE. Robinhood Chain / ETH only. Solana /live mode is unchanged.")
+        return
+
     if action in ("paper", "live"):
         await repo.update_bot_state(owner_id, mode=action)
         await repo.write_audit_log(str(owner_id), "switch_mode", {"mode": action})
@@ -492,7 +555,13 @@ async def confirmation_callback(update: Update, context: ContextTypes.DEFAULT_TY
     elif entry.action == "save_rule":
         from app.scoring.rules import RuleParams
 
-        params = RuleParams(**entry.payload["params"])
+        raw_params = dict(entry.payload["params"])
+        requested_platform = raw_params.get("platform", "solana")
+        if requested_platform == "pons":
+            raw_params["platform"] = "solana"
+        params = RuleParams(**raw_params)
+        if requested_platform == "pons":
+            params.platform = "pons"
 
         # Explicit lane selection from the /setrule wizard.
         # Keep backwards compatibility with old activate/save callbacks.
