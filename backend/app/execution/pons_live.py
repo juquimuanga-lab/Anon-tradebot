@@ -9,6 +9,7 @@ from eth_account.signers.local import LocalAccount
 from app.execution.base import ExecutionAdapter, OrderResult
 from app.scoring.rules import TokenSnapshot
 from app.config.settings import settings
+from app.execution.onchain.robinhood_wallet import resolve_robinhood_rpc_url
 
 ROBINHOOD_CHAIN_ID = 4663
 from app.connectors.pons import CURVE_ABI, PONS_NATIVE_QUOTE, LAUNCHED_TOKEN_ABI, PONS_FACTORY_ADDRESS, ERC20_ABI
