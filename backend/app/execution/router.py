@@ -41,6 +41,7 @@ from app.execution.onchain.wallet_keys import (
 )
 
 from app.execution.fourmeme_live import FourMemeExecutionAdapter
+from app.execution.pons_live import PonsExecutionAdapter
 
 from app.execution.paper import (
     PaperExecutionAdapter,
@@ -79,6 +80,10 @@ SOURCE_PUMPFUN = (
 
 SOURCE_FOURMEME = (
     "fourmeme"
+)
+
+SOURCE_PONS = (
+    "pons"
 )
 
 SOURCE_MOCK = (
@@ -228,6 +233,7 @@ class ExecutionRouter:
             SOURCE_ANONCOIN,
             SOURCE_PUMPFUN,
             SOURCE_FOURMEME,
+            SOURCE_PONS,
             SOURCE_MOCK,
         }:
 
@@ -368,6 +374,36 @@ class ExecutionRouter:
                 slippage_bps=settings.fourmeme_default_slippage_bps,
                 helper_address=settings.fourmeme_helper3_address,
                 token_manager_address=settings.fourmeme_token_manager2_address,
+            )
+
+        # --------------------------------------------------------------
+        # PONS / ROBINHOOD CHAIN
+        # --------------------------------------------------------------
+
+        if source == SOURCE_PONS:
+            if not getattr(settings, "robinhood_pons_trading_enabled", False):
+                return NoWalletConnectedAdapter(
+                    "Pons/Robinhood Chain live trading is disabled; set ROBINHOOD_PONS_TRADING_ENABLED=true."
+                )
+            raw_evm_key = await secrets_manager.get_bsc_wallet_private_key(owner_user_id)
+            if not raw_evm_key:
+                return NoWalletConnectedAdapter(
+                    "No EVM wallet connected. Use /connectbscwallet to connect the EVM wallet."
+                )
+            from app.execution.onchain.bsc_wallet import load_bsc_account, InvalidBscWalletKeyError
+            try:
+                account = load_bsc_account(raw_evm_key)
+            except InvalidBscWalletKeyError:
+                logger.error("stored_evm_wallet_key_invalid", extra={"owner_user_id": owner_user_id, "source": SOURCE_PONS})
+                return NoWalletConnectedAdapter("Stored EVM wallet is invalid. Reconnect it.")
+            rpc_url = getattr(settings, "robinhood_rpc_url", None) or getattr(settings, "robinhood_alchemy_rpc_url", None)
+            if not rpc_url:
+                return NoWalletConnectedAdapter("Robinhood Chain RPC is not configured.")
+            logger.info("pons_execution_adapter_selected", extra={"owner_user_id": owner_user_id, "source": SOURCE_PONS, "wallet": account.address})
+            return PonsExecutionAdapter(
+                account=account,
+                rpc_url=rpc_url,
+                slippage_bps=getattr(settings, "pons_buy_slippage_bps", 1000),
             )
 
         # --------------------------------------------------------------
