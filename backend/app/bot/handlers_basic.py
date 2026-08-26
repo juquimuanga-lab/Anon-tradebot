@@ -10,36 +10,50 @@ from app.storage import repository as repo
 HELP_TEXT = (
     "*Anoncoin Sniper Bot*\n\n"
     "*Read-only (anyone):*\n"
-    "/status - mode, rules, balance, positions\n"
-    "/rules - show your active rule\n"
-    "/listrules - list your saved rule sets (with IDs)\n"
-    "/balance - wallet / paper balance\n"
+    "/status - mode, rules, balances, positions, and network status\n"
+    "/rules - show your active rules by network\n"
+    "/listrules - list your saved rule sets (with IDs and platforms)\n"
+    "/balance - Solana wallet / paper balance\n"
     "/positions - open positions\n"
     "/history - recent trades\n"
     "/help - this message\n\n"
-    "*Admin only:*\n"
-    "/connect - register your Anoncoin API key\n"
-    "/connectwallet - register a wallet for live on-chain trading (base58 or JSON key)\n"
-    "/disconnectwallet - remove your stored wallet key (confirm)\n"
+    "*Solana / Pump.fun:*\n"
+    "/connectwallet - register a Solana wallet for live trading\n"
+    "/disconnectwallet - remove your stored Solana wallet key (confirm)\n"
     "/setrule - create a SOLANA rule set (Anoncoin + Pump.fun)\n"
+    "/paper - switch Solana to paper mode (confirm)\n"
+    "/live - switch Solana to live mode (confirm)\n"
+    "/enablepumpfun - resume Pump.fun trading only\n"
+    "/disablepumpfun - pause Pump.fun trading only (confirm)\n"
+    "/pumpfunsnipers - control Fast Sniper / Smart Filter\n"
+    "/setfast <id> - assign a rule to the Pump.fun Fast Sniper lane\n"
+    "/setsmart <id> - assign a rule to the Pump.fun Smart Filter lane\n"
+    "/enablesmartmoney - enable smart-money wallet copying\n"
+    "/disablesmartmoney - disable smart-money wallet copying\n\n"
+    "*Robinhood Chain / Pons:*\n"
+    "/connectrobinhoodwallet - connect your encrypted Robinhood Chain EVM wallet\n"
+    "/robinhoodwallet - show Robinhood wallet, chain ID, ETH balance and Pons state\n"
+    "/disconnectrobinhoodwallet - remove the encrypted Robinhood wallet key (confirm)\n"
+    "/ponsstatus - show Pons/Robinhood status, wallet, ETH balance and mode\n"
+    "/setrulepons - create a separate ROBINHOOD / Pons rule set (ETH)\n"
+    "/ponslive - switch Pons to LIVE mode (confirm)\n"
+    "/ponspaper - switch Pons to PAPER mode\n\n"
+    "*Four.meme / BSC:*\n"
+    "/connectbscwallet - connect the BSC trading wallet\n"
+    "/disconnectbscwallet - remove the stored BSC wallet key (confirm)\n"
     "/setrulefourmeme - create a separate FOUR.MEME / BSC rule set\n"
+    "/enablefourmeme - resume Four.meme trading\n"
+    "/disablefourmeme - pause Four.meme trading (confirm)\n\n"
+    "*Admin controls:*\n"
+    "/connect - register your Anoncoin API key\n"
     "/activaterule <id> - activate a rule; activation is isolated by platform\n"
     "/enable - resume automated trading\n"
     "/disable - pause automated trading (confirm)\n"
     "/enableanoncoin - resume Anoncoin trading only\n"
     "/disableanoncoin - pause Anoncoin trading only (confirm)\n"
-    "/enablepumpfun - resume Pump.fun trading only\n"
-    "/disablepumpfun - pause Pump.fun trading only (confirm)\n"
-    "/pumpfunsnipers - control Fast Sniper / Smart Filter (both can run together)\n"
-    "/setfast <id> - assign a rule to the Pump.fun Fast Sniper lane\n"
-    "/setsmart <id> - assign a rule to the Pump.fun Smart Filter lane\n"
-    "/enablesmartmoney - enable copying the configured smart-money wallet\n"
-    "/disablesmartmoney - disable smart-money wallet copying\n"
-    "/guardian - GO Guardian AI health dashboard\n"
-    "/paper - switch to paper mode (confirm)\n"
-    "/live - switch to live mode (confirm)\n"
-    "\nEach admin's rules run independently - activating or editing your rule "
-    "never affects another admin's."
+    "/guardian - GO Guardian AI health dashboard\n\n"
+    "Solana uses SOL. Four.meme uses BNB. Robinhood/Pons uses ETH. "
+    "Each network has its own wallet and trading mode."
 )
 
 
@@ -57,46 +71,79 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    state = await repo.get_or_create_bot_state(update.effective_user.id)
-    fast_rule = await repo.get_active_rule_for_strategy(update.effective_user.id, "solana", "fast")
-    smart_rule = await repo.get_active_rule_for_strategy(update.effective_user.id, "solana", "smart")
-    fourmeme_rule = await repo.get_active_rule_for(update.effective_user.id, "fourmeme")
+    user_id = update.effective_user.id
+    state = await repo.get_or_create_bot_state(user_id)
+    fast_rule = await repo.get_active_rule_for_strategy(user_id, "solana", "fast")
+    smart_rule = await repo.get_active_rule_for_strategy(user_id, "solana", "smart")
+    fourmeme_rule = await repo.get_active_rule_for(user_id, "fourmeme")
+    pons_rule = await repo.get_active_rule_for(user_id, "pons")
     smart_money_rule = None
     if hasattr(repo, "get_active_smart_money_rule"):
-        smart_money_rule = await repo.get_active_smart_money_rule(update.effective_user.id, "solana")
-    positions = await repo.get_open_positions(update.effective_user.id)
-    orders = await repo.get_recent_orders(3, update.effective_user.id)
+        smart_money_rule = await repo.get_active_smart_money_rule(user_id, "solana")
+    positions = await repo.get_open_positions(user_id)
+    orders = await repo.get_recent_orders(3, user_id)
 
     anoncoin_key = await secrets_manager.get_anoncoin_api_key()
     anoncoin_connected = "yes" if anoncoin_key else "no (use /connect)"
     helius_connected = "yes" if settings.helius_api_key else "no"
 
-    wallet_key = await secrets_manager.get_wallet_private_key(update.effective_user.id)
-    wallet_line = "connected (use /balance to check funds)" if wallet_key else "not connected (use /connectwallet for live trading)"
+    wallet_key = await secrets_manager.get_wallet_private_key(user_id)
+    wallet_line = "connected (SOL)" if wallet_key else "not connected (use /connectwallet)"
+
+    rh_key = await secrets_manager.get_robinhood_wallet_private_key(user_id)
+    rh_enabled = bool(getattr(settings, "robinhood_pons_trading_enabled", False))
+    rh_mode = await secrets_manager.get_pons_mode(user_id) or "paper"
+    rh_line = "not connected"
+    rh_address = "-"
+    rh_chain = "4663"
+    rh_balance = "-"
+    if rh_key:
+        try:
+            from app.execution.onchain.robinhood_wallet import (
+                build_robinhood_web3,
+                load_robinhood_account,
+                resolve_robinhood_rpc_url,
+            )
+            account = load_robinhood_account(rh_key)
+            w3 = build_robinhood_web3(resolve_robinhood_rpc_url(settings))
+            rh_address = account.address
+            rh_chain = str(int(w3.eth.chain_id))
+            rh_balance = f"{int(w3.eth.get_balance(account.address)) / 10**18:.6f} ETH"
+            rh_line = "connected"
+        except Exception:
+            rh_line = "connected (RPC unavailable)"
 
     fast_rule_line = f"`{fast_rule.name}` (id {fast_rule.id})" if fast_rule else "none"
     smart_rule_line = f"`{smart_rule.name}` (id {smart_rule.id})" if smart_rule else "none"
     smart_money_rule_line = f"`{smart_money_rule.name}` (id {smart_money_rule.id})" if smart_money_rule else "none"
     fourmeme_rule_line = f"`{fourmeme_rule.name}` (id {fourmeme_rule.id})" if fourmeme_rule else "none - use /setrulefourmeme"
-    recent_lines = "\n".join(
-        f"  - {o.side} {o.mint[:6]}... [{o.status}]" for o in orders
-    ) or "  - none yet"
+    pons_rule_line = f"`{pons_rule.name}` (id {pons_rule.id})" if pons_rule else "none - use /setrulepons"
+    recent_lines = "\n".join(f"  - {o.side} {o.mint[:6]}... [{o.status}]" for o in orders) or "  - none yet"
 
     text = (
-        f"*Mode:* {state.mode} | *Trading enabled:* {state.trading_enabled}\n"
-        f"*Anoncoin trading:* {state.anoncoin_trading_enabled} | "
-        f"*Pump.fun trading:* {state.pumpfun_trading_enabled} | "
-        f"*Smart Money Copy:* {getattr(state, 'smart_money_copy_enabled', False)} | "
-        f"*Guardian:* {getattr(state, 'guardian_last_status', 'HEALTHY')} | "
-        f"*Four.meme trading:* {state.fourmeme_trading_enabled and settings.fourmeme_trading_enabled}\n"
-        f"*Fast rule:* {fast_rule_line}\n"
-        f"*Smart rule:* {smart_rule_line}\n"
-        f"*Smart Money rule:* {smart_money_rule_line}\n"
-        f"*Four.meme rule:* {fourmeme_rule_line}\n"
-        f"*Connected APIs:* Anoncoin: {anoncoin_connected}, Helius: {helius_connected}\n"
-        f"*Your wallet:* {wallet_line}\n"
-        f"*Paper balance:* {state.paper_balance_sol:.3f} SOL\n"
-        f"*Open positions:* {len(positions)}\n"
+        f"*Solana*\n"
+        f"Mode: `{state.mode}` | Trading: `{state.trading_enabled}`\n"
+        f"Anoncoin: `{state.anoncoin_trading_enabled}` | Pump.fun: `{state.pumpfun_trading_enabled}`\n"
+        f"Fast rule: {fast_rule_line}\n"
+        f"Smart rule: {smart_rule_line}\n"
+        f"Smart Money Copy: `{getattr(state, 'smart_money_copy_enabled', False)}`\n"
+        f"Wallet: `{wallet_line}`\n"
+        f"Paper balance: `{state.paper_balance_sol:.3f} SOL`\n\n"
+        f"*Robinhood Chain / Pons*\n"
+        f"Deployment: `{'ON' if rh_enabled else 'OFF'}`\n"
+        f"Mode: `{rh_mode.upper()}`\n"
+        f"Wallet: `{rh_line}`\n"
+        f"Address: `{rh_address}`\n"
+        f"Chain ID: `{rh_chain}`\n"
+        f"Balance: `{rh_balance}`\n"
+        f"Rule: {pons_rule_line}\n"
+        f"Currency: `ETH`\n\n"
+        f"*Four.meme / BSC*\n"
+        f"Trading: `{state.fourmeme_trading_enabled and settings.fourmeme_trading_enabled}`\n"
+        f"Rule: {fourmeme_rule_line}\n\n"
+        f"*Connected APIs*\n"
+        f"Anoncoin: `{anoncoin_connected}` | Helius: `{helius_connected}`\n\n"
+        f"*Positions:* `{len(positions)}`\n"
         f"*Recent trades:*\n{recent_lines}"
     )
     await update.message.reply_text(text, parse_mode="Markdown")
@@ -105,14 +152,19 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 async def rules(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     sol_rule = await repo.get_active_rule_for(update.effective_user.id, "solana")
     fm_rule = await repo.get_active_rule_for(update.effective_user.id, "fourmeme")
+    pons_rule = await repo.get_active_rule_for(update.effective_user.id, "pons")
     from app.storage.repository import rule_row_to_params
 
     def render(rule, label):
         if not rule:
             return f"*{label}:* none"
         p = rule_row_to_params(rule)
-        buy = p.max_buy_size_bnb if p.platform == "fourmeme" else p.max_buy_size_sol
-        unit = "BNB" if p.platform == "fourmeme" else "SOL"
+        if p.platform == "fourmeme":
+            buy, unit = p.max_buy_size_bnb, "BNB"
+        elif p.platform == "pons":
+            buy, unit = p.max_buy_size_sol, "ETH"
+        else:
+            buy, unit = p.max_buy_size_sol, "SOL"
         return (
             f"*{label}: {p.name}* (id {rule.id})\n"
             f"Max buy: {buy} {unit} | Min liquidity: ${p.min_liquidity_usd:,.0f} | Holders: {p.min_holders} | Age: {p.max_age_seconds}s\n"
@@ -120,7 +172,9 @@ async def rules(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         )
 
     await update.message.reply_text(
-        render(sol_rule, "SOLANA (Anoncoin + Pump.fun)") + "\n\n" + render(fm_rule, "FOUR.MEME / BSC"),
+        render(sol_rule, "SOLANA (Anoncoin + Pump.fun") + "\n\n" +
+        render(fm_rule, "FOUR.MEME / BSC") + "\n\n" +
+        render(pons_rule, "ROBINHOOD CHAIN / PONS (ETH)"),
         parse_mode="Markdown",
     )
 
@@ -128,7 +182,7 @@ async def rules(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 async def listrules(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     my_rules = await repo.get_rules_for_admin(update.effective_user.id)
     if not my_rules:
-        await update.message.reply_text("You haven't saved any rule sets yet. Use /setrule to create one.")
+        await update.message.reply_text("You haven't saved any rule sets yet. Use /setrule or /setrulepons to create one.")
         return
     lines = [f"- {'[ACTIVE] ' if r.is_active else ''}{r.name} (id {r.id}) [{getattr(r, 'platform', 'solana')}]" for r in my_rules]
     await update.message.reply_text(
@@ -169,8 +223,8 @@ async def balance(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
     if not wallet_key:
         await update.message.reply_text(
-            f"Mode: {state.mode.upper()}\\n"
-            f"Paper balance: {state.paper_balance_sol:.3f} SOL\\n\\n"
+            f"Mode: {state.mode.upper()}\n"
+            f"Paper balance: {state.paper_balance_sol:.3f} SOL\n\n"
             "No wallet connected. Use /connectwallet for live trading."
         )
         return
@@ -184,16 +238,16 @@ async def balance(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         sol_balance = await get_sol_balance(settings.solana_rpc_url, address)
 
         await update.message.reply_text(
-            f"Mode: {state.mode.upper()}\\n"
-            f"Wallet balance: {sol_balance:.4f} SOL\\n"
-            f"Paper balance: {state.paper_balance_sol:.3f} SOL\\n"
+            f"Mode: {state.mode.upper()}\n"
+            f"Wallet balance: {sol_balance:.4f} SOL\n"
+            f"Paper balance: {state.paper_balance_sol:.3f} SOL\n"
             f"Address: `{address}`",
             parse_mode="Markdown",
         )
     except Exception as exc:
         await update.message.reply_text(
-            f"Mode: {state.mode.upper()}\\n"
-            f"Paper balance: {state.paper_balance_sol:.3f} SOL\\n\\n"
+            f"Mode: {state.mode.upper()}\n"
+            f"Paper balance: {state.paper_balance_sol:.3f} SOL\n\n"
             f"Could not fetch wallet balance right now: {exc}"
         )
 
