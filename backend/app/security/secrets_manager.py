@@ -24,6 +24,10 @@ def _robinhood_wallet_key_name(user_id: int) -> str:
     return f"robinhood_wallet_privkey_{user_id}"
 
 
+def _pons_mode_key_name(user_id: int) -> str:
+    return f"pons_mode_{user_id}"
+
+
 class SecretsManager:
     def __init__(self):
         self._fernet = Fernet(settings.secret_encryption_key.encode())
@@ -113,6 +117,18 @@ class SecretsManager:
 
     async def delete_robinhood_wallet_private_key(self, user_id: int) -> None:
         await self.delete_secret(_robinhood_wallet_key_name(user_id))
+
+    async def set_pons_mode(self, user_id: int, mode: str) -> None:
+        mode = mode.strip().lower()
+        if mode not in {"paper", "live"}:
+            raise ValueError("Pons mode must be paper or live")
+        await self.set_secret(_pons_mode_key_name(user_id), mode)
+
+    async def get_pons_mode(self, user_id: int) -> Optional[str]:
+        return await self.get_secret(_pons_mode_key_name(user_id))
+
+    async def delete_pons_mode(self, user_id: int) -> None:
+        await self.delete_secret(_pons_mode_key_name(user_id))
 
 
 secrets_manager = SecretsManager()
