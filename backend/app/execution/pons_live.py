@@ -53,12 +53,21 @@ def _quote_sell(curve, tokens_in: int):
 class PonsExecutionAdapter(ExecutionAdapter):
     mode = "live"
 
-    def __init__(self, account: LocalAccount, rpc_url: str, slippage_bps: int = 1000):
+    def __init__(
+        self,
+        account: LocalAccount,
+        rpc_url: str,
+        buy_slippage_bps: int = 1000,
+        sell_slippage_bps: int = 1000,
+    ):
         self._account = account
         self._pubkey = account.address
         self._rpc_url = rpc_url
         self._w3 = Web3(Web3.HTTPProvider(rpc_url, request_kwargs={"timeout": 5}))
-        self._slippage_bps = max(0, min(int(slippage_bps), 3000))
+        # Keep buy and sell slippage independent. Pons exposes separate
+        # deployment settings for these two directions.
+        self._buy_slippage_bps = max(0, min(int(buy_slippage_bps), 3000))
+        self._sell_slippage_bps = max(0, min(int(sell_slippage_bps), 3000))
         factory_address = getattr(settings, "pons_factory_address", None) or PONS_FACTORY_ADDRESS
         self._factory = self._w3.eth.contract(address=Web3.to_checksum_address(factory_address), abi=LAUNCHED_TOKEN_ABI)
 
@@ -105,7 +114,7 @@ class PonsExecutionAdapter(ExecutionAdapter):
             expected, fee_bps, creator_tax, snipe_tax = await asyncio.to_thread(_quote_buy, curve, quote_in, self._account.address)
             if expected <= 0:
                 raise RuntimeError("Pons quote returned zero tokens")
-            min_out = expected * (BPS - self._slippage_bps) // BPS
+            min_out = expected * (BPS - self._buy_slippage_bps) // BPS
             tx_hash = await asyncio.to_thread(
                 self._send,
                 curve.functions.buy(quote_in, min_out, self._account.address),
@@ -126,7 +135,7 @@ class PonsExecutionAdapter(ExecutionAdapter):
             expected = await asyncio.to_thread(_quote_sell, curve, token_amount)
             if expected <= 0:
                 raise RuntimeError("Pons sell quote returned zero")
-            min_out = expected * (BPS - self._slippage_bps) // BPS
+            min_out = expected * (BPS - self._sell_slippage_bps) // BPS
             token_contract = self._w3.eth.contract(address=Web3.to_checksum_address(token.mint), abi=ERC20_ABI)
             await asyncio.to_thread(self._send, token_contract.functions.approve(curve_addr, token_amount), 0)
             tx_hash = await asyncio.to_thread(self._send, curve.functions.sell(token_amount, min_out, self._account.address), 0)
