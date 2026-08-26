@@ -97,11 +97,11 @@ class PonsExecutionAdapter(ExecutionAdapter):
             raise RuntimeError("Pons launch is no longer on the bonding curve")
         return Web3.to_checksum_address(launch[1])
 
-    async def buy(self, token: TokenSnapshot, amount_sol: float) -> OrderResult:
+    async def buy(self, token: TokenSnapshot, amount_eth: float) -> OrderResult:
         try:
             curve_addr = await asyncio.to_thread(self._curve, token.mint)
             curve = self._w3.eth.contract(address=curve_addr, abi=CURVE_EXEC_ABI)
-            quote_in = max(1, int(float(amount_sol) * 10**18))
+            quote_in = max(1, int(float(amount_eth) * 10**18))
             expected, fee_bps, creator_tax, snipe_tax = await asyncio.to_thread(_quote_buy, curve, quote_in, self._account.address)
             if expected <= 0:
                 raise RuntimeError("Pons quote returned zero tokens")
