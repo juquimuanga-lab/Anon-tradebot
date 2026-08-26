@@ -9,6 +9,7 @@ from pydantic import BaseModel, Field
 
 BondingCurvePhase = Literal["any", "pre_graduation", "post_graduation"]
 SniperStrategy = Literal["smart", "fast", "smart_money"]
+RulePlatform = Literal["solana", "fourmeme", "pons"]
 
 
 class TakeProfitLevel(BaseModel):
@@ -19,7 +20,7 @@ class TakeProfitLevel(BaseModel):
 class RuleParams(BaseModel):
     name: str = "default"
     # Platform-specific rules: existing rules default to Solana (Anoncoin/Pump.fun).
-    platform: Literal["solana", "fourmeme"] = "solana"
+    platform: RulePlatform = "solana"
     # Pump.fun strategy lane. Existing rules default to Smart for compatibility.
     strategy: SniperStrategy = "smart"
     max_buy_size_sol: float = 0.1
