@@ -385,18 +385,18 @@ class ExecutionRouter:
                 return NoWalletConnectedAdapter(
                     "Pons/Robinhood Chain live trading is disabled; set ROBINHOOD_PONS_TRADING_ENABLED=true."
                 )
-            raw_evm_key = await secrets_manager.get_bsc_wallet_private_key(owner_user_id)
-            if not raw_evm_key:
+            raw_robinhood_key = await secrets_manager.get_robinhood_wallet_private_key(owner_user_id)
+            if not raw_robinhood_key:
                 return NoWalletConnectedAdapter(
-                    "No EVM wallet connected. Use /connectbscwallet to connect the EVM wallet."
+                    "No Robinhood Chain wallet connected. Use /connectrobinhoodwallet first."
                 )
-            from app.execution.onchain.bsc_wallet import load_bsc_account, InvalidBscWalletKeyError
+            from app.execution.onchain.robinhood_wallet import load_robinhood_account, InvalidRobinhoodWalletKeyError
             try:
-                account = load_bsc_account(raw_evm_key)
-            except InvalidBscWalletKeyError:
-                logger.error("stored_evm_wallet_key_invalid", extra={"owner_user_id": owner_user_id, "source": SOURCE_PONS})
-                return NoWalletConnectedAdapter("Stored EVM wallet is invalid. Reconnect it.")
-            rpc_url = getattr(settings, "robinhood_rpc_url", None) or getattr(settings, "robinhood_alchemy_rpc_url", None)
+                account = load_robinhood_account(raw_robinhood_key)
+            except InvalidRobinhoodWalletKeyError:
+                logger.error("stored_robinhood_wallet_key_invalid", extra={"owner_user_id": owner_user_id, "source": SOURCE_PONS})
+                return NoWalletConnectedAdapter("Stored Robinhood wallet is invalid. Reconnect it.")
+            rpc_url = getattr(settings, "robinhood_rpc_url", None) or getattr(settings, "robinhood_rpc_override_url", None)
             if not rpc_url:
                 return NoWalletConnectedAdapter("Robinhood Chain RPC is not configured.")
             logger.info("pons_execution_adapter_selected", extra={"owner_user_id": owner_user_id, "source": SOURCE_PONS, "wallet": account.address})
