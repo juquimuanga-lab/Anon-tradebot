@@ -6,6 +6,7 @@ contracts. No Pons API is required for launch discovery.
 from __future__ import annotations
 
 import asyncio
+import logging
 import time
 from datetime import datetime, timezone
 from typing import Any, Optional
@@ -131,21 +132,73 @@ class PonsClient:
     async def _call(self, fn, *args):
         return await asyncio.to_thread(fn, *args)
 
-    async def poll_new_launches(self, from_block: int = 0, max_blocks: int = 250) -> list[dict[str, Any]]:
+    async def poll_new_launches(
+        self,
+        from_block: int = 0,
+        max_blocks: int = 10,
+    ) -> list[dict[str, Any]]:
+        """
+        Poll Pons TokenLaunched events in small block windows.
+
+        Alchemy's Robinhood Chain eth_getLogs endpoint limits the free tier
+        to a 10-block range per request.  The previous implementation used
+        a 250-block request, which produced HTTP 400 responses and caused
+        the Railway log spam seen in production.
+
+        We deliberately keep each request to <=10 blocks and only advance
+        the watermark after the complete scan succeeds.  That prevents a
+        transient RPC failure from silently skipping launches.
+        """
         w3 = await asyncio.to_thread(_build_web3)
-        latest = await self._call(lambda: w3.eth.block_number)
+        latest = int(await self._call(lambda: w3.eth.block_number))
+
+        # The caller may provide a larger value, but never exceed the
+        # provider-safe window.
+        window = max(1, min(int(max_blocks or 10), 10))
+
         start = self._watermark_block or from_block or max(0, latest - 2)
-        start = min(start, latest)
-        if latest - start > max_blocks:
-            start = latest - max_blocks
-        if start > latest:
+        start = min(int(start), latest)
+
+        factory_address = (
+            getattr(settings, "pons_factory_address", None)
+            or PONS_FACTORY_ADDRESS
+        )
+        factory = w3.eth.contract(
+            address=Web3.to_checksum_address(factory_address),
+            abi=FACTORY_ABI,
+        )
+        event = factory.events.TokenLaunched()
+
+        entries = []
+        cursor = start
+
+        try:
+            while cursor <= latest:
+                chunk_end = min(cursor + window - 1, latest)
+
+                chunk = await self._call(
+                    lambda c=cursor, e=chunk_end: event.get_logs(
+                        from_block=c,
+                        to_block=e,
+                    )
+                )
+                entries.extend(chunk)
+                cursor = chunk_end + 1
+
+        except Exception as exc:
+            # Do not advance the watermark on a failed chunk. The next poll
+            # will retry it rather than losing a launch.
+            logger = logging.getLogger(__name__)
+            logger.warning(
+                "pons_launch_poll_failed "
+                f"from_block={cursor} to_block={latest} "
+                f"error_type={type(exc).__name__} error={exc}"
+            )
             return []
 
-        factory_address = getattr(settings, "pons_factory_address", None) or PONS_FACTORY_ADDRESS
-        factory = w3.eth.contract(address=Web3.to_checksum_address(factory_address), abi=FACTORY_ABI)
-        event = factory.events.TokenLaunched()
-        entries = await self._call(lambda: event.get_logs(from_block=start, to_block=latest))
+        # Everything through `latest` was scanned successfully.
         self._watermark_block = latest + 1
+
         if not self._initialized:
             self._initialized = True
             return []
@@ -154,21 +207,24 @@ class PonsClient:
         for item in entries:
             args = item["args"]
             pair_token = Web3.to_checksum_address(args["pairToken"])
-            discovered.append({
-                "mint": Web3.to_checksum_address(args["token"]),
-                "curve": Web3.to_checksum_address(args["curve"]),
-                "creator": Web3.to_checksum_address(args["deployer"]),
-                "deployer": Web3.to_checksum_address(args["deployer"]),
-                "pair_token": pair_token,
-                "launch_config_id": int(args["launchConfigId"]),
-                "graduation_threshold": int(args["graduationThreshold"]),
-                "tx_hash": item["transactionHash"].hex(),
-                "block_number": int(item["blockNumber"]),
-                "launch_block": int(item["blockNumber"]),
-                "log_index": int(item["logIndex"]),
-                "created_on": datetime.now(timezone.utc),
-                "source": "pons",
-            })
+            discovered.append(
+                {
+                    "mint": Web3.to_checksum_address(args["token"]),
+                    "curve": Web3.to_checksum_address(args["curve"]),
+                    "creator": Web3.to_checksum_address(args["deployer"]),
+                    "deployer": Web3.to_checksum_address(args["deployer"]),
+                    "pair_token": pair_token,
+                    "launch_config_id": int(args["launchConfigId"]),
+                    "graduation_threshold": int(args["graduationThreshold"]),
+                    "tx_hash": item["transactionHash"].hex(),
+                    "block_number": int(item["blockNumber"]),
+                    "launch_block": int(item["blockNumber"]),
+                    "log_index": int(item["logIndex"]),
+                    "created_on": datetime.now(timezone.utc),
+                    "source": "pons",
+                }
+            )
+
         return discovered
 
     async def market_snapshot(self, token: str, metadata: dict[str, Any] | None = None) -> dict[str, Any]:
