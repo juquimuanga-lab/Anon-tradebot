@@ -281,105 +281,18 @@ class ExecutionRouter:
 
 
         # --------------------------------------------------------------
-        # Both real sources require a wallet.
+        # All real sources require a rule owner.
         # --------------------------------------------------------------
 
         if owner_user_id is None:
-
-            return NoWalletConnectedAdapter(
-                (
-                    "No wallet owner is associated "
-                    "with this trade."
-                )
-            )
-
-
-        # --------------------------------------------------------------
-        # Load admin wallet.
-        #
-        # The same connected wallet used by the Telegram admin is used
-        # for both Anoncoin and Pump.fun.
-        # --------------------------------------------------------------
-
-        keypair = (
-            await self._load_wallet_adapter(
-                owner_user_id,
-                source,
-            )
-        )
-
-
-        if keypair is None:
-
-            return NoWalletConnectedAdapter(
-                (
-                    "Live trading needs a connected "
-                    "wallet. The admin who owns this "
-                    "rule should run /connectwallet first."
-                )
-            )
-
-
-        # --------------------------------------------------------------
-        # FOUR.MEME / BSC
-        # --------------------------------------------------------------
-
-        if source == SOURCE_FOURMEME:
-            if not settings.fourmeme_trading_enabled:
-                block_log = {
-                    "source": SOURCE_FOURMEME,
-                    "reason": "deployment_trading_disabled",
-                }
-                logger.warning(
-                    "fourmeme_execution_blocked " + json.dumps(
-                        block_log, default=str, separators=(",", ":"), sort_keys=True
-                    ),
-                    extra=block_log,
-                )
-                return NoWalletConnectedAdapter(
-                    "Four.meme live trading is disabled at deployment level; set FOURMEME_TRADING_ENABLED=true."
-                )
-            state = await repo.get_or_create_bot_state(owner_user_id)
-            if not state.fourmeme_trading_enabled:
-                return NoWalletConnectedAdapter(
-                    "Four.meme trading is paused. Use /enablefourmeme to resume."
-                )
-
-            raw_bsc_key = await secrets_manager.get_bsc_wallet_private_key(owner_user_id)
-            if not raw_bsc_key:
-                return NoWalletConnectedAdapter(
-                    "No BSC wallet connected. Use /connectbscwallet first."
-                )
-            from app.execution.onchain.bsc_wallet import load_bsc_account, InvalidBscWalletKeyError
-            try:
-                account = load_bsc_account(raw_bsc_key)
-            except InvalidBscWalletKeyError:
-                logger.error("stored_bsc_wallet_key_invalid", extra={"owner_user_id": owner_user_id})
-                return NoWalletConnectedAdapter("Stored BSC wallet is invalid. Reconnect it.")
-            adapter_log = {
-                "source": SOURCE_FOURMEME,
-                "owner_user_id": owner_user_id,
-                "rpc_configured": bool(settings.bsc_rpc_url),
-                "bsc_wallet_connected": True,
-            }
-            logger.info(
-                "fourmeme_execution_adapter_selected " + json.dumps(
-                    adapter_log, default=str, separators=(",", ":"), sort_keys=True
-                ),
-                extra=adapter_log,
-            )
-            return FourMemeExecutionAdapter(
-                account=account,
-                rpc_url=settings.bsc_rpc_url,
-                slippage_bps=settings.fourmeme_default_slippage_bps,
-                helper_address=settings.fourmeme_helper3_address,
-                token_manager_address=settings.fourmeme_token_manager2_address,
-            )
+            return NoWalletConnectedAdapter("No wallet owner is associated with this trade.")
 
         # --------------------------------------------------------------
         # PONS / ROBINHOOD CHAIN
         # --------------------------------------------------------------
-
+        # IMPORTANT: this branch MUST run before the Solana wallet loader.
+        # Pons is an EVM/ETH source and has its own encrypted wallet slot.
+        # --------------------------------------------------------------
         if source == SOURCE_PONS:
             if not getattr(settings, "robinhood_pons_trading_enabled", False):
                 return NoWalletConnectedAdapter(
@@ -390,20 +303,65 @@ class ExecutionRouter:
                 return NoWalletConnectedAdapter(
                     "No Robinhood Chain wallet connected. Use /connectrobinhoodwallet first."
                 )
-            from app.execution.onchain.robinhood_wallet import load_robinhood_account, InvalidRobinhoodWalletKeyError
+            from app.execution.onchain.robinhood_wallet import (
+                load_robinhood_account,
+                InvalidRobinhoodWalletKeyError,
+                resolve_robinhood_rpc_url,
+            )
             try:
                 account = load_robinhood_account(raw_robinhood_key)
-            except InvalidRobinhoodWalletKeyError:
-                logger.error("stored_robinhood_wallet_key_invalid", extra={"owner_user_id": owner_user_id, "source": SOURCE_PONS})
-                return NoWalletConnectedAdapter("Stored Robinhood wallet is invalid. Reconnect it.")
-            rpc_url = getattr(settings, "robinhood_rpc_url", None) or getattr(settings, "robinhood_rpc_override_url", None)
-            if not rpc_url:
-                return NoWalletConnectedAdapter("Robinhood Chain RPC is not configured.")
-            logger.info("pons_execution_adapter_selected", extra={"owner_user_id": owner_user_id, "source": SOURCE_PONS, "wallet": account.address})
+                rpc_url = resolve_robinhood_rpc_url(settings)
+            except (InvalidRobinhoodWalletKeyError, RuntimeError, ValueError) as exc:
+                logger.error(
+                    "stored_robinhood_wallet_or_rpc_invalid",
+                    extra={"owner_user_id": owner_user_id, "source": SOURCE_PONS, "error": str(exc)},
+                )
+                return NoWalletConnectedAdapter(str(exc))
+            logger.info(
+                "pons_execution_adapter_selected",
+                extra={"owner_user_id": owner_user_id, "source": SOURCE_PONS, "wallet": account.address},
+            )
             return PonsExecutionAdapter(
                 account=account,
                 rpc_url=rpc_url,
                 slippage_bps=getattr(settings, "pons_buy_slippage_bps", 1000),
+            )
+
+        # --------------------------------------------------------------
+        # FOUR.MEME / BSC
+        # --------------------------------------------------------------
+        if source == SOURCE_FOURMEME:
+            if not settings.fourmeme_trading_enabled:
+                return NoWalletConnectedAdapter(
+                    "Four.meme live trading is disabled at deployment level; set FOURMEME_TRADING_ENABLED=true."
+                )
+            state = await repo.get_or_create_bot_state(owner_user_id)
+            if not state.fourmeme_trading_enabled:
+                return NoWalletConnectedAdapter("Four.meme trading is paused. Use /enablefourmeme to resume.")
+            raw_bsc_key = await secrets_manager.get_bsc_wallet_private_key(owner_user_id)
+            if not raw_bsc_key:
+                return NoWalletConnectedAdapter("No BSC wallet connected. Use /connectbscwallet first.")
+            from app.execution.onchain.bsc_wallet import load_bsc_account, InvalidBscWalletKeyError
+            try:
+                account = load_bsc_account(raw_bsc_key)
+            except InvalidBscWalletKeyError:
+                logger.error("stored_bsc_wallet_key_invalid", extra={"owner_user_id": owner_user_id})
+                return NoWalletConnectedAdapter("Stored BSC wallet is invalid. Reconnect it.")
+            return FourMemeExecutionAdapter(
+                account=account,
+                rpc_url=settings.bsc_rpc_url,
+                slippage_bps=settings.fourmeme_default_slippage_bps,
+                helper_address=settings.fourmeme_helper3_address,
+                token_manager_address=settings.fourmeme_token_manager2_address,
+            )
+
+        # --------------------------------------------------------------
+        # SOLANA SOURCES (Anoncoin + Pump.fun)
+        # --------------------------------------------------------------
+        keypair = await self._load_wallet_adapter(owner_user_id, source)
+        if keypair is None:
+            return NoWalletConnectedAdapter(
+                "Live trading needs a connected Solana wallet. The admin who owns this rule should run /connectwallet first."
             )
 
         # --------------------------------------------------------------
