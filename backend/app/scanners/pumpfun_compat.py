@@ -6,18 +6,15 @@ secondary instruction decoder cannot parse even though the CreateEvent is
 valid. In that case the watcher used to discard the launch before the global
 launch-safety gate could run.
 
-This module installs a narrow fallback around extract_pumpfun_create:
-- use the existing instruction decoder first;
-- if it cannot decode the transaction, recover the CreateEvent from the
-  transaction log messages already returned by getTransaction;
-- infer create/create_v2 from instruction data when possible, otherwise use
-  legacy create as the conservative compatibility label.
-
-It does not bypass the launch-safety filter or admin ruleset.
+This module installs narrow compatibility wrappers around the existing
+watcher/execution functions. It deliberately avoids replacing the large
+Pump.fun scanner modules so their existing safety, Graduation Hunter,
+Smart Money, and trading behavior remain untouched.
 """
 
 from __future__ import annotations
 
+import asyncio
 import logging
 
 from app.scanners import onchain_watcher
@@ -27,6 +24,7 @@ logger = logging.getLogger("app.scanners.pumpfun_compat")
 
 _INSTALLED = False
 _ORIGINAL_EXTRACT = onchain_watcher.extract_pumpfun_create
+_ORIGINAL_TX_FETCH = onchain_watcher._get_confirmed_transaction_with_fallback
 
 
 def _get_logs(tx) -> list[str]:
@@ -109,12 +107,111 @@ def _extract_with_fallback(tx):
     return fallback
 
 
+async def _tx_fetch_without_launch_version_probe(rpc_url: str, signature: str, *, purpose: str):
+    """Skip the redundant launch-version getTransaction hot-path.
+
+    The Pump.fun CreateEvent already carries the mint/creator and is the
+    authoritative discovery signal used by the websocket worker. Launch
+    safety still performs its own transaction retrieval later. Keeping those
+    two responsibilities separate avoids one extra Helius getTransaction per
+    launch while preserving all safety checks.
+    """
+    if purpose == "pumpfun_launch_version":
+        return None
+    return await _ORIGINAL_TX_FETCH(rpc_url, signature, purpose=purpose)
+
+
+class _SuppressRedundantLaunchVersionLog(logging.Filter):
+    """Hide the old informational fallback message after the probe is removed."""
+
+    _TARGET = "pumpfun_launch_version_verification_unavailable_using_event"
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        return self._TARGET not in record.getMessage()
+
+
+async def _get_launch_transactions_with_refresh(original, rpc_url: str, curve_address: str, *, limit: int):
+    """Retry launch transaction discovery when signatures race transaction indexing.
+
+    The existing Pump.fun implementation already has provider fallback and
+    per-signature retries. This wrapper adds two delayed *signature refreshes*
+    only when the first pass returns no usable transaction bodies. That avoids
+    changing the normal path while recovering the common Helius propagation
+    race where signatures appear before getTransaction becomes readable.
+    """
+    first = await original(rpc_url, curve_address, limit=limit)
+    if first:
+        return first
+
+    # A second signature list after propagation delay is more useful than
+    # repeatedly asking getTransaction for the exact same stale signatures.
+    for delay in (1.5, 3.0):
+        await asyncio.sleep(delay)
+        refreshed = await original(rpc_url, curve_address, limit=limit)
+        if refreshed:
+            logger.info(
+                "pumpfun_launch_safety_transaction_refresh_recovered",
+                extra={
+                    "curve": curve_address,
+                    "delay_seconds": delay,
+                    "transactions": len(refreshed),
+                },
+            )
+            return refreshed
+
+    logger.warning(
+        "pumpfun_launch_safety_transaction_refresh_exhausted",
+        extra={"curve": curve_address, "attempts": 3},
+    )
+    return first
+
+
+def _patch_pumpfun_transaction_recovery() -> None:
+    """Patch only the existing launch-transaction helper after import."""
+    try:
+        from app.execution.onchain import pumpfun
+    except Exception:
+        logger.debug("pumpfun_transaction_recovery_patch_deferred", exc_info=True)
+        return
+
+    original = getattr(pumpfun, "_get_launch_transactions", None)
+    if original is None or getattr(original, "_anon_refresh_patch", False):
+        return
+
+    async def wrapped(rpc_url: str, curve_address: str, *, limit: int):
+        return await _get_launch_transactions_with_refresh(
+            original,
+            rpc_url,
+            curve_address,
+            limit=limit,
+        )
+
+    wrapped._anon_refresh_patch = True
+    pumpfun._get_launch_transactions = wrapped
+    logger.info("pumpfun_launch_transaction_refresh_patch_installed")
+
+
 def install_pumpfun_compat() -> None:
-    """Install the fallback exactly once during application startup."""
+    """Install the narrow compatibility/recovery patches exactly once."""
     global _INSTALLED
     if _INSTALLED:
         return
 
     onchain_watcher.extract_pumpfun_create = _extract_with_fallback
+    onchain_watcher._get_confirmed_transaction_with_fallback = (
+        _tx_fetch_without_launch_version_probe
+    )
+
+    # The server imports this module before ScannerService, so pumpfun.py is
+    # normally importable here. If an unusual import order occurs, retry on the
+    # first install call without failing application startup.
+    _patch_pumpfun_transaction_recovery()
+
+    # The old message described a probe we have intentionally removed. Filter
+    # only that exact message; all real RPC/safety warnings remain visible.
+    onchain_watcher.logger.addFilter(
+        _SuppressRedundantLaunchVersionLog()
+    )
+
     _INSTALLED = True
     logger.info("pumpfun_compat_fallback_installed")
