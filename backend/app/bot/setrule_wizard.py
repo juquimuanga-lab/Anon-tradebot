@@ -41,17 +41,12 @@ def _parse_take_profit(raw: str) -> list[TakeProfitLevel]:
     return levels
 
 
-
 def _parse_strategy(raw: str) -> str:
     value = sanitize_text(raw).lower().replace("-", "_").replace(" ", "_")
     aliases = {
-        "fast": "fast",
-        "fast_sniper": "fast",
-        "smart": "smart",
-        "smart_filter": "smart",
-        "smart_money": "smart_money",
-        "smart_money_copy": "smart_money",
-        "copy": "smart_money",
+        "fast": "fast", "fast_sniper": "fast", "smart": "smart",
+        "smart_filter": "smart", "smart_money": "smart_money",
+        "smart_money_copy": "smart_money", "copy": "smart_money",
         "copy_wallet": "smart_money",
     }
     if value not in aliases:
@@ -60,21 +55,15 @@ def _parse_strategy(raw: str) -> str:
 
 
 def _steps(platform: str) -> list[Step]:
-    buy_key = "max_buy_size_bnb" if platform == "fourmeme" else "max_buy_size_sol"
     if platform == "pons":
-        buy_unit = "ETH"
-        buy_default = 0.005
+        buy_key, buy_unit, buy_default = "max_buy_size_sol", "ETH", 0.005
+    elif platform == "fourmeme":
+        buy_key, buy_unit, buy_default = "max_buy_size_bnb", "BNB", 0.01
     else:
-        buy_unit = "BNB" if platform == "fourmeme" else "SOL"
-        buy_default = 0.01 if platform == "fourmeme" else 0.1
+        buy_key, buy_unit, buy_default = "max_buy_size_sol", "SOL", 0.1
     return [
         Step("name", "Step 1/20 - Name this rule set (e.g. `sniper-default`):", sanitize_text, default="default"),
-        Step(
-            "strategy",
-            "Step 2/20 - Entry strategy: `fast` for ⚡ Fast Sniper, `smart` for 🧠 Smart Filter, or `smart_money` for 🐋 Smart Money Copy:",
-            _parse_strategy,
-            default="smart",
-        ),
+        Step("strategy", "Step 2/20 - Entry strategy: `fast` for ⚡ Fast Sniper, `smart` for 🧠 Smart Filter, or `smart_money` for 🐋 Smart Money Copy:", _parse_strategy, default="smart"),
         Step(buy_key, f"Step 3/20 - Max buy size per trade, in {buy_unit} (e.g. `0.01`):", lambda r: parse_float(r, 0.000001, 1000), default=buy_default),
         Step("min_liquidity_usd", "Step 4/20 - Minimum liquidity in USD (e.g. `1000`):", lambda r: parse_float(r, 0, 1e9)),
         Step("min_holders", "Step 5/20 - Minimum holder count (e.g. `10`):", lambda r: parse_int(r, 0, 1_000_000)),
@@ -116,8 +105,7 @@ async def _start(update: Update, context: ContextTypes.DEFAULT_TYPE, platform: s
     labels = {"fourmeme": "FOUR.MEME / BSC", "pons": "ROBINHOOD CHAIN / PONS (ETH)", "solana": "SOLANA (Anoncoin + Pump.fun)"}
     label = labels.get(platform, "SOLANA (Anoncoin + Pump.fun)")
     await update.message.reply_text(
-        f"Let's build a new *{label}* rule set. Send /cancel anytime to stop.\n\n"
-        + _steps(platform)[0].prompt,
+        f"Let's build a new *{label}* rule set. Send /cancel anytime to stop.\n\n" + _steps(platform)[0].prompt,
         parse_mode="Markdown",
     )
     return COLLECTING
@@ -127,7 +115,6 @@ async def setrule_collect(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     state = context.user_data.get("setrule")
     if not state:
         return ConversationHandler.END
-
     platform = state.get("platform", "solana")
     steps = _steps(platform)
     text = (update.message.text or "").strip()
@@ -135,7 +122,6 @@ async def setrule_collect(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         context.user_data.pop("setrule", None)
         await update.message.reply_text("Rule creation cancelled.")
         return ConversationHandler.END
-
     step = steps[state["index"]]
     if text == "/skip":
         if not step.optional:
@@ -148,36 +134,36 @@ async def setrule_collect(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         except (ValueError, ZeroDivisionError) as exc:
             await update.message.reply_text(f"Invalid value ({exc}). Try again.\n\n{step.prompt}")
             return COLLECTING
-
     state["index"] += 1
     if state["index"] >= len(steps):
         return await _finish_wizard(update, context)
-
     await update.message.reply_text(steps[state["index"]].prompt)
     return COLLECTING
 
 
 async def _finish_wizard(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     state = context.user_data.pop("setrule")
-    answers = state["answers"]
+    answers = dict(state["answers"])
     platform = state.get("platform", "solana")
-    # The deployed RuleParams model predates the Pons platform literal.
-    # Validate against its Solana-compatible shape, then restore the explicit
-    # Pons platform tag before persisting.
-    requested_platform = platform
-    answers["platform"] = "solana" if platform == "pons" else platform
+
+    # Pons is now a first-class RuleParams platform. Do not coerce it to
+    # Solana and mutate it back; that workaround caused the production
+    # Pydantic validation crash.
+    answers["platform"] = platform
     if platform == "fourmeme":
         answers.setdefault("max_buy_size_sol", 0.1)
     else:
         answers.setdefault("max_buy_size_bnb", 0.01)
 
     params = RuleParams(**answers)
-    if requested_platform == "pons":
-        params.platform = "pons"
     token = confirmation_store.create("save_rule", {"params": params.model_dump(), "user_id": update.effective_user.id})
-    unit = "BNB" if platform == "fourmeme" else ("ETH" if platform == "pons" else "SOL")
-    label = "FOUR.MEME" if platform == "fourmeme" else ("ROBINHOOD / PONS" if platform == "pons" else "SOLANA")
-    buy = params.max_buy_size_bnb if platform == "fourmeme" else params.max_buy_size_sol
+    if platform == "fourmeme":
+        unit, label, buy = "BNB", "FOUR.MEME", params.max_buy_size_bnb
+    elif platform == "pons":
+        unit, label, buy = "ETH", "ROBINHOOD / PONS", params.max_buy_size_sol
+    else:
+        unit, label, buy = "SOL", "SOLANA", params.max_buy_size_sol
+
     summary = (
         f"*{label} rule '{params.name}' ready*\n"
         f"Max buy: {buy} {unit} | Min liq: ${params.min_liquidity_usd:,.0f} | "
@@ -188,18 +174,9 @@ async def _finish_wizard(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         f"Save this *{label}* rule set now?"
     )
     keyboard = InlineKeyboardMarkup(
-        [[InlineKeyboardButton(
-            "💾 Save & Activate",
-            callback_data=f"confirm:{token}:save_{params.strategy}"
-        )],
-         [InlineKeyboardButton(
-            "💾 Save only",
-            callback_data=f"confirm:{token}:save_only"
-        ),
-          InlineKeyboardButton(
-            "❌ Discard",
-            callback_data=f"confirm:{token}:discard"
-        )]]
+        [[InlineKeyboardButton("💾 Save & Activate", callback_data=f"confirm:{token}:save_{params.strategy}")],
+         [InlineKeyboardButton("💾 Save only", callback_data=f"confirm:{token}:save_only"),
+          InlineKeyboardButton("❌ Discard", callback_data=f"confirm:{token}:discard")]]
     )
     await update.message.reply_text(summary, parse_mode="Markdown", reply_markup=keyboard)
     return ConversationHandler.END
