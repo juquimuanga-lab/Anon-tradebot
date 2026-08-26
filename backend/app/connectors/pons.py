@@ -19,47 +19,9 @@ PONS_CHAIN_ID = 4663
 PONS_FACTORY_ADDRESS = "0x7eD598BcEf8bd9Edd8C97A195C6d13f40801EC7e"
 PONS_NATIVE_QUOTE = "0x0000000000000000000000000000000000000000"
 
-FACTORY_ABI = [
-    {
-        "anonymous": False,
-        "inputs": [
-            {"indexed": True, "name": "token", "type": "address"},
-            {"indexed": True, "name": "curve", "type": "address"},
-            {"indexed": True, "name": "deployer", "type": "address"},
-            {"indexed": False, "name": "pairToken", "type": "address"},
-            {"indexed": False, "name": "launchConfigId", "type": "uint256"},
-            {"indexed": False, "name": "graduationThreshold", "type": "uint256"},
-        ],
-        "name": "TokenLaunched",
-        "type": "event",
-    },
-]
+FACTORY_ABI = [{"anonymous": False, "inputs": [{"indexed": True, "name": "token", "type": "address"}, {"indexed": True, "name": "curve", "type": "address"}, {"indexed": True, "name": "deployer", "type": "address"}, {"indexed": False, "name": "pairToken", "type": "address"}, {"indexed": False, "name": "launchConfigId", "type": "uint256"}, {"indexed": False, "name": "graduationThreshold", "type": "uint256"}], "name": "TokenLaunched", "type": "event"}]
 
-LAUNCHED_TOKEN_ABI = [
-    {
-        "inputs": [{"name": "token", "type": "address"}],
-        "name": "getLaunchedToken",
-        "outputs": [
-            {"name": "token", "type": "address"},
-            {"name": "curve", "type": "address"},
-            {"name": "deployer", "type": "address"},
-            {"name": "creatorFeeRecipient", "type": "address"},
-            {"name": "pairToken", "type": "address"},
-            {"name": "graduationThreshold", "type": "uint256"},
-            {"name": "poolFee", "type": "uint24"},
-            {"name": "tickSpacing", "type": "int24"},
-            {"name": "creatorTaxBps", "type": "uint16"},
-            {"name": "buybackEnabled", "type": "bool"},
-            {"name": "phase", "type": "uint8"},
-            {"name": "sweptQuote", "type": "uint256"},
-            {"name": "sweptTokens", "type": "uint256"},
-            {"name": "sweptAt", "type": "uint256"},
-            {"name": "exists", "type": "bool"},
-        ],
-        "stateMutability": "view",
-        "type": "function",
-    }
-]
+LAUNCHED_TOKEN_ABI = [{"inputs": [{"name": "token", "type": "address"}], "name": "getLaunchedToken", "outputs": [{"name": "token", "type": "address"}, {"name": "curve", "type": "address"}, {"name": "deployer", "type": "address"}, {"name": "creatorFeeRecipient", "type": "address"}, {"name": "pairToken", "type": "address"}, {"name": "graduationThreshold", "type": "uint256"}, {"name": "poolFee", "type": "uint24"}, {"name": "tickSpacing", "type": "int24"}, {"name": "creatorTaxBps", "type": "uint16"}, {"name": "buybackEnabled", "type": "bool"}, {"name": "phase", "type": "uint8"}, {"name": "sweptQuote", "type": "uint256"}, {"name": "sweptTokens", "type": "uint256"}, {"name": "sweptAt", "type": "uint256"}, {"name": "exists", "type": "bool"}], "stateMutability": "view", "type": "function"}]
 
 CURVE_ABI = [
     {"inputs": [], "name": "getReserves", "outputs": [{"type": "uint256"}, {"type": "uint256"}], "stateMutability": "view", "type": "function"},
@@ -69,14 +31,7 @@ CURVE_ABI = [
     {"inputs": [{"name": "recipient", "type": "address"}], "name": "currentSnipeTaxBps", "outputs": [{"type": "uint256"}], "stateMutability": "view", "type": "function"},
     {"inputs": [], "name": "graduated", "outputs": [{"type": "bool"}], "stateMutability": "view", "type": "function"},
     {"inputs": [], "name": "readyToGraduate", "outputs": [{"type": "bool"}], "stateMutability": "view", "type": "function"},
-    {"anonymous": False, "inputs": [
-        {"indexed": True, "name": "buyer", "type": "address"},
-        {"indexed": True, "name": "recipient", "type": "address"},
-        {"indexed": False, "name": "quoteIn", "type": "uint256"},
-        {"indexed": False, "name": "tokensOut", "type": "uint256"},
-        {"indexed": False, "name": "fee", "type": "uint256"},
-        {"indexed": False, "name": "tax", "type": "uint256"},
-    ], "name": "CurveBuy", "type": "event"},
+    {"anonymous": False, "inputs": [{"indexed": True, "name": "buyer", "type": "address"}, {"indexed": True, "name": "recipient", "type": "address"}, {"indexed": False, "name": "quoteIn", "type": "uint256"}, {"indexed": False, "name": "tokensOut", "type": "uint256"}, {"indexed": False, "name": "fee", "type": "uint256"}, {"indexed": False, "name": "tax", "type": "uint256"}], "name": "CurveBuy", "type": "event"},
 ]
 
 ERC20_ABI = [
@@ -85,16 +40,7 @@ ERC20_ABI = [
     {"inputs": [], "name": "decimals", "outputs": [{"type": "uint8"}], "stateMutability": "view", "type": "function"},
     {"inputs": [], "name": "totalSupply", "outputs": [{"type": "uint256"}], "stateMutability": "view", "type": "function"},
     {"inputs": [{"name": "spender", "type": "address"}, {"name": "amount", "type": "uint256"}], "name": "approve", "outputs": [{"type": "bool"}], "stateMutability": "nonpayable", "type": "function"},
-    {
-        "anonymous": False,
-        "inputs": [
-            {"indexed": True, "name": "from", "type": "address"},
-            {"indexed": True, "name": "to", "type": "address"},
-            {"indexed": False, "name": "value", "type": "uint256"},
-        ],
-        "name": "Transfer",
-        "type": "event",
-    },
+    {"anonymous": False, "inputs": [{"indexed": True, "name": "from", "type": "address"}, {"indexed": True, "name": "to", "type": "address"}, {"indexed": False, "name": "value", "type": "uint256"}], "name": "Transfer", "type": "event"},
 ]
 
 
@@ -141,20 +87,42 @@ class PonsClient:
     async def _call(self, fn, *args):
         return await asyncio.to_thread(fn, *args)
 
+    async def _get_logs_chunked(self, event, start_block: int, end_block: int, initial_chunk: int = 10):
+        """Read logs in provider-safe windows, shrinking on RPC 400/range errors."""
+        logs = []
+        cursor = int(start_block)
+        chunk_size = max(1, int(initial_chunk))
+        while cursor <= int(end_block):
+            chunk_end = min(cursor + chunk_size - 1, int(end_block))
+            try:
+                part = await self._call(
+                    lambda s=cursor, e=chunk_end: event.get_logs(from_block=s, to_block=e)
+                )
+                logs.extend(part)
+                cursor = chunk_end + 1
+                if chunk_size < initial_chunk:
+                    chunk_size = min(initial_chunk, chunk_size * 2)
+            except Exception as exc:
+                if chunk_size > 1:
+                    chunk_size = max(1, chunk_size // 2)
+                    continue
+                raise exc
+        return logs
+
     async def poll_new_launches(self, from_block: int = 0, max_blocks: int = 250) -> list[dict[str, Any]]:
         w3 = await asyncio.to_thread(_build_web3)
-        latest = await self._call(lambda: w3.eth.block_number)
+        latest = int(await self._call(lambda: w3.eth.block_number))
         start = self._watermark_block or from_block or max(0, latest - 2)
-        start = min(start, latest)
+        start = min(int(start), latest)
         if latest - start > max_blocks:
-            start = latest - max_blocks
+            start = latest - int(max_blocks)
         if start > latest:
             return []
 
         factory_address = getattr(settings, "pons_factory_address", None) or PONS_FACTORY_ADDRESS
         factory = w3.eth.contract(address=Web3.to_checksum_address(factory_address), abi=FACTORY_ABI)
         event = factory.events.TokenLaunched()
-        entries = await self._call(lambda: event.get_logs(from_block=start, to_block=latest))
+        entries = await self._get_logs_chunked(event, start, latest, initial_chunk=10)
         self._watermark_block = latest + 1
         if not self._initialized:
             self._initialized = True
@@ -211,61 +179,21 @@ class PonsClient:
         total_supply = int(await self._call(lambda: token_contract.functions.totalSupply().call()))
         eth_usd = await get_eth_usd_price()
 
-        token_per_eth = (reserve_token / 10**decimals) / (reserve_quote / 10**18) if reserve_quote else 0.0
         price_eth = (reserve_quote / 10**18) / (reserve_token / 10**decimals) if reserve_token else 0.0
         price_usd = price_eth * eth_usd
         market_cap_usd = (total_supply / 10**decimals) * price_usd
         liquidity_usd = 2.0 * (reserve_quote / 10**18) * eth_usd
-        # Holder detection must never silently turn an RPC/logging failure into
-        # ``holders=0``.  That was causing valid Pons candidates to pass the
-        # Graduation Hunter and then be rejected by the normal rule because the
-        # snapshot happened to be incomplete.
-        #
-        # We derive current holders from ERC-20 Transfer events rather than
-        # merely counting CurveBuy recipients.  A recipient can later transfer
-        # all tokens away, while a holder can receive tokens without buying from
-        # the curve.  Replaying transfers from launch -> latest gives us the
-        # current non-zero holder set without requiring one RPC balanceOf call
-        # per wallet.
+
         holders = 0
         holders_ready = False
         volume_quote = 0
         launch_block = int(metadata.get("launch_block") or 0)
 
-        async def _event_logs(event, start_block: int, end_block: int, chunk_size: int = 2000):
-            logs = []
-            cursor = start_block
-            while cursor <= end_block:
-                chunk_end = min(cursor + chunk_size - 1, end_block)
-                last_exc = None
-                for attempt, delay in enumerate((0.0, 0.35, 0.8), start=1):
-                    if delay:
-                        await asyncio.sleep(delay)
-                    try:
-                        part = await self._call(
-                            lambda s=cursor, e=chunk_end: event.get_logs(
-                                from_block=s, to_block=e
-                            )
-                        )
-                        logs.extend(part)
-                        last_exc = None
-                        break
-                    except Exception as exc:
-                        last_exc = exc
-                if last_exc is not None:
-                    raise last_exc
-                cursor = chunk_end + 1
-            return logs
-
         if launch_block:
-            latest_block = await self._call(lambda: w3.eth.block_number)
-
+            latest_block = int(await self._call(lambda: w3.eth.block_number))
             try:
                 transfer_event = token_contract.events.Transfer()
-                transfer_logs = await _event_logs(
-                    transfer_event, launch_block, latest_block
-                )
-
+                transfer_logs = await self._get_logs_chunked(transfer_event, launch_block, latest_block, initial_chunk=10)
                 balances: dict[str, int] = {}
                 zero_address = "0x0000000000000000000000000000000000000000"
                 for log in transfer_logs:
@@ -277,46 +205,17 @@ class PonsClient:
                         balances[sender] = balances.get(sender, 0) - value
                     if recipient != zero_address:
                         balances[recipient] = balances.get(recipient, 0) + value
-
                 holders = sum(1 for balance in balances.values() if balance > 0)
                 holders_ready = True
 
                 buy_event = curve.events.CurveBuy()
-                buy_logs = await _event_logs(
-                    buy_event, launch_block, latest_block
-                )
-                volume_quote = sum(
-                    int(log["args"].get("quoteIn", 0)) for log in buy_logs
-                )
-
-                logger.info(
-                    "pons_holder_snapshot_ready",
-                    extra={
-                        "mint": token_addr,
-                        "launch_block": launch_block,
-                        "latest_block": latest_block,
-                        "transfer_events": len(transfer_logs),
-                        "curve_buy_events": len(buy_logs),
-                        "holders": holders,
-                    },
-                )
+                buy_logs = await self._get_logs_chunked(buy_event, launch_block, latest_block, initial_chunk=10)
+                volume_quote = sum(int(log["args"].get("quoteIn", 0)) for log in buy_logs)
+                logger.info("pons_holder_snapshot_ready", extra={"mint": token_addr, "launch_block": launch_block, "latest_block": latest_block, "transfer_events": len(transfer_logs), "curve_buy_events": len(buy_logs), "holders": holders})
             except Exception as exc:
-                logger.warning(
-                    "pons_holder_snapshot_not_ready",
-                    extra={
-                        "mint": token_addr,
-                        "launch_block": launch_block,
-                        "error": str(exc),
-                    },
-                )
+                logger.warning("pons_holder_snapshot_not_ready", extra={"mint": token_addr, "launch_block": launch_block, "error": str(exc)})
         else:
-            logger.warning(
-                "pons_holder_snapshot_not_ready",
-                extra={
-                    "mint": token_addr,
-                    "error": "launch_block missing from discovery metadata",
-                },
-            )
+            logger.warning("pons_holder_snapshot_not_ready", extra={"mint": token_addr, "error": "launch_block missing from discovery metadata"})
 
         progress = 0.0
         threshold = int(launch[5])
