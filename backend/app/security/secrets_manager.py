@@ -20,6 +20,9 @@ def _wallet_key_name(user_id: int) -> str:
 def _bsc_wallet_key_name(user_id: int) -> str:
     return f"bsc_wallet_privkey_{user_id}"
 
+def _robinhood_wallet_key_name(user_id: int) -> str:
+    return f"robinhood_wallet_privkey_{user_id}"
+
 
 class SecretsManager:
     def __init__(self):
@@ -101,6 +104,15 @@ class SecretsManager:
 
     async def delete_bsc_wallet_private_key(self, user_id: int) -> None:
         await self.delete_secret(_bsc_wallet_key_name(user_id))
+
+    async def set_robinhood_wallet_private_key(self, user_id: int, raw_key: str) -> None:
+        await self.set_secret(_robinhood_wallet_key_name(user_id), raw_key)
+
+    async def get_robinhood_wallet_private_key(self, user_id: int) -> Optional[str]:
+        return await self.get_secret(_robinhood_wallet_key_name(user_id))
+
+    async def delete_robinhood_wallet_private_key(self, user_id: int) -> None:
+        await self.delete_secret(_robinhood_wallet_key_name(user_id))
 
 
 secrets_manager = SecretsManager()
