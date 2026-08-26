@@ -18,6 +18,7 @@ from app.execution.router import ExecutionRouter
 from app.metrics import metrics
 from app.positions.manager import PositionManager
 from app.scanners.pumpfun_compat import install_pumpfun_compat
+from app.scanners.pumpfun_resource_guard import install_pumpfun_resource_guard
 from app.scanners.scanner import ScannerService
 from app.security.secrets_manager import secrets_manager
 from app.storage import repository as repo
@@ -38,6 +39,9 @@ async def lifespan(app: FastAPI):
     # scanner starts. This only affects transaction decoding failures; the
     # global launch-safety gate and active Telegram ruleset remain unchanged.
     install_pumpfun_compat()
+    # Reduce Pump.fun stream RPC/queue pressure without disabling discovery,
+    # safety filters, Smart Money, or HTTP recovery.
+    install_pumpfun_resource_guard()
 
     anoncoin_client = AnoncoinClient(settings.anoncoin_base_url, secrets_manager.get_anoncoin_api_key)
     holders_client = HeliusClient(settings.helius_base_url, settings.helius_api_key)
