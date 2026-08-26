@@ -86,6 +86,8 @@ def build_application() -> Application:
     application.add_handler(CommandHandler("live", handlers_admin.live_cmd))
     application.add_handler(CommandHandler("disconnectwallet", handlers_wallet.disconnectwallet_cmd))
     application.add_handler(CommandHandler("disconnectbscwallet", handlers_wallet.disconnectbscwallet_cmd))
+    application.add_handler(CommandHandler("disconnectrobinhoodwallet", handlers_wallet.disconnectrobinhoodwallet_cmd))
+    application.add_handler(CommandHandler("robinhoodwallet", handlers_wallet.robinhoodwallet_cmd))
 
     connect_conv = ConversationHandler(
         entry_points=[CommandHandler("connect", handlers_admin.connect_start)],
@@ -116,6 +118,22 @@ def build_application() -> Application:
         name="connect_bsc_wallet_conversation",
     )
     application.add_handler(connectbscwallet_conv)
+
+
+    connectrobinhoodwallet_conv = ConversationHandler(
+        entry_points=[CommandHandler("connectrobinhoodwallet", handlers_wallet.connectrobinhoodwallet_start)],
+        states={
+            handlers_wallet.ROBINHOOD_CONNECT_WALLET_WAITING: [
+                MessageHandler(
+                    filters.TEXT & ~filters.COMMAND | filters.Regex("^/cancel$"),
+                    handlers_wallet.connectrobinhoodwallet_receive,
+                )
+            ]
+        },
+        fallbacks=[CommandHandler("cancel", handlers_wallet.connectrobinhoodwallet_receive)],
+        name="connect_robinhood_wallet_conversation",
+    )
+    application.add_handler(connectrobinhoodwallet_conv)
 
     connectwallet_conv = ConversationHandler(
         entry_points=[CommandHandler("connectwallet", handlers_wallet.connectwallet_start)],
@@ -198,5 +216,6 @@ def build_application() -> Application:
     application.add_handler(CallbackQueryHandler(handlers_admin.guardian_callback, pattern=r"^guardian:"))
     application.add_handler(CallbackQueryHandler(handlers_admin.burnclose_callback, pattern=r"^burnclose:"))
     application.add_handler(CallbackQueryHandler(handlers_admin.rent_recovery_callback, pattern=r"^rent:"))
+    application.add_handler(CallbackQueryHandler(handlers_wallet.disconnectrobinhoodwallet_callback, pattern=r"^rhdisconnect:"))
 
     return application
