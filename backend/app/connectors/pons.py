@@ -14,6 +14,7 @@ from typing import Any, Optional
 from web3 import Web3
 
 from app.config.settings import settings
+from app.execution.onchain.robinhood_wallet import resolve_robinhood_rpc_url
 
 
 PONS_CHAIN_ID = 4663
@@ -90,7 +91,7 @@ ERC20_ABI = [
 
 
 def _rpc_url() -> Optional[str]:
-    return getattr(settings, "robinhood_rpc_url", None) or getattr(settings, "robinhood_alchemy_rpc_url", None)
+    return resolve_robinhood_rpc_url(settings)
 
 
 def _build_web3() -> Web3:
