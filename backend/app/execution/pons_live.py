@@ -9,6 +9,8 @@ from eth_account.signers.local import LocalAccount
 from app.execution.base import ExecutionAdapter, OrderResult
 from app.scoring.rules import TokenSnapshot
 from app.config.settings import settings
+
+ROBINHOOD_CHAIN_ID = 4663
 from app.connectors.pons import CURVE_ABI, PONS_NATIVE_QUOTE, LAUNCHED_TOKEN_ABI, PONS_FACTORY_ADDRESS, ERC20_ABI
 
 logger = logging.getLogger("app.execution.pons")
@@ -52,6 +54,7 @@ class PonsExecutionAdapter(ExecutionAdapter):
 
     def __init__(self, account: LocalAccount, rpc_url: str, slippage_bps: int = 1000):
         self._account = account
+        self._pubkey = account.address
         self._rpc_url = rpc_url
         self._w3 = Web3(Web3.HTTPProvider(rpc_url, request_kwargs={"timeout": 5}))
         self._slippage_bps = max(0, min(int(slippage_bps), 3000))
@@ -59,6 +62,13 @@ class PonsExecutionAdapter(ExecutionAdapter):
         self._factory = self._w3.eth.contract(address=Web3.to_checksum_address(factory_address), abi=LAUNCHED_TOKEN_ABI)
 
     def _send(self, fn, value=0):
+        chain_id = int(self._w3.eth.chain_id)
+        if chain_id != ROBINHOOD_CHAIN_ID:
+            raise RuntimeError(f"Refusing to sign: RPC chain ID {chain_id} is not Robinhood Chain {ROBINHOOD_CHAIN_ID}")
+        balance = int(self._w3.eth.get_balance(self._account.address))
+        required_value = int(value)
+        if balance <= required_value:
+            raise RuntimeError("Robinhood wallet has insufficient ETH for transaction value and gas")
         nonce = self._w3.eth.get_transaction_count(self._account.address, "pending")
         gas_price = self._w3.eth.gas_price
         tx = fn.build_transaction({
@@ -124,3 +134,20 @@ class PonsExecutionAdapter(ExecutionAdapter):
         except Exception as exc:
             logger.warning("pons_sell_failed", extra={"mint": token.mint, "error": str(exc)})
             return OrderResult(False, "failed", error_message=str(exc))
+
+
+async def get_robinhood_token_balance(rpc_url: str, wallet_address: str, token_address: str) -> float:
+    """Read an ERC-20 balance on Robinhood Chain without touching private keys."""
+    def _read() -> float:
+        w3 = Web3(Web3.HTTPProvider(rpc_url, request_kwargs={"timeout": 5}))
+        if int(w3.eth.chain_id) != ROBINHOOD_CHAIN_ID:
+            raise RuntimeError("RPC is not connected to Robinhood Chain")
+        abi = [
+            {"inputs": [], "name": "decimals", "outputs": [{"type": "uint8"}], "stateMutability": "view", "type": "function"},
+            {"inputs": [{"name": "owner", "type": "address"}], "name": "balanceOf", "outputs": [{"type": "uint256"}], "stateMutability": "view", "type": "function"},
+        ]
+        token = w3.eth.contract(address=Web3.to_checksum_address(token_address), abi=abi)
+        decimals = int(token.functions.decimals().call())
+        raw = int(token.functions.balanceOf(Web3.to_checksum_address(wallet_address)).call())
+        return raw / (10 ** decimals)
+    return await asyncio.to_thread(_read)
