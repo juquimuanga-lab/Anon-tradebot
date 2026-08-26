@@ -72,7 +72,22 @@ class Notifier:
         await self._send_to(recipient_id, "\n".join(lines))
 
     async def rule_violation(self, recipient_id: int, ticker: str, reasons: list[str]) -> None:
-        await self._send_to(recipient_id, f"*Skipped* `{ticker}`\n- " + "\n- ".join(reasons[:5]))
+        """Keep rejected-token diagnostics out of Telegram.
+
+        Screening failures remain available through the scanner's structured
+        logs/database for debugging, but rejected candidates are not user-facing
+        alerts. This prevents high-volume sources such as Pons/Robinhood from
+        flooding the Telegram chat with tokens that never qualified.
+        """
+        logger.info(
+            "telegram_screening_rejection_suppressed",
+            extra={
+                "recipient_id": recipient_id,
+                "ticker": ticker,
+                "reasons": reasons[:5],
+            },
+        )
+        return
 
     async def buy_attempt(self, recipient_id: int, ticker: str, amount_sol: float, mode: str) -> None:
         """Tell the user a buy execution has started, not that it was filled."""
