@@ -9,7 +9,7 @@ from telegram.ext import (
     filters,
 )
 
-from app.bot import handlers_admin, handlers_basic, handlers_wallet
+from app.bot import handlers_admin, handlers_basic, handlers_wallet, rule_manager
 from app.bot.setrule_wizard import COLLECTING, setrule_collect, setrule_start, setrule_fourmeme_start, setrule_pons_start
 from app.config.settings import settings
 
@@ -21,7 +21,8 @@ async def set_bot_commands(application: Application) -> None:
         BotCommand("help", "Show help"),
         BotCommand("status", "Show bot status"),
         BotCommand("balance", "Show wallet and paper balance"),
-        BotCommand("rules", "List your rules"),
+        BotCommand("rules", "Open rule manager"),
+        BotCommand("rulemanager", "Open rule manager"),
         BotCommand("listrules", "List saved rules"),
         BotCommand("activaterule", "Activate a rule"),
         BotCommand("positions", "Show open positions"),
@@ -64,7 +65,9 @@ def build_application() -> Application:
     application.add_handler(CommandHandler("start", handlers_basic.start))
     application.add_handler(CommandHandler("help", handlers_basic.help_cmd))
     application.add_handler(CommandHandler("status", handlers_basic.status))
-    application.add_handler(CommandHandler("rules", handlers_basic.rules))
+    # /rules now opens the button-driven manager; /listrules remains the legacy text view.
+    application.add_handler(CommandHandler("rules", rule_manager.rule_manager_start))
+    application.add_handler(CommandHandler("rulemanager", rule_manager.rule_manager_start))
     application.add_handler(CommandHandler("listrules", handlers_basic.listrules))
     application.add_handler(CommandHandler("activaterule", handlers_basic.activaterule))
     application.add_handler(CommandHandler("balance", handlers_basic.balance))
@@ -101,14 +104,7 @@ def build_application() -> Application:
 
     connect_conv = ConversationHandler(
         entry_points=[CommandHandler("connect", handlers_admin.connect_start)],
-        states={
-            handlers_admin.CONNECT_WAITING_KEY: [
-                MessageHandler(
-                    filters.TEXT & ~filters.COMMAND | filters.Regex("^/cancel$"),
-                    handlers_admin.connect_receive,
-                )
-            ]
-        },
+        states={handlers_admin.CONNECT_WAITING_KEY: [MessageHandler(filters.TEXT & ~filters.COMMAND | filters.Regex("^/cancel$"), handlers_admin.connect_receive)]},
         fallbacks=[CommandHandler("cancel", handlers_admin.connect_receive)],
         name="connect_conversation",
     )
@@ -116,30 +112,15 @@ def build_application() -> Application:
 
     connectbscwallet_conv = ConversationHandler(
         entry_points=[CommandHandler("connectbscwallet", handlers_wallet.connectbscwallet_start)],
-        states={
-            handlers_wallet.BSC_CONNECT_WALLET_WAITING: [
-                MessageHandler(
-                    filters.TEXT & ~filters.COMMAND | filters.Regex("^/cancel$"),
-                    handlers_wallet.connectbscwallet_receive,
-                )
-            ]
-        },
+        states={handlers_wallet.BSC_CONNECT_WALLET_WAITING: [MessageHandler(filters.TEXT & ~filters.COMMAND | filters.Regex("^/cancel$"), handlers_wallet.connectbscwallet_receive)]},
         fallbacks=[CommandHandler("cancel", handlers_wallet.connectbscwallet_receive)],
         name="connect_bsc_wallet_conversation",
     )
     application.add_handler(connectbscwallet_conv)
 
-
     connectrobinhoodwallet_conv = ConversationHandler(
         entry_points=[CommandHandler("connectrobinhoodwallet", handlers_wallet.connectrobinhoodwallet_start)],
-        states={
-            handlers_wallet.ROBINHOOD_CONNECT_WALLET_WAITING: [
-                MessageHandler(
-                    filters.TEXT & ~filters.COMMAND | filters.Regex("^/cancel$"),
-                    handlers_wallet.connectrobinhoodwallet_receive,
-                )
-            ]
-        },
+        states={handlers_wallet.ROBINHOOD_CONNECT_WALLET_WAITING: [MessageHandler(filters.TEXT & ~filters.COMMAND | filters.Regex("^/cancel$"), handlers_wallet.connectrobinhoodwallet_receive)]},
         fallbacks=[CommandHandler("cancel", handlers_wallet.connectrobinhoodwallet_receive)],
         name="connect_robinhood_wallet_conversation",
     )
@@ -147,14 +128,7 @@ def build_application() -> Application:
 
     connectwallet_conv = ConversationHandler(
         entry_points=[CommandHandler("connectwallet", handlers_wallet.connectwallet_start)],
-        states={
-            handlers_wallet.CONNECT_WALLET_WAITING: [
-                MessageHandler(
-                    filters.TEXT & ~filters.COMMAND | filters.Regex("^/cancel$"),
-                    handlers_wallet.connectwallet_receive,
-                )
-            ]
-        },
+        states={handlers_wallet.CONNECT_WALLET_WAITING: [MessageHandler(filters.TEXT & ~filters.COMMAND | filters.Regex("^/cancel$"), handlers_wallet.connectwallet_receive)]},
         fallbacks=[CommandHandler("cancel", handlers_wallet.connectwallet_receive)],
         name="connectwallet_conversation",
     )
@@ -162,14 +136,7 @@ def build_application() -> Application:
 
     burnclose_conv = ConversationHandler(
         entry_points=[CommandHandler("burnclose", handlers_admin.burnclose_cmd)],
-        states={
-            handlers_admin.BURN_CLOSE_WAITING_ACCOUNTS: [
-                MessageHandler(
-                    filters.TEXT & ~filters.COMMAND | filters.Regex("^/cancel$"),
-                    handlers_admin.burnclose_receive,
-                )
-            ]
-        },
+        states={handlers_admin.BURN_CLOSE_WAITING_ACCOUNTS: [MessageHandler(filters.TEXT & ~filters.COMMAND | filters.Regex("^/cancel$"), handlers_admin.burnclose_receive)]},
         fallbacks=[CommandHandler("cancel", handlers_admin.burnclose_receive)],
         name="burnclose_conversation",
     )
@@ -177,14 +144,7 @@ def build_application() -> Application:
 
     rent_recovery_conv = ConversationHandler(
         entry_points=[CommandHandler("recoverent", handlers_admin.recoverent_cmd)],
-        states={
-            handlers_admin.RENT_RECOVERY_WAITING_SIGNATURES: [
-                MessageHandler(
-                    filters.TEXT & ~filters.COMMAND | filters.Regex("^/cancel$"),
-                    handlers_admin.recoverent_receive,
-                )
-            ]
-        },
+        states={handlers_admin.RENT_RECOVERY_WAITING_SIGNATURES: [MessageHandler(filters.TEXT & ~filters.COMMAND | filters.Regex("^/cancel$"), handlers_admin.recoverent_receive)]},
         fallbacks=[CommandHandler("cancel", handlers_admin.recoverent_receive)],
         name="rent_recovery_conversation",
     )
@@ -192,14 +152,7 @@ def build_application() -> Application:
 
     setrule_pons_conv = ConversationHandler(
         entry_points=[CommandHandler("setrulepons", setrule_pons_start)],
-        states={
-            COLLECTING: [
-                MessageHandler(
-                    filters.TEXT & ~filters.COMMAND | filters.Regex("^/(skip|cancel)$"),
-                    setrule_collect,
-                )
-            ]
-        },
+        states={COLLECTING: [MessageHandler(filters.TEXT & ~filters.COMMAND | filters.Regex("^/(skip|cancel)$"), setrule_collect)]},
         fallbacks=[CommandHandler("cancel", setrule_collect)],
         name="setrule_pons_conversation",
     )
@@ -207,14 +160,7 @@ def build_application() -> Application:
 
     setrule_fourmeme_conv = ConversationHandler(
         entry_points=[CommandHandler("setrulefourmeme", setrule_fourmeme_start)],
-        states={
-            COLLECTING: [
-                MessageHandler(
-                    filters.TEXT & ~filters.COMMAND | filters.Regex("^/(skip|cancel)$"),
-                    setrule_collect,
-                )
-            ]
-        },
+        states={COLLECTING: [MessageHandler(filters.TEXT & ~filters.COMMAND | filters.Regex("^/(skip|cancel)$"), setrule_collect)]},
         fallbacks=[CommandHandler("cancel", setrule_collect)],
         name="setrule_fourmeme_conversation",
     )
@@ -222,18 +168,16 @@ def build_application() -> Application:
 
     setrule_conv = ConversationHandler(
         entry_points=[CommandHandler("setrule", setrule_start)],
-        states={
-            COLLECTING: [
-                MessageHandler(
-                    filters.TEXT & ~filters.COMMAND | filters.Regex("^/(skip|cancel)$"),
-                    setrule_collect,
-                )
-            ]
-        },
+        states={COLLECTING: [MessageHandler(filters.TEXT & ~filters.COMMAND | filters.Regex("^/(skip|cancel)$"), setrule_collect)]},
         fallbacks=[CommandHandler("cancel", setrule_collect)],
         name="setrule_conversation",
     )
     application.add_handler(setrule_conv)
+
+    # Rule manager: upload JSON only after the admin explicitly chooses Import.
+    application.add_handler(MessageHandler(filters.Document.ALL, rule_manager.rule_manager_document))
+    application.add_handler(CommandHandler("cancel", rule_manager.rule_manager_cancel))
+    application.add_handler(CallbackQueryHandler(rule_manager.rule_manager_callback, pattern=r"^rulemgr:"))
 
     application.add_handler(CallbackQueryHandler(handlers_admin.action_confirmation_callback, pattern=r"^actionconfirm:"))
     application.add_handler(CallbackQueryHandler(handlers_admin.confirmation_callback, pattern=r"^confirm:"))
