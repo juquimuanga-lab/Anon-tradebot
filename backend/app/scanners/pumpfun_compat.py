@@ -111,10 +111,10 @@ async def _tx_fetch_without_launch_version_probe(rpc_url: str, signature: str, *
     """Skip the redundant launch-version getTransaction hot-path.
 
     The Pump.fun CreateEvent already carries the mint/creator and is the
-    authoritative discovery signal used by the websocket worker. Launch
-    safety still performs its own transaction retrieval later. Keeping those
-    two responsibilities separate avoids one extra Helius getTransaction per
-    launch while preserving all safety checks.
+authoritative discovery signal used by the websocket worker. Launch
+safety still performs its own transaction retrieval later. Keeping those
+two responsibilities separate avoids one extra Helius getTransaction per
+launch while preserving all safety checks.
     """
     if purpose == "pumpfun_launch_version":
         return None
@@ -131,20 +131,10 @@ class _SuppressRedundantLaunchVersionLog(logging.Filter):
 
 
 async def _get_launch_transactions_with_refresh(original, rpc_url: str, curve_address: str, *, limit: int):
-    """Retry launch transaction discovery when signatures race transaction indexing.
-
-    The existing Pump.fun implementation already has provider fallback and
-    per-signature retries. This wrapper adds two delayed *signature refreshes*
-    only when the first pass returns no usable transaction bodies. That avoids
-    changing the normal path while recovering the common Helius propagation
-    race where signatures appear before getTransaction becomes readable.
-    """
+    """Retry launch transaction discovery when signatures race transaction indexing."""
     first = await original(rpc_url, curve_address, limit=limit)
     if first:
         return first
-
-    # A second signature list after propagation delay is more useful than
-    # repeatedly asking getTransaction for the exact same stale signatures.
     for delay in (1.5, 3.0):
         await asyncio.sleep(delay)
         refreshed = await original(rpc_url, curve_address, limit=limit)
@@ -158,7 +148,6 @@ async def _get_launch_transactions_with_refresh(original, rpc_url: str, curve_ad
                 },
             )
             return refreshed
-
     logger.warning(
         "pumpfun_launch_safety_transaction_refresh_exhausted",
         extra={"curve": curve_address, "attempts": 3},
@@ -191,6 +180,90 @@ def _patch_pumpfun_transaction_recovery() -> None:
     logger.info("pumpfun_launch_transaction_refresh_patch_installed")
 
 
+def _patch_graduation_hunter_fresh_curve_read() -> None:
+    """Refresh Pump.fun curve state at the Graduation Hunter boundary.
+
+    The normal scanner keeps a 1.25s cache to protect Helius during launch
+    bursts. That is useful for discovery, but the Hunter's real-SOL floor is a
+    trading gate, so it must not evaluate an old cached reserve value. This
+    wrapper refreshes only Smart Pump.fun candidates that have reached the
+    configured Hunter observation age, then updates the existing TokenSnapshot
+    in-place before the original screening method continues.
+    """
+    try:
+        from app.scanners.scanner import ScannerService, SOURCE_PUMPFUN
+        from app.execution.onchain import pumpfun
+        from app.config.settings import settings
+    except Exception:
+        logger.debug("pumpfun_graduation_fresh_read_patch_deferred", exc_info=True)
+        return
+
+    original = getattr(ScannerService, "_screen_and_maybe_trade", None)
+    if original is None or getattr(original, "_fresh_curve_patch", False):
+        return
+
+    async def wrapped(self, token, rule, notify_on_fail):
+        try:
+            strategy = getattr(rule, "strategy", "smart") or "smart"
+            enabled = getattr(rule, "graduation_hunter_enabled", True)
+            age = float(getattr(token, "age_seconds", 0.0) or 0.0)
+            min_age = float(
+                getattr(
+                    rule,
+                    "graduation_hunter_min_observation_seconds",
+                    20.0,
+                )
+                or 20.0
+            )
+            if (
+                getattr(token, "source", "") == SOURCE_PUMPFUN
+                and strategy == "smart"
+                and enabled
+                and age >= min_age
+            ):
+                cache = getattr(pumpfun, "_pumpfun_pool_cache", None)
+                if isinstance(cache, dict):
+                    cache.pop(token.mint, None)
+                info = await pumpfun.get_pool_info(
+                    token.mint,
+                    settings.solana_rpc_url,
+                    commitment="processed",
+                )
+                token.price_usd = float(info.get("price_usd", token.price_usd) or token.price_usd)
+                token.market_cap_usd = float(info.get("market_cap_usd", token.market_cap_usd) or token.market_cap_usd)
+                token.liquidity_usd = float(info.get("liquidity_usd", token.liquidity_usd) or token.liquidity_usd)
+                token.real_sol_reserves_sol = float(
+                    info.get("real_sol_reserves", token.real_sol_reserves_sol) or 0.0
+                )
+                token.real_sol_progress_pct = min(
+                    100.0,
+                    max(
+                        0.0,
+                        token.real_sol_reserves_sol / 85.0 * 100.0,
+                    ),
+                )
+                logger.info(
+                    "pumpfun_graduation_hunter_fresh_curve_read",
+                    extra={
+                        "mint": token.mint,
+                        "age_seconds": age,
+                        "real_sol_reserves": token.real_sol_reserves_sol,
+                        "commitment": "processed",
+                        "cache_bypassed": True,
+                    },
+                )
+        except Exception as exc:
+            logger.warning(
+                "pumpfun_graduation_hunter_fresh_curve_read_failed",
+                extra={"mint": getattr(token, "mint", ""), "error": str(exc)},
+            )
+        return await original(self, token, rule, notify_on_fail)
+
+    wrapped._fresh_curve_patch = True
+    ScannerService._screen_and_maybe_trade = wrapped
+    logger.info("pumpfun_graduation_hunter_fresh_read_patch_installed")
+
+
 def install_pumpfun_compat() -> None:
     """Install the narrow compatibility/recovery patches exactly once."""
     global _INSTALLED
@@ -201,17 +274,8 @@ def install_pumpfun_compat() -> None:
     onchain_watcher._get_confirmed_transaction_with_fallback = (
         _tx_fetch_without_launch_version_probe
     )
-
-    # The server imports this module before ScannerService, so pumpfun.py is
-    # normally importable here. If an unusual import order occurs, retry on the
-    # first install call without failing application startup.
     _patch_pumpfun_transaction_recovery()
-
-    # The old message described a probe we have intentionally removed. Filter
-    # only that exact message; all real RPC/safety warnings remain visible.
-    onchain_watcher.logger.addFilter(
-        _SuppressRedundantLaunchVersionLog()
-    )
-
+    _patch_graduation_hunter_fresh_curve_read()
+    onchain_watcher.logger.addFilter(_SuppressRedundantLaunchVersionLog())
     _INSTALLED = True
     logger.info("pumpfun_compat_fallback_installed")
