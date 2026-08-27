@@ -31,8 +31,10 @@ def _rule_line(rule) -> str:
 def _manager_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("⚡ SOL Fast", callback_data="rulemgr:lane:solana:fast"), InlineKeyboardButton("🧠 SOL Smart", callback_data="rulemgr:lane:solana:smart")],
-        [InlineKeyboardButton("🐋 SOL Smart Money", callback_data="rulemgr:lane:solana:smart_money"), InlineKeyboardButton("🧪 Pons", callback_data="rulemgr:lane:pons:smart")],
-        [InlineKeyboardButton("📋 All Saved Rules", callback_data="rulemgr:all"), InlineKeyboardButton("📥 Import JSON", callback_data="rulemgr:import")],
+        [InlineKeyboardButton("🐋 SOL Smart Money", callback_data="rulemgr:lane:solana:smart_money"), InlineKeyboardButton("⚡ Pons Fast", callback_data="rulemgr:lane:pons:fast")],
+        [InlineKeyboardButton("🧠 Pons Smart", callback_data="rulemgr:lane:pons:smart"), InlineKeyboardButton("🐋 Pons Smart Money", callback_data="rulemgr:lane:pons:smart_money")],
+        [InlineKeyboardButton("🧪 Four.meme", callback_data="rulemgr:lane:fourmeme:smart"), InlineKeyboardButton("📋 All Saved Rules", callback_data="rulemgr:all")],
+        [InlineKeyboardButton("📥 Import JSON", callback_data="rulemgr:import")],
     ])
 
 
