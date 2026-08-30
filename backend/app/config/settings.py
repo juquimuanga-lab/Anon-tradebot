@@ -155,20 +155,10 @@ class Settings(BaseSettings):
     # ------------------------------------------------------------------
     # Pump.fun
     #
-    # Pump.fun is treated as a separate launch source.
-    #
-    # This is the Pump.fun mint-authority identifier supplied for
-    # detecting Pump.fun-created tokens.
-    #
-    # It must NOT be treated as an Anoncoin creator wallet.
+    # Pump.fun is a separate launch source. No mint-authority wallet is
+    # trusted. Discovery is verified from the official Pump.fun program
+    # and create/create_v2 instructions in the transaction.
     # ------------------------------------------------------------------
-
-    pumpfun_mint_authority: str = Field(
-        default=(
-            "TSLvdd1pWpHVjahSpsvCXUbgwsL3JAcvokwaKt1eokM"
-        ),
-        validation_alias="PUMPFUN_MINT_AUTHORITY",
-    )
 
     # Official Pump.fun bonding-curve program.
     #
