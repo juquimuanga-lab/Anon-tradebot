@@ -1,6 +1,6 @@
 """Pump.fun compatibility patch for provider-specific transaction decoding.
 
-The Pump.fun websocket receives an authoritative CreateEvent containing the
+The Pump.fun websocket receives a CreateEvent from the official Pump.fun program containing the
 mint and creator. Some RPC providers can return a transaction shape that the
 secondary instruction decoder cannot parse even though the CreateEvent is
 valid. In that case the watcher used to discard the launch before the global
