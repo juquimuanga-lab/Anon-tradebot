@@ -337,18 +337,158 @@ function requirePositiveInteger(
 // This supports normal SPL Token and Token-2022 accounts.
 // ---------------------------------------------------------------------------
 
+async function sleepMs(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+
+// ---------------------------------------------------------------------------
+// RPC retry helper for transient rate limiting
+// ---------------------------------------------------------------------------
+
+async function rpcWithRetry(
+  operation,
+  label,
+  attempts = 4
+) {
+  let lastError;
+
+  for (let attempt = 1; attempt <= attempts; attempt += 1) {
+    try {
+      return await operation();
+    } catch (error) {
+      lastError = error;
+      const message = String(
+        error?.message ||
+        error ||
+        ""
+      ).toLowerCase();
+
+      const transient =
+        message.includes("429") ||
+        message.includes("too many requests") ||
+        message.includes("rate limit") ||
+        message.includes("timed out") ||
+        message.includes("fetch failed") ||
+        message.includes("503") ||
+        message.includes("502") ||
+        message.includes("504");
+
+      if (!transient || attempt >= attempts) {
+        throw error;
+      }
+
+      const delayMs =
+        Math.min(
+          1500,
+          200 * (2 ** (attempt - 1))
+        ) +
+        Math.floor(
+          Math.random() * 100
+        );
+
+      console.error(
+        `Pump.fun sell RPC transient error ` +
+        `label=${label} attempt=${attempt}/${attempts}; ` +
+        `retrying_in_ms=${delayMs}`
+      );
+
+      await sleepMs(delayMs);
+    }
+  }
+
+  throw lastError;
+}
+
+
+// ---------------------------------------------------------------------------
+// Direct wallet token balance
+// ---------------------------------------------------------------------------
+//
+// IMPORTANT execution-path optimization:
+//
+// The previous implementation called getParsedTokenAccountsByOwner() for
+// every sell. Under RPC pressure that is an expensive owner-wide lookup and
+// was directly exposed to HTTP 429.
+//
+// For the normal case, derive the user's canonical ATA and query its balance
+// directly. This is a much smaller RPC request. Only fall back to the broader
+// owner scan when the canonical ATA does not exist.
+//
+// Supports normal SPL Token and Token-2022.
+// ---------------------------------------------------------------------------
+
 async function getWalletTokenBalance(
   connection,
   user,
-  mint
+  mint,
+  tokenProgram
 ) {
-  const response =
-    await connection.getParsedTokenAccountsByOwner(
+  const associatedTokenAddress =
+    getAssociatedTokenAddressSync(
+      mint,
       user,
-      {
-        mint,
-      },
-      "processed"
+      false,
+      tokenProgram,
+      ASSOCIATED_TOKEN_PROGRAM_ID
+    );
+
+  try {
+    const balanceResponse =
+      await rpcWithRetry(
+        () =>
+          connection.getTokenAccountBalance(
+            associatedTokenAddress,
+            "processed"
+          ),
+        "getTokenAccountBalance",
+        4
+      );
+
+    const rawAmount =
+      balanceResponse?.value?.amount;
+
+    if (
+      rawAmount !== undefined &&
+      rawAmount !== null
+    ) {
+      return new BN(
+        String(rawAmount)
+      );
+    }
+  } catch (error) {
+    const message = String(
+      error?.message ||
+      error ||
+      ""
+    ).toLowerCase();
+
+    // If the canonical ATA is missing, fall back to the legacy owner scan.
+    // Other transient failures are re-thrown so we don't silently trade with
+    // an unknown balance.
+    const missing =
+      message.includes("could not find account") ||
+      message.includes("account does not exist") ||
+      message.includes("invalid param") ||
+      message.includes("failed to get account");
+
+    if (!missing) {
+      throw error;
+    }
+  }
+
+  const response =
+    await rpcWithRetry(
+      () =>
+        connection.getParsedTokenAccountsByOwner(
+          user,
+          {
+            mint,
+          },
+          "processed"
+        ),
+      "getParsedTokenAccountsByOwner_fallback",
+      4
     );
 
   let totalBalance =
@@ -1035,7 +1175,8 @@ async function main() {
     await getWalletTokenBalance(
       connection,
       user,
-      mint
+      mint,
+      tokenProgram
     );
 
   if (
