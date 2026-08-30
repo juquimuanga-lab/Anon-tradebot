@@ -72,7 +72,7 @@ def _infer_instruction(tx) -> str:
     except Exception:
         pass
 
-    return "create"
+    return None
 
 
 def _fallback_extract(tx):
@@ -84,27 +84,36 @@ def _fallback_extract(tx):
     if not event:
         return None
 
-    event["instruction"] = _infer_instruction(tx)
+    instruction = _infer_instruction(tx)
+    if instruction not in {"create", "create_v2"}:
+        return None
+    event["instruction"] = instruction
     event["source"] = "pumpfun"
     event["discovery"] = "websocket_create_event_rpc_fallback"
     return event
 
 
 def _extract_with_fallback(tx):
+    """Accept only transaction-proven Pump.fun create/create_v2 launches.
+
+    CreateEvent/log-only recovery is retained for diagnostics, but it is never
+    promoted into a tradable launch without a verified Pump.fun instruction.
+    """
     decoded = _ORIGINAL_EXTRACT(tx)
     if decoded:
         return decoded
 
     fallback = _fallback_extract(tx)
     if fallback:
-        logger.info(
-            "pumpfun_launch_version_verification_fallback",
+        logger.warning(
+            "pumpfun_launch_rejected_event_only_unverified",
             extra={
                 "mint": fallback.get("mint"),
                 "instruction": fallback.get("instruction"),
+                "reason": "no_verified_pumpfun_create_instruction",
             },
         )
-    return fallback
+    return None
 
 
 async def _tx_fetch_without_launch_version_probe(rpc_url: str, signature: str, *, purpose: str):
