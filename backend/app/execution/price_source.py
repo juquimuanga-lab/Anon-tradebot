@@ -70,7 +70,7 @@ METEORA_PRICE_TIMEOUT_SECONDS = 2.5
 #
 # Keep this short because the position manager should never wait several
 # seconds for a single price read when a stop-loss could be approaching.
-PUMPFUN_PRICE_TIMEOUT_SECONDS = 1.5
+PUMPFUN_PRICE_TIMEOUT_SECONDS = 4.0
 
 # SOL/USD is not nearly as volatile as a newly launched token price.
 # A very short cache avoids repeatedly paying the external price-feed
