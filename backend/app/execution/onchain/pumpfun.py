@@ -845,17 +845,25 @@ def _rpc_json_value(body: dict, *, method: str = ""):
 
 
 def _rpc_candidate_urls(rpc_url: str) -> list[str]:
-    """Return the primary Solana RPC plus optional Alchemy fallback."""
+    """Return Alchemy first, with the configured RPC (normally Helius) as fallback.
+
+    The launch-time Pump.fun hot path is intentionally tested against Alchemy
+    first while we diagnose the current Helius failures. The configured
+    ``rpc_url`` remains available as the second provider so there is no loss
+    of redundancy.
+    """
     urls: list[str] = []
-    if rpc_url:
-        urls.append(str(rpc_url))
     try:
         from app.config.settings import settings
-        fallback = getattr(settings, "alchemy_solana_rpc_url", None)
-        if fallback and str(fallback) not in urls:
-            urls.append(str(fallback))
+        alchemy = getattr(settings, "alchemy_solana_rpc_url", None)
+        if alchemy:
+            urls.append(str(alchemy))
     except Exception:
         pass
+
+    if rpc_url and str(rpc_url) not in urls:
+        urls.append(str(rpc_url))
+
     return urls
 
 
@@ -875,6 +883,16 @@ async def _raw_rpc_call(
     import httpx
 
     candidates = _rpc_candidate_urls(rpc_url)
+    logger.info(
+        "pumpfun_rpc_provider_order",
+        extra={
+            "method": method,
+            "providers": [
+                "alchemy" if i == 0 else "helius"
+                for i in range(len(candidates))
+            ],
+        },
+    )
     if not candidates:
         raise RuntimeError(f"invalid Solana RPC URL for {method}: {rpc_url!r}")
 
@@ -890,65 +908,70 @@ async def _raw_rpc_call(
 
     timeout = httpx.Timeout(connect=2.5, read=5.0, write=5.0, pool=2.5)
 
-    # Try Helius first, then Alchemy, instead of exhausting all retries on
-    # one provider before allowing the fallback to run. This is important for
-    # launch-time reads where milliseconds matter and provider visibility can
-    # differ briefly.
-    for round_index in range(max(1, min(retries, 2))):
-        for provider_index, candidate in enumerate(candidates):
-            async with httpx.AsyncClient(
-                timeout=timeout,
-                headers={"Content-Type": "application/json"},
-                follow_redirects=True,
-            ) as client:
+    for provider_index, candidate in enumerate(candidates):
+        async with httpx.AsyncClient(
+            timeout=timeout,
+            headers={"Content-Type": "application/json"},
+            follow_redirects=True,
+        ) as client:
+            for attempt, delay in enumerate(delays, start=1):
+                if delay:
+                    await asyncio.sleep(delay)
                 try:
                     response = await client.post(candidate, json=payload)
                     body_text = response.text[:700]
+
                     if response.status_code in {408, 425, 429, 500, 502, 503, 504}:
                         raise RuntimeError(
-                            f"{method} HTTP {response.status_code}: {body_text}"
+                            f"{method} HTTP {response.status_code} "
+                            f"(attempt {attempt}/{len(delays)}): {body_text}"
                         )
+
                     response.raise_for_status()
                     try:
                         body = response.json()
                     except Exception as exc:
                         raise RuntimeError(
-                            f"{method} returned invalid JSON (HTTP {response.status_code}): {body_text}"
+                            f"{method} returned invalid JSON "
+                            f"(HTTP {response.status_code}): {body_text}"
                         ) from exc
+
                     return _rpc_json_value(body, method=method)
+
                 except Exception as exc:
                     last_exc = exc
                     message = str(exc)
                     transient = (
                         isinstance(exc, (httpx.TimeoutException, httpx.NetworkError))
-                        or any(f" HTTP {status}" in message for status in (408, 425, 429, 500, 502, 503, 504))
-                        or "could not find account" in message.lower()
-                        or "account not found" in message.lower()
+                        or any(
+                            f" HTTP {status} " in message
+                            for status in (408, 425, 429, 500, 502, 503, 504)
+                        )
                     )
                     if not transient:
+                        # Deterministic errors should not be hidden by a
+                        # second provider returning a different error.
                         raise RuntimeError(
                             f"{method} RPC failed on provider {provider_index + 1}: {exc}"
                         ) from exc
-                    logger.warning(
-                        "pumpfun_rpc_provider_attempt_failed",
-                        extra={
-                            "method": method,
-                            "provider_index": provider_index,
-                            "round": round_index + 1,
-                            "error": f"{type(exc).__name__}: {exc}",
-                        },
-                    )
-            if provider_index < len(candidates) - 1:
-                logger.info(
-                    "pumpfun_rpc_provider_fallback",
-                    extra={
-                        "method": method,
-                        "from_provider_index": provider_index,
-                        "to_provider_index": provider_index + 1,
-                    },
-                )
-        if round_index == 0 and len(candidates) > 0:
-            await asyncio.sleep(0.20)
+
+                    if attempt < len(delays):
+                        logger.warning(
+                            "pumpfun_launch_safety_rpc_retry",
+                            extra={
+                                "method": method,
+                                "attempt": attempt,
+                                "max_attempts": len(delays),
+                                "provider_index": provider_index,
+                                "error": f"{type(exc).__name__}: {exc}",
+                            },
+                        )
+
+        if provider_index < len(candidates) - 1:
+            logger.warning(
+                "pumpfun_launch_safety_rpc_provider_fallback",
+                extra={"method": method, "provider_index": provider_index, "fallback": "alchemy"},
+            )
 
     raise RuntimeError(
         f"{method} RPC failed on all configured providers: {last_exc}"
