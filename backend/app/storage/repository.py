@@ -901,11 +901,8 @@ def rule_row_to_params(
         ),
         take_profit_levels=[
             TakeProfitLevel(
-                **lvl
-            )
-            for lvl in (
-                rule.take_profit_levels
-                or []
+                gain_pct=6.0,
+                sell_pct=100.0,
             )
         ],
         stop_loss_pct=(
@@ -996,10 +993,10 @@ async def create_rule(
                 params.cooldown_seconds
             ),
             take_profit_levels=[
-                lvl.model_dump()
-                for lvl in (
-                    params.take_profit_levels
-                )
+                TakeProfitLevel(
+                    gain_pct=6.0,
+                    sell_pct=100.0,
+                ).model_dump()
             ],
             stop_loss_pct=(
                 params.stop_loss_pct
