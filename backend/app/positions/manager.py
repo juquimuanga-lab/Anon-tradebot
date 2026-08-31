@@ -1694,7 +1694,7 @@ class PositionManager:
                     "position_id": position.id,
                     "pnl_pct": pnl_pct,
                     "threshold": settings.defensive_stop_loss_pct,
-                    "sell_pct": settings.defensive_stop_sell_pct,
+                    "sell_pct": 80.0,
                 },
             )
             sell_success = await self._close_position(
@@ -1901,16 +1901,11 @@ class PositionManager:
         # Pump.fun uses the launch-specific staged profit plan. It takes
         # modest profits early, then leaves 30% of the original position as
         # a runner for large moves. Other sources keep the exact user rule.
-        if token.source == "pumpfun":
-            take_profit_levels = [
-                # Give Pump.fun winners room to develop. The final 30% is
-                # intentionally left as a runner for large moves.
-                TakeProfitLevel(gain_pct=30.0, sell_pct=20.0),
-                TakeProfitLevel(gain_pct=60.0, sell_pct=25.0),
-                TakeProfitLevel(gain_pct=100.0, sell_pct=25.0),
-            ]
-        else:
-            take_profit_levels = rule.take_profit_levels
+        # Fixed single-level take profit: +6% closes 100% of the
+        # remaining position. Legacy multi-level configurations are ignored.
+        take_profit_levels = [
+            TakeProfitLevel(gain_pct=6.0, sell_pct=100.0),
+        ]
 
         for idx, level in enumerate(
             take_profit_levels
