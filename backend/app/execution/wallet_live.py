@@ -9,7 +9,6 @@ import logging
 import struct
 
 from solana.rpc.async_api import AsyncClient
-from solana.rpc.types import TokenAccountOpts
 from solders.instruction import AccountMeta, Instruction
 from solders.keypair import Keypair
 from solders.pubkey import Pubkey
@@ -96,29 +95,24 @@ class WalletExecutionAdapter(ExecutionAdapter):
                 logger.exception("onchain_execution_unexpected_error")
                 return OrderResult(success=False, status="failed", error_message=f"unexpected error: {exc}")
 
-    async def cleanup_closed_token_accounts(self, token: TokenSnapshot | str, dust_threshold_tokens: float = 10.0) -> dict:
+    async def cleanup_closed_token_accounts(self, token: TokenSnapshot, dust_threshold_tokens: float = 10.0) -> dict:
         """Best-effort post-close SPL cleanup: burn <10 tokens, then close ATA.
 
         A cleanup failure never changes the already-successful trade result.
         """
         try:
-            mint_str = token if isinstance(token, str) else mint_str
-            mint = Pubkey.from_string(mint_str)
+            mint = Pubkey.from_string(token.mint)
             owner = self._keypair.pubkey()
+            decimals = int(token.decimals)
+            threshold_raw = int(dust_threshold_tokens * (10 ** decimals))
 
             async with AsyncClient(self._rpc_url) as client:
-                if isinstance(token, str):
-                    supply = await client.get_token_supply(mint, commitment="processed")
-                    decimals = int(supply.value.decimals)
-                else:
-                    decimals = int(token.decimals)
-                threshold_raw = int(dust_threshold_tokens * (10 ** decimals))
                 response = await client.get_token_accounts_by_owner(
                     owner, TokenAccountOpts(mint=mint), commitment="processed"
                 )
                 accounts = list(response.value or [])
                 if not accounts:
-                    logger.info("token_account_cleanup_no_accounts", extra={"mint": mint_str, "wallet": self._pubkey})
+                    logger.info("token_account_cleanup_no_accounts", extra={"mint": token.mint, "wallet": self._pubkey})
                     return {"accounts": 0, "closed": 0, "burned": 0}
 
                 closed = burned = 0
@@ -132,7 +126,7 @@ class WalletExecutionAdapter(ExecutionAdapter):
                     raw = int(getattr(token_amount, "amount", 0) or 0)
 
                     if raw >= threshold_raw:
-                        logger.info("token_account_cleanup_kept", extra={"mint": mint_str, "account": str(account_pubkey), "balance_raw": raw, "threshold_raw": threshold_raw})
+                        logger.info("token_account_cleanup_kept", extra={"mint": token.mint, "account": str(account_pubkey), "balance_raw": raw, "threshold_raw": threshold_raw})
                         continue
 
                     instructions = []
@@ -153,13 +147,13 @@ class WalletExecutionAdapter(ExecutionAdapter):
                     if raw > 0:
                         burned += 1
                     logger.info("token_account_burn_close_completed", extra={
-                        "mint": mint_str, "account": str(account_pubkey), "balance_raw": raw,
+                        "mint": token.mint, "account": str(account_pubkey), "balance_raw": raw,
                         "dust_threshold_raw": threshold_raw, "tx_signature": signature,
                     })
 
                 return {"accounts": len(accounts), "closed": closed, "burned": burned}
         except Exception as exc:
-            logger.warning("token_account_cleanup_failed", extra={"mint": mint_str, "wallet": self._pubkey, "error": str(exc)})
+            logger.warning("token_account_cleanup_failed", extra={"mint": token.mint, "wallet": self._pubkey, "error": str(exc)})
             return {"accounts": 0, "closed": 0, "burned": 0, "error": str(exc)}
 
     async def buy(self, token: TokenSnapshot, amount_sol: float) -> OrderResult:
@@ -177,23 +171,18 @@ class NoWalletConnectedAdapter(ExecutionAdapter):
     def __init__(self, reason: str):
         self._reason = reason
 
-    async def cleanup_closed_token_accounts(self, token: TokenSnapshot | str, dust_threshold_tokens: float = 10.0) -> dict:
+    async def cleanup_closed_token_accounts(self, token: TokenSnapshot, dust_threshold_tokens: float = 10.0) -> dict:
         """Best-effort post-close SPL cleanup: burn <10 tokens, then close ATA.
 
         A cleanup failure never changes the already-successful trade result.
         """
         try:
-            mint_str = token if isinstance(token, str) else token.mint
-            mint = Pubkey.from_string(mint_str)
+            mint = Pubkey.from_string(token.mint)
             owner = self._keypair.pubkey()
+            decimals = int(token.decimals)
+            threshold_raw = int(dust_threshold_tokens * (10 ** decimals))
 
             async with AsyncClient(self._rpc_url) as client:
-                if isinstance(token, str):
-                    supply = await client.get_token_supply(mint, commitment="processed")
-                    decimals = int(supply.value.decimals)
-                else:
-                    decimals = int(token.decimals)
-                threshold_raw = int(dust_threshold_tokens * (10 ** decimals))
                 response = await client.get_token_accounts_by_owner(
                     owner, TokenAccountOpts(mint=mint), commitment="processed"
                 )
