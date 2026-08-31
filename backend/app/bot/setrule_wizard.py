@@ -31,14 +31,8 @@ def _parse_phase(raw: str) -> str:
 
 
 def _parse_take_profit(raw: str) -> list[TakeProfitLevel]:
-    text = sanitize_text(raw)
-    if text.lower() in ("", "none", "skip", "-"):
-        return []
-    levels = []
-    for part in text.split(","):
-        gain_str, sell_str = part.split(":")
-        levels.append(TakeProfitLevel(gain_pct=float(gain_str), sell_pct=float(sell_str)))
-    return levels
+    """Fixed TP policy: +6% gain and 100% close."""
+    return [TakeProfitLevel(gain_pct=6.0, sell_pct=100.0)]
 
 
 
@@ -88,7 +82,7 @@ def _steps(platform: str) -> list[Step]:
         Step("qualify_score_threshold", "Step 13/20 - Minimum qualification score (0-100, e.g. `50`):", lambda r: parse_float(r, 0, 100), default=52.0),
         Step("max_trades_per_hour", "Step 14/20 - Max trades per hour (e.g. `5`):", lambda r: parse_int(r, 1, 1000)),
         Step("cooldown_seconds", "Step 15/20 - Cooldown between buys, in seconds (e.g. `120`):", lambda r: parse_int(r, 0, 86400)),
-        Step("take_profit_levels", "Step 16/20 - Take profit levels as `gain:sell%,gain:sell%` (e.g. `50:50,100:50`), or /skip:", _parse_take_profit, default=[], optional=True),
+        Step("take_profit_levels", "Step 16/20 - Take profit is fixed at +6% gain / 100% close. Type /skip to accept:", _parse_take_profit, default=[TakeProfitLevel(gain_pct=6.0, sell_pct=100.0)], optional=True),
         Step("stop_loss_pct", "Step 17/20 - Stop loss percent (e.g. `20`):", lambda r: parse_float(r, 0, 100)),
         Step("trailing_stop_pct", "Step 18/20 - Trailing stop percent, or /skip for none:", lambda r: parse_float(r, 0, 100), default=None, optional=True),
         Step("sell_on_volume_drop_pct", "Step 19/20 - Sell on volume drop percent, or /skip for none:", lambda r: parse_float(r, 0, 100), default=None, optional=True),
