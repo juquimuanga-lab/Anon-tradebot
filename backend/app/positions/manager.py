@@ -267,6 +267,54 @@ class PositionManager:
 
         return str(pubkey)
 
+    async def _schedule_token_account_cleanup(self, position, token=None) -> None:
+        """Best-effort automatic rent recovery/dust burn-close after a full close."""
+        if position.mode != "live":
+            return
+        if position.source in {"fourmeme", "pons"}:
+            return
+
+        try:
+            wallet_pubkey = await self._get_wallet_pubkey(position)
+            if not wallet_pubkey:
+                return
+            adapter = await self._execution_router.get_adapter(
+                position.mode,
+                position.owner_user_id,
+                source=position.source,
+            )
+            cleanup = getattr(adapter, "cleanup_closed_token_accounts", None)
+            if cleanup is None:
+                logger.warning(
+                    "token_account_cleanup_adapter_unsupported",
+                    extra={"position_id": position.id, "mint": position.mint, "source": position.source},
+                )
+                return
+
+            cleanup_target = token if token is not None else position.mint
+
+            # Do not await cleanup on the trade path. Rent recovery is maintenance
+            # and must never delay/alter the successful exit state.
+            asyncio.create_task(
+                cleanup(cleanup_target, 10.0),
+                name=f"token-cleanup-{position.id}",
+            )
+            logger.info(
+                "token_account_cleanup_scheduled",
+                extra={
+                    "position_id": position.id,
+                    "mint": position.mint,
+                    "wallet": wallet_pubkey,
+                    "source": position.source,
+                    "dust_threshold_tokens": 10.0,
+                },
+            )
+        except Exception as exc:
+            logger.warning(
+                "token_account_cleanup_schedule_failed",
+                extra={"position_id": position.id, "mint": position.mint, "error": str(exc)},
+            )
+
     async def _reconcile_live_position(
         self,
         position,
@@ -459,6 +507,8 @@ class PositionManager:
 
             position.remaining_pct = 0.0
             position.status = "closed"
+
+            await self._schedule_token_account_cleanup(position)
 
             logger.info(
                 "position_reconciled_external_close",
@@ -1203,6 +1253,8 @@ class PositionManager:
 
                 position.remaining_pct = 0.0
                 position.status = "closed"
+
+                await self._schedule_token_account_cleanup(position, token)
 
                 logger.info(
                     "position_closed",
