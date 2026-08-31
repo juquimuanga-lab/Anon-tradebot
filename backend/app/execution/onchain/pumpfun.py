@@ -515,34 +515,27 @@ async def _get_curve_account_data(
     commitment: str,
 ) -> bytes:
     """Read a Pump.fun curve account with provider fallback."""
-    candidates = _rpc_candidate_urls(rpc_url)
-    last_exc: Exception | None = None
-    for index, candidate in enumerate(candidates):
-        try:
-            async with AsyncClient(candidate) as client:
-                response = await client.get_account_info(
-                    curve_address,
-                    commitment=commitment,
-                    encoding="base64",
-                )
-                account = response.value
-                if account is not None:
-                    return _decode_account_data(account.data)
-                last_exc = PumpFunPoolNotFound(
-                    f"no Pump.fun bonding curve exists for {curve_address}"
-                )
-        except Exception as exc:
-            last_exc = exc
-            if index < len(candidates) - 1:
-                logger.warning(
-                    "pumpfun_curve_account_provider_fallback",
-                    extra={"curve": str(curve_address), "provider_index": index},
-                )
-                continue
-            raise
-    if last_exc:
-        raise last_exc
-    raise PumpFunPoolNotFound(f"no Pump.fun bonding curve exists for {curve_address}")
+    result = await _raw_rpc_call(
+        rpc_url,
+        "getAccountInfo",
+        [str(curve_address), {"encoding": "base64", "commitment": commitment}],
+        retries=2,
+    )
+    if not isinstance(result, dict):
+        raise PumpFunInvalidAccount(
+            f"getAccountInfo returned unexpected result for {curve_address}"
+        )
+    value = result.get("value")
+    if value is None:
+        raise PumpFunPoolNotFound(
+            f"no Pump.fun bonding curve exists for {curve_address}"
+        )
+    data = value.get("data") if isinstance(value, dict) else None
+    if data is None:
+        raise PumpFunInvalidAccount(
+            f"Pump.fun bonding curve account has no data: {curve_address}"
+        )
+    return _decode_account_data(data)
 
 
 
