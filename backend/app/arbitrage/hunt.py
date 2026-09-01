@@ -30,7 +30,8 @@ DEFAULT_SEARCH_TERMS = (
 # A hunt is a screening pass, so use a compact ladder to reduce API pressure.
 # Full /arbdiscover keeps the normal six-size ladder.
 DEFAULT_HUNT_DISCOVERY_SIZES_SOL = (0.02, 0.10, 0.50)
-DEFAULT_JUPITER_MIN_INTERVAL_SECONDS = 0.40
+# Jupiter's current Free plan is 1 request/sec; keep a small safety margin.
+DEFAULT_JUPITER_MIN_INTERVAL_SECONDS = 1.05
 
 EXCLUDED_MINTS = {
     "So11111111111111111111111111111111111111112",
@@ -315,9 +316,7 @@ class ArbitrageHunter:
             except Exception as exc:
                 errors.append(f"{candidate.symbol}: {exc}")
 
-        round_trips = sum(
-            1 for _, discovery in discoveries if discovery.opportunity is not None
-        )
+        round_trips = sum(1 for _, discovery in discoveries if discovery.opportunity is not None)
         rate_limits = sum(
             1 for _, discovery in discoveries
             if discovery.error and "HTTP 429" in discovery.error
