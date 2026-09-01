@@ -105,7 +105,7 @@ async def arbitrage_live_status_cmd(update: Update, context: ContextTypes.DEFAUL
         f"Environment gate: `{state}`\n\n"
         "Default deployment state is LOCKED.\n"
         "The scanner cannot submit trades automatically.\n"
-        "When explicitly armed, `/arblive` still applies a fresh quote, minimum-profit gate, transaction simulation, and Jito atomic bundle submission.",
+        "When explicitly armed, `/arblive` re-quotes both legs, applies the minimum-profit gate, simulates the required transactions, submits an atomic Jito bundle, waits for settlement, and reconciles every transaction signature.",
         parse_mode="Markdown",
     )
 
@@ -150,19 +150,28 @@ async def arbitrage_live_execute_cmd(update: Update, context: ContextTypes.DEFAU
         return
 
     if not result.success:
+        signatures = "\n".join(f"`{sig}`" for sig in result.transaction_signatures[:3]) or "none"
         await update.message.reply_text(
-            f"🛑 Bundle NOT submitted.\nReason: `{result.reason}`\nEstimated net: `{result.estimated_net_profit_lamports / 1_000_000_000:.9f} SOL`",
+            "🛑 *Arbitrage not settled*\n\n"
+            f"Reason: `{result.reason}`\n"
+            f"Settlement: `{result.settlement_status or 'not submitted'}`\n"
+            f"Bundle ID: `{result.bundle_id or 'none'}`\n"
+            f"Estimated net: `{result.estimated_net_profit_lamports / 1_000_000_000:.9f} SOL`\n"
+            f"Transactions observed:\n{signatures}",
             parse_mode="Markdown",
         )
         return
 
+    signatures = "\n".join(f"`{sig}`" for sig in result.transaction_signatures)
     await update.message.reply_text(
-        "🚨 *Arbitrage bundle submitted*\n\n"
+        "✅ *Arbitrage bundle settled*\n\n"
         f"Buy: `{result.buy_venue}`\n"
         f"Sell: `{result.sell_venue}`\n"
         f"Input: `{result.input_lamports / 1_000_000_000:.9f} SOL`\n"
         f"Guaranteed token amount: `{result.guaranteed_token_amount}`\n"
         f"Estimated net: `{result.estimated_net_profit_lamports / 1_000_000_000:.9f} SOL`\n"
-        f"Bundle ID: `{result.bundle_id}`",
+        f"Settlement: `{result.settlement_status}`\n"
+        f"Bundle ID: `{result.bundle_id}`\n"
+        f"Transactions:\n{signatures}",
         parse_mode="Markdown",
     )
