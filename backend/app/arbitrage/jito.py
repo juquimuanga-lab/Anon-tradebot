@@ -1,6 +1,7 @@
 """Minimal Jito Block Engine client for atomic arbitrage bundles."""
 from __future__ import annotations
 
+import asyncio
 from typing import Any
 
 import httpx
@@ -34,7 +35,11 @@ class JitoClient:
             raise ValueError("bundle must contain at least one transaction")
         if len(signed_transactions_b64) > 5:
             raise ValueError("Jito bundles support at most 5 transactions")
-        result = await self._rpc("/api/v1/bundles", "sendBundle", [signed_transactions_b64, {"encoding": "base64"}])
+        result = await self._rpc(
+            "/api/v1/bundles",
+            "sendBundle",
+            [signed_transactions_b64, {"encoding": "base64"}],
+        )
         if not result:
             raise JitoError("Jito returned an empty bundle id")
         return str(result)
@@ -42,5 +47,61 @@ class JitoClient:
     async def get_bundle_statuses(self, bundle_ids: list[str]) -> list[dict[str, Any]]:
         if not bundle_ids:
             return []
-        result = await self._rpc("/api/v1/bundles", "getBundleStatuses", [bundle_ids])
+        result = await self._rpc(
+            "/api/v1/bundles",
+            "getBundleStatuses",
+            [bundle_ids],
+        )
         return list(result.get("value", [])) if isinstance(result, dict) else list(result or [])
+
+    async def get_inflight_bundle_statuses(self, bundle_ids: list[str]) -> list[dict[str, Any]]:
+        """Check the short-lived Jito inflight state for a submitted bundle."""
+        if not bundle_ids:
+            return []
+        result = await self._rpc(
+            "/api/v1/bundles",
+            "getInflightBundleStatuses",
+            [bundle_ids],
+        )
+        return list(result.get("value", [])) if isinstance(result, dict) else list(result or [])
+
+    async def wait_for_bundle(
+        self,
+        bundle_id: str,
+        timeout_seconds: float = 20.0,
+        poll_seconds: float = 0.5,
+    ) -> dict[str, Any]:
+        """Wait until Jito reports the bundle landed/failed/invalid.
+
+        Jito explicitly distinguishes receipt of a bundle ID from successful
+        landing, so callers must not treat sendBundle success as trade success.
+        """
+        deadline = asyncio.get_running_loop().time() + timeout_seconds
+        last_status: dict[str, Any] = {"status": "Pending"}
+
+        while asyncio.get_running_loop().time() < deadline:
+            inflight = await self.get_inflight_bundle_statuses([bundle_id])
+            if inflight:
+                last_status = dict(inflight[0])
+                state = str(last_status.get("status", "")).lower()
+                if state == "landed":
+                    break
+                if state in {"failed", "invalid"}:
+                    return last_status
+
+            statuses = await self.get_bundle_statuses([bundle_id])
+            if statuses:
+                status = dict(statuses[0])
+                last_status = status
+                confirmation = str(status.get("confirmation_status") or status.get("confirmationStatus") or "").lower()
+                if status.get("err") not in (None, {"Ok": None}):
+                    status["status"] = "Failed"
+                    return status
+                if confirmation in {"processed", "confirmed", "finalized"}:
+                    status["status"] = "Landed"
+                    return status
+
+            await asyncio.sleep(poll_seconds)
+
+        last_status["status"] = "Timeout"
+        return last_status
