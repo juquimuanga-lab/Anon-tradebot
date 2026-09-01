@@ -20,15 +20,18 @@ async def arbitrage_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     status = service.status()
     mode = "ENABLED (paper/observe only)" if status.enabled else "DISABLED"
     live = "ARMED BY ENVIRONMENT" if live_executor.live_enabled else "LOCKED"
+    rpc = await scanner.rpc_health.check()
+    rpc_state = f"OK ({rpc.provider}, slot {rpc.slot})" if rpc.healthy else f"DOWN ({rpc.error})"
     await update.message.reply_text(
         "⚖️ *Solana Arbitrage*\n\n"
         f"Status: `{mode}`\n"
         f"Live execution gate: `{live}`\n"
+        f"RPC data plane: `{rpc_state}`\n"
         f"Running: `{status.running}`\n"
         f"Opportunities checked: `{status.opportunities_seen}`\n"
         f"Profit-qualified: `{status.executable_seen}`\n"
         f"Last result: `{status.last_reason}`\n\n"
-        "Live execution is never enabled by the scanner itself.",
+        "Observe scans use live Jupiter venue quotes. No transaction is submitted by scanning.",
         parse_mode="Markdown",
     )
 
@@ -49,15 +52,15 @@ async def disable_arbitrage_cmd(update: Update, context: ContextTypes.DEFAULT_TY
 async def arbitrage_help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(
         "⚖️ *Arbitrage commands*\n\n"
-        "/arbitrage — show arbitrage status\n"
+        "/arbitrage — show arbitrage status and RPC health\n"
         "/enablearbitrage — enable quote scanning\n"
         "/disablearbitrage — disable scanning\n"
-        "/arbscan <mint> [SOL] — scan venue spreads\n"
+        "/arbscan <mint> [SOL] — scan live venue spreads\n"
         "/arbvenues — show configured venues\n"
         "/arblivestatus — show live execution gate\n"
         "/arblive <mint> <SOL> <buy_venue> <sell_venue> — explicitly submit one atomic bundle\n"
         "/arbhelp — show this help\n\n"
-        "Live execution requires ARBITRAGE_LIVE_TRADING_ENABLED=true and an explicitly invoked /arblive command.",
+        "Observe mode uses live quotes but never submits transactions. Live execution requires ARBITRAGE_LIVE_TRADING_ENABLED=true and an explicitly invoked /arblive command.",
         parse_mode="Markdown",
     )
 
@@ -88,13 +91,17 @@ async def arbitrage_scan_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE)
         await update.message.reply_text(f"❌ Arbitrage scan failed safely: `{type(exc).__name__}: {exc}`", parse_mode="Markdown")
         return
     if not result.opportunities:
-        await update.message.reply_text("No two-venue quote pairs were available for that token/size.\nUse /arbvenues to inspect the configured venue labels.")
+        rpc = result.rpc_health
+        detail = f"RPC: {rpc.provider}" if rpc and rpc.healthy else f"RPC unavailable: {rpc.error if rpc else 'unknown'}"
+        await update.message.reply_text("No two-venue quote pairs were available for that token/size.\n" + detail + "\nUse /arbvenues to inspect the configured venue labels.")
         return
     lines = []
     for item in result.opportunities[:8]:
         status = "✅ QUALIFIED" if item.executable else "— rejected"
         lines.append(f"{status} `{item.buy_venue} → {item.sell_venue}` | net `{item.net_profit_bps:.1f} bps` | reason `{item.reason}`")
-    await update.message.reply_text("⚖️ *Arbitrage scan result*\n\n" + "\n".join(lines) + "\n\n_No transaction was submitted._", parse_mode="Markdown")
+    rpc = result.rpc_health
+    rpc_line = f"RPC: `{rpc.provider}`" if rpc and rpc.healthy else "RPC: `unavailable`"
+    await update.message.reply_text("⚖️ *Arbitrage scan result*\n\n" + "\n".join(lines) + f"\n\n{rpc_line}\n_No transaction was submitted._", parse_mode="Markdown")
 
 
 @admin_required
