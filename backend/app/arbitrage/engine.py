@@ -4,6 +4,11 @@ Jupiter quote output amounts are treated as quoted executable outputs. DEX
 fees and price impact are not subtracted a second time. Price impact remains
 a safety gate, while priority fees and Jito tips remain explicit external
 execution costs.
+
+Profitability policy: any strictly positive final net profit is eligible.
+There is intentionally no minimum profit-bps floor, absolute-profit floor, or
+execution-safety profit buffer. Actual execution costs are still included in
+net-profit calculations.
 """
 from __future__ import annotations
 
@@ -13,15 +18,13 @@ from typing import Iterable
 
 from app.arbitrage.models import ArbitrageOpportunity, Quote
 
-# Production-safe defaults. Environment variables may still override these,
-# but a Railway deployment does not need them merely to start correctly.
-DEFAULT_MIN_PROFIT_BPS = 35.0
-DEFAULT_MIN_PROFIT_LAMPORTS = 50_000
+DEFAULT_MIN_PROFIT_BPS = 0.0
+DEFAULT_MIN_PROFIT_LAMPORTS = 0
 DEFAULT_MAX_PRICE_IMPACT_BPS = 80.0
 DEFAULT_MAX_SLIPPAGE_BPS = 50.0
 DEFAULT_ESTIMATED_PRIORITY_FEE_LAMPORTS = 50_000
 DEFAULT_ESTIMATED_JITO_TIP_LAMPORTS = 100_000
-DEFAULT_EXECUTION_SAFETY_BPS = 10.0
+DEFAULT_EXECUTION_SAFETY_BPS = 0.0
 
 
 @dataclass(frozen=True)
@@ -44,13 +47,13 @@ class ArbitrageConfig:
                 return default
 
         return cls(
-            min_profit_bps=max(number("ARBITRAGE_MIN_PROFIT_BPS", DEFAULT_MIN_PROFIT_BPS), 0.0),
-            min_profit_atomic=max(int(number("ARBITRAGE_MIN_PROFIT_LAMPORTS", DEFAULT_MIN_PROFIT_LAMPORTS)), 0),
+            min_profit_bps=0.0,
+            min_profit_atomic=0,
             max_price_impact_bps=max(number("ARBITRAGE_MAX_PRICE_IMPACT_BPS", DEFAULT_MAX_PRICE_IMPACT_BPS), 0.0),
             max_slippage_bps=max(number("ARBITRAGE_MAX_SLIPPAGE_BPS", DEFAULT_MAX_SLIPPAGE_BPS), 0.0),
             estimated_priority_fee_atomic=max(int(number("ARBITRAGE_ESTIMATED_PRIORITY_FEE_LAMPORTS", DEFAULT_ESTIMATED_PRIORITY_FEE_LAMPORTS)), 0),
             estimated_jito_tip_atomic=max(int(number("ARBITRAGE_ESTIMATED_JITO_TIP_LAMPORTS", DEFAULT_ESTIMATED_JITO_TIP_LAMPORTS)), 0),
-            execution_safety_bps=max(number("ARBITRAGE_EXECUTION_SAFETY_BPS", DEFAULT_EXECUTION_SAFETY_BPS), 0.0),
+            execution_safety_bps=0.0,
         )
 
     @property
@@ -84,21 +87,9 @@ def find_two_venue_opportunity(
     execution_cost_bps = (
         execution_costs / input_atomic * 10_000 if input_atomic else float("inf")
     )
-    safety_atomic = max(
-        int(input_atomic * max(config.execution_safety_bps, 0.0) / 10_000), 0
-    )
-    min_profit_bps_edge = max(config.min_profit_bps, 0.0) + max(
-        config.execution_safety_bps, 0.0
-    )
-    min_profit_atomic_edge = max(config.min_profit_atomic, 0) + safety_atomic
-    required_by_bps = execution_cost_bps + min_profit_bps_edge
-    required_by_atomic = (
-        (execution_costs + min_profit_atomic_edge) / input_atomic * 10_000
-        if input_atomic
-        else float("inf")
-    )
-    required_gross_profit_bps = max(required_by_bps, required_by_atomic)
 
+    # Profitability has no artificial safety buffer: positive net profit is enough.
+    required_gross_profit_bps = execution_cost_bps
     net_profit = gross_profit - execution_costs
     net_profit_bps = net_profit / input_atomic * 10_000 if input_atomic else 0.0
 
@@ -110,10 +101,7 @@ def find_two_venue_opportunity(
             required_gross_profit_bps, config, False, "price_impact_too_high",
         )
 
-    executable = (
-        net_profit >= min_profit_atomic_edge
-        and net_profit_bps >= min_profit_bps_edge
-    )
+    executable = net_profit > 0
     reason = "profit_threshold_met" if executable else "profit_threshold_not_met"
 
     return _build(
