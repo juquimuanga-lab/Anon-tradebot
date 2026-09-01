@@ -265,31 +265,31 @@ def _decode_account_data(
 ) -> bytes:
     """Normalize Solana RPC account data into bytes."""
 
-    if isinstance(
-        raw_data,
-        tuple,
-    ):
+    # json-rpc getAccountInfo with encoding="base64" returns the
+    # account data as a JSON array/list: [base64_string, "base64"].
+    # solana-py can expose the same shape as a tuple. Accept both.
+    if isinstance(raw_data, (tuple, list)):
+
+        if not raw_data:
+            raise PumpFunInvalidAccount(
+                "empty Pump.fun bonding curve account-data array"
+            )
 
         encoded = raw_data[0]
 
-        try:
-
-            return base64.b64decode(
-                encoded
+        if not isinstance(encoded, str):
+            raise PumpFunInvalidAccount(
+                "Pump.fun bonding curve account-data is not base64 text"
             )
 
+        try:
+            return base64.b64decode(encoded, validate=True)
         except Exception as exc:
-
             raise PumpFunInvalidAccount(
-                "failed to decode Pump.fun "
-                "bonding curve account"
+                "failed to decode Pump.fun bonding curve account"
             ) from exc
 
-    if isinstance(
-        raw_data,
-        bytes,
-    ):
-
+    if isinstance(raw_data, bytes):
         return raw_data
 
     raise PumpFunInvalidAccount(
@@ -845,25 +845,17 @@ def _rpc_json_value(body: dict, *, method: str = ""):
 
 
 def _rpc_candidate_urls(rpc_url: str) -> list[str]:
-    """Return Alchemy first, with the configured RPC (normally Helius) as fallback.
-
-    The launch-time Pump.fun hot path is intentionally tested against Alchemy
-    first while we diagnose the current Helius failures. The configured
-    ``rpc_url`` remains available as the second provider so there is no loss
-    of redundancy.
-    """
+    """Return the primary Solana RPC plus optional Alchemy fallback."""
     urls: list[str] = []
+    if rpc_url:
+        urls.append(str(rpc_url))
     try:
         from app.config.settings import settings
-        alchemy = getattr(settings, "alchemy_solana_rpc_url", None)
-        if alchemy:
-            urls.append(str(alchemy))
+        fallback = getattr(settings, "alchemy_solana_rpc_url", None)
+        if fallback and str(fallback) not in urls:
+            urls.append(str(fallback))
     except Exception:
         pass
-
-    if rpc_url and str(rpc_url) not in urls:
-        urls.append(str(rpc_url))
-
     return urls
 
 
@@ -883,16 +875,6 @@ async def _raw_rpc_call(
     import httpx
 
     candidates = _rpc_candidate_urls(rpc_url)
-    logger.info(
-        "pumpfun_rpc_provider_order",
-        extra={
-            "method": method,
-            "providers": [
-                "alchemy" if i == 0 else "helius"
-                for i in range(len(candidates))
-            ],
-        },
-    )
     if not candidates:
         raise RuntimeError(f"invalid Solana RPC URL for {method}: {rpc_url!r}")
 
