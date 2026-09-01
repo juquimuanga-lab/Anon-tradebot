@@ -1,4 +1,5 @@
-from app.arbitrage.engine import ArbitrageConfig, Quote, find_two_venue_opportunity
+from app.arbitrage.engine import ArbitrageConfig, find_two_venue_opportunity
+from app.arbitrage.models import Quote
 
 
 def _quote(venue: str, input_amount: int, output_amount: int) -> Quote:
@@ -33,7 +34,7 @@ def test_profitable_spread_is_qualified_after_costs() -> None:
     )
 
     assert result.executable is True
-    assert result.reason == "qualified"
+    assert result.reason == "profit_threshold_met"
     assert result.net_profit_atomic >= 2_000_000
 
 
