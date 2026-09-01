@@ -3,21 +3,28 @@ import respx
 from httpx import Response
 
 from app.arbitrage.rpc_health import ArbitrageRpcHealth
+from app.config.settings import settings
+
+
+@pytest.fixture
+def rpc_settings(monkeypatch):
+    """Patch writable settings fields and replace the computed Alchemy URL property."""
+    monkeypatch.setattr(
+        settings,
+        "solana_rpc_url",
+        "https://mainnet.helius-rpc.com/?api-key=test",
+    )
+    monkeypatch.setattr(settings, "helius_api_key", "test")
+    monkeypatch.setattr(
+        type(settings),
+        "alchemy_solana_rpc_url",
+        property(lambda _self: "https://solana-mainnet.g.alchemy.com/v2/fallback"),
+    )
 
 
 @pytest.mark.asyncio
 @respx.mock
-async def test_helius_health_is_used_when_primary_is_healthy(monkeypatch):
-    monkeypatch.setattr(
-        "app.arbitrage.rpc_health.settings.solana_rpc_url",
-        "https://mainnet.helius-rpc.com/?api-key=test",
-    )
-    monkeypatch.setattr("app.arbitrage.rpc_health.settings.helius_api_key", "test")
-    monkeypatch.setattr(
-        "app.arbitrage.rpc_health.settings.alchemy_solana_rpc_url",
-        "https://solana-mainnet.g.alchemy.com/v2/fallback",
-    )
-
+async def test_helius_health_is_used_when_primary_is_healthy(rpc_settings):
     async def helius_response(request):
         body = request.content.decode()
         return Response(200, json={"result": 123456 if "getSlot" in body else "ok"})
@@ -37,17 +44,7 @@ async def test_helius_health_is_used_when_primary_is_healthy(monkeypatch):
 
 @pytest.mark.asyncio
 @respx.mock
-async def test_alchemy_is_used_when_primary_fails(monkeypatch):
-    monkeypatch.setattr(
-        "app.arbitrage.rpc_health.settings.solana_rpc_url",
-        "https://mainnet.helius-rpc.com/?api-key=test",
-    )
-    monkeypatch.setattr("app.arbitrage.rpc_health.settings.helius_api_key", "test")
-    monkeypatch.setattr(
-        "app.arbitrage.rpc_health.settings.alchemy_solana_rpc_url",
-        "https://solana-mainnet.g.alchemy.com/v2/fallback",
-    )
-
+async def test_alchemy_is_used_when_primary_fails(rpc_settings):
     respx.post("https://mainnet.helius-rpc.com/").mock(
         return_value=Response(503, text="unavailable")
     )
