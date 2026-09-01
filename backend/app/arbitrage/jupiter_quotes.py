@@ -1,6 +1,7 @@
 """Jupiter quote connector for Solana arbitrage scans."""
 from __future__ import annotations
 
+import asyncio
 import os
 from dataclasses import dataclass
 from typing import Optional
@@ -33,6 +34,8 @@ DEFAULT_VENUES = (
 
 DEFAULT_JUPITER_API_BASE_URL = "https://api.jup.ag/swap/v1"
 DEFAULT_JUPITER_LITE_BASE_URL = "https://lite-api.jup.ag/swap/v1"
+DEFAULT_MAX_429_RETRIES = 3
+DEFAULT_429_BACKOFF_SECONDS = 1.0
 
 
 class JupiterArbitrageQuoteProvider:
@@ -61,7 +64,6 @@ class JupiterArbitrageQuoteProvider:
         input_amount_atomic: int,
         slippage_bps: int = 30,
     ) -> Optional[Quote]:
-        """Get Jupiter's best available route without a DEX restriction."""
         return await self._request_quote(
             input_mint, output_mint, input_amount_atomic, slippage_bps,
             venue_name="jupiter_best_route", dex_label=None, fee_bps=0.0,
@@ -105,7 +107,29 @@ class JupiterArbitrageQuoteProvider:
         }
         if dex_label:
             params["dexes"] = dex_label
-        response = await self._client.get("/quote", params=params)
+
+        max_retries = max(int(os.getenv("JUPITER_MAX_429_RETRIES", str(DEFAULT_MAX_429_RETRIES))), 0)
+        backoff = max(float(os.getenv("JUPITER_429_BACKOFF_SECONDS", str(DEFAULT_429_BACKOFF_SECONDS))), 0.1)
+
+        for attempt in range(max_retries + 1):
+            response = await self._client.get("/quote", params=params)
+            if response.status_code != 429:
+                break
+
+            if attempt >= max_retries:
+                detail = response.text[:300].replace("\n", " ")
+                raise JupiterArbitrageError(
+                    f"Jupiter quote failed for {venue_name}: HTTP 429"
+                    + (f" - {detail}" if detail else "")
+                )
+
+            retry_after = response.headers.get("Retry-After")
+            try:
+                delay = float(retry_after) if retry_after else backoff * (2 ** attempt)
+            except ValueError:
+                delay = backoff * (2 ** attempt)
+            await asyncio.sleep(min(max(delay, 0.1), 10.0))
+
         if response.status_code != 200:
             detail = response.text[:300].replace("\n", " ")
             raise JupiterArbitrageError(

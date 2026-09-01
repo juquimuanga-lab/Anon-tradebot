@@ -19,28 +19,21 @@ from app.arbitrage.discovery import ArbitrageDiscovery, DiscoveryResult
 DEXSCREENER_BASE = "https://api.dexscreener.com"
 SOLANA = "solana"
 
-# Broad discovery defaults. These are screening thresholds, not execution
-# thresholds; Jupiter remains the final profitability gate.
 DEFAULT_MAX_CANDIDATES = 8
 DEFAULT_MIN_LIQUIDITY_USD = 100_000.0
 DEFAULT_MIN_VOLUME_24H_USD = 250_000.0
 DEFAULT_MIN_DEXES = 1
 DEFAULT_REQUEST_TIMEOUT_SECONDS = 8.0
 DEFAULT_SEARCH_TERMS = (
-    "SOL",
-    "USDC",
-    "USDT",
-    "JUP",
-    "RAY",
-    "ORCA",
-    "MET",
-    "PUMP",
-    "FARTCOIN",
+    "SOL", "USDC", "USDT", "JUP", "RAY", "ORCA", "MET", "PUMP", "FARTCOIN"
 )
+# A hunt is a screening pass, so use a compact ladder to reduce API pressure.
+# Full /arbdiscover keeps the normal six-size ladder.
+DEFAULT_HUNT_DISCOVERY_SIZES_SOL = (0.02, 0.10, 0.50)
+# Jupiter's current Free plan is 1 request/sec; keep a small safety margin.
+DEFAULT_JUPITER_MIN_INTERVAL_SECONDS = 1.05
 
 EXCLUDED_MINTS = {
-    # Wrapped/native SOL and common stablecoins should never become the token
-    # being hunted. They may still be quote assets in a candidate pool.
     "So11111111111111111111111111111111111111112",
     "11111111111111111111111111111111",
     "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGgZwyTDt1v",
@@ -69,6 +62,8 @@ class HuntStats:
     volume_qualified: int = 0
     venue_qualified: int = 0
     final_candidates: int = 0
+    jupiter_round_trips: int = 0
+    jupiter_429s: int = 0
 
 
 @dataclass(frozen=True)
@@ -108,6 +103,21 @@ def _env_terms() -> tuple[str, ...]:
     return values or DEFAULT_SEARCH_TERMS
 
 
+def _hunt_sizes() -> tuple[float, ...]:
+    raw = os.getenv("ARBITRAGE_HUNT_DISCOVERY_SIZES_SOL", "").strip()
+    if not raw:
+        return DEFAULT_HUNT_DISCOVERY_SIZES_SOL
+    values: list[float] = []
+    for item in raw.split(","):
+        try:
+            value = float(item.strip())
+        except ValueError:
+            continue
+        if value > 0:
+            values.append(value)
+    return tuple(dict.fromkeys(values)) or DEFAULT_HUNT_DISCOVERY_SIZES_SOL
+
+
 class DexScreenerCandidateSource:
     """Build a broad Solana candidate pool from profiles, boosts and pair search."""
 
@@ -115,7 +125,7 @@ class DexScreenerCandidateSource:
         self._client = client or httpx.AsyncClient(
             base_url=DEXSCREENER_BASE,
             timeout=_env_float("ARBITRAGE_HUNT_TIMEOUT_SECONDS", DEFAULT_REQUEST_TIMEOUT_SECONDS),
-            headers={"Accept": "application/json", "User-Agent": "AnonTradeBot-ArbHunt/2.0"},
+            headers={"Accept": "application/json", "User-Agent": "AnonTradeBot-ArbHunt/2.1"},
         )
         self._owns_client = client is None
         self.last_stats = HuntStats()
@@ -145,14 +155,12 @@ class DexScreenerCandidateSource:
         addresses: list[str] = []
         if isinstance(profiles, list):
             addresses.extend(
-                str(item.get("tokenAddress", ""))
-                for item in profiles
+                str(item.get("tokenAddress", "")) for item in profiles
                 if isinstance(item, dict) and item.get("chainId") == SOLANA
             )
         if isinstance(boosts, list):
             addresses.extend(
-                str(item.get("tokenAddress", ""))
-                for item in boosts
+                str(item.get("tokenAddress", "")) for item in boosts
                 if isinstance(item, dict) and item.get("chainId") == SOLANA
             )
         profile_addresses = len(set(address for address in addresses if address))
@@ -161,11 +169,8 @@ class DexScreenerCandidateSource:
         if isinstance(searches, list):
             pair_payloads.extend(item for item in searches if isinstance(item, dict))
 
-        # Profiles/boosts are useful for discovering tokens that may not appear
-        # in search terms. Fetch their pool sets in a bounded batch.
         unique_addresses = [
-            address
-            for address in dict.fromkeys(addresses)
+            address for address in dict.fromkeys(addresses)
             if address and address not in EXCLUDED_MINTS
         ][:30]
         sem = asyncio.Semaphore(5)
@@ -183,12 +188,6 @@ class DexScreenerCandidateSource:
             for payload in fetched:
                 pair_payloads.extend(item for item in payload if isinstance(item, dict))
 
-        self.last_stats = HuntStats(
-            profile_addresses=profile_addresses,
-            search_pairs=len([item for item in pair_payloads if isinstance(item, dict)]),
-        )
-
-        # Aggregate pool liquidity/volume by the non-SOL, non-stable token.
         aggregates: dict[str, dict[str, Any]] = {}
         for pair in pair_payloads:
             if pair.get("chainId") != SOLANA:
@@ -215,13 +214,10 @@ class DexScreenerCandidateSource:
                 address,
                 {"symbol": str(token.get("symbol") or address[:8]),
                  "name": str(token.get("name") or token.get("symbol") or address[:8]),
-                 "liquidity": 0.0,
-                 "volume": 0.0,
-                 "dexes": set()},
+                 "liquidity": 0.0, "volume": 0.0, "dexes": set()},
             )
             entry["liquidity"] = max(
-                float(entry["liquidity"]),
-                _float_value((pair.get("liquidity") or {}).get("usd")),
+                float(entry["liquidity"]), _float_value((pair.get("liquidity") or {}).get("usd"))
             )
             entry["volume"] += _float_value((pair.get("volume") or {}).get("h24"))
             dex_id = str(pair.get("dexId") or "").lower().strip()
@@ -240,36 +236,16 @@ class DexScreenerCandidateSource:
             dex_count = len(value["dexes"])
             if liquidity < min_liquidity or volume < min_volume or dex_count < min_dexes:
                 continue
-
-            # Tier A is the strongest screen; Tier B is intentionally broader.
-            # Multi-DEX diversity is rewarded rather than required by default.
             tier = "A" if liquidity >= 250_000 and volume >= 1_000_000 and dex_count >= 2 else "B"
-            score = (
-                volume
-                * max(liquidity, 1.0) ** 0.25
-                * max(dex_count, 1) ** 0.75
-            )
-            candidates.append(
-                HuntCandidate(
-                    address,
-                    str(value["symbol"]),
-                    str(value["name"]),
-                    liquidity,
-                    volume,
-                    dex_count,
-                    score,
-                    tier,
-                )
-            )
+            score = volume * max(liquidity, 1.0) ** 0.25 * max(dex_count, 1) ** 0.75
+            candidates.append(HuntCandidate(
+                address, str(value["symbol"]), str(value["name"]), liquidity,
+                volume, dex_count, score, tier,
+            ))
 
-        candidates.sort(
-            key=lambda candidate: (
-                candidate.tier == "A",
-                candidate.score,
-                candidate.dex_count,
-            ),
-            reverse=True,
-        )
+        candidates.sort(key=lambda candidate: (
+            candidate.tier == "A", candidate.score, candidate.dex_count
+        ), reverse=True)
         final = tuple(candidates[:max_candidates])
         self.last_stats = HuntStats(
             profile_addresses=profile_addresses,
@@ -305,43 +281,52 @@ class ArbitrageHunter:
         self.source = source or DexScreenerCandidateSource()
         self.discovery = ArbitrageDiscovery()
         self._owns_source = source is None
+        self._jupiter_lock = asyncio.Lock()
+        self._last_jupiter_request = 0.0
 
     async def close(self) -> None:
         await self.discovery.close()
         if self._owns_source:
             await self.source.close()
 
+    async def _discover_candidate(self, candidate: HuntCandidate) -> DiscoveryResult:
+        async with self._jupiter_lock:
+            now = asyncio.get_running_loop().time()
+            wait = _env_float("ARBITRAGE_HUNT_JUPITER_MIN_INTERVAL_SECONDS", DEFAULT_JUPITER_MIN_INTERVAL_SECONDS)
+            delay = wait - (now - self._last_jupiter_request)
+            if delay > 0:
+                await asyncio.sleep(delay)
+            self._last_jupiter_request = asyncio.get_running_loop().time()
+            return await self.discovery.discover(candidate.token_mint, sizes_sol=_hunt_sizes())
+
     async def hunt(self, limit: int | None = None) -> HuntResult:
         candidates = await self.source.discover_candidates(limit)
         stats = self.source.last_stats
         if not candidates:
             return HuntResult(
-                (),
-                (),
-                ("No candidates met the configured liquidity, volume, and venue screening thresholds.",),
-                stats,
+                (), (), ("No candidates met the configured liquidity, volume, and venue screening thresholds.",), stats
             )
 
-        sem = asyncio.Semaphore(2)
         errors: list[str] = []
+        discoveries: list[tuple[HuntCandidate, DiscoveryResult]] = []
+        for candidate in candidates:
+            try:
+                result = await self._discover_candidate(candidate)
+                discoveries.append((candidate, result))
+            except Exception as exc:
+                errors.append(f"{candidate.symbol}: {exc}")
 
-        async def run(candidate: HuntCandidate):
-            async with sem:
-                try:
-                    result = await self.discovery.discover(candidate.token_mint)
-                    return candidate, result
-                except Exception as exc:
-                    errors.append(f"{candidate.symbol}: {exc}")
-                    return None
-
-        raw = await asyncio.gather(*(run(candidate) for candidate in candidates))
-        discoveries = [item for item in raw if item is not None]
-        discoveries.sort(
-            key=lambda item: (
-                bool(item[1].opportunity and item[1].opportunity.executable),
-                item[1].opportunity.net_profit_atomic if item[1].opportunity else -1,
-                item[1].opportunity.net_profit_bps if item[1].opportunity else float("-inf"),
-            ),
-            reverse=True,
+        round_trips = sum(1 for _, discovery in discoveries if discovery.opportunity is not None)
+        rate_limits = sum(
+            1 for _, discovery in discoveries
+            if discovery.error and "HTTP 429" in discovery.error
         )
+        stats = HuntStats(
+            **{**stats.__dict__, "jupiter_round_trips": round_trips, "jupiter_429s": rate_limits}
+        )
+        discoveries.sort(key=lambda item: (
+            bool(item[1].opportunity and item[1].opportunity.executable),
+            item[1].opportunity.net_profit_atomic if item[1].opportunity else -1,
+            item[1].opportunity.net_profit_bps if item[1].opportunity else float("-inf"),
+        ), reverse=True)
         return HuntResult(candidates, tuple(discoveries), tuple(errors), stats)
