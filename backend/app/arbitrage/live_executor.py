@@ -60,10 +60,6 @@ class ArbitrageLiveExecutor:
         self._live_enabled = (
             os.getenv("ARBITRAGE_LIVE_TRADING_ENABLED", "false").lower() == "true"
         )
-        self._min_profit_bps = float(os.getenv("ARBITRAGE_LIVE_MIN_PROFIT_BPS", "50"))
-        self._min_profit_lamports = int(
-            os.getenv("ARBITRAGE_LIVE_MIN_PROFIT_LAMPORTS", "5000000")
-        )
         self._max_trade_lamports = int(
             Decimal(os.getenv("ARBITRAGE_LIVE_MAX_SOL", "0.10")) * LAMPORTS_PER_SOL
         )
@@ -292,11 +288,7 @@ class ArbitrageLiveExecutor:
         estimated_cost += int(guaranteed_sol * sell_venue.fee_bps / 10_000)
         estimated_cost += self._tip_lamports
         net_before_priority = gross - estimated_cost
-        net_bps = net_before_priority / input_lamports * 10_000
-        if (
-            net_before_priority < self._min_profit_lamports
-            or net_bps < self._min_profit_bps
-        ):
+        if net_before_priority <= 0:
             return LiveExecutionResult(
                 False,
                 buy_venue=buy_venue.name,
@@ -334,10 +326,7 @@ class ArbitrageLiveExecutor:
             raise ArbitrageLiveExecutionError(str(exc)) from exc
 
         net_after_priority = net_before_priority - buy_priority - sell_priority
-        if (
-            net_after_priority < self._min_profit_lamports
-            or (net_after_priority / input_lamports * 10_000) < self._min_profit_bps
-        ):
+        if net_after_priority <= 0:
             return LiveExecutionResult(
                 False,
                 buy_venue=buy_venue.name,
