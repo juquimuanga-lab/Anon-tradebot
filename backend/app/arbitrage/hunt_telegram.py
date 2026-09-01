@@ -32,8 +32,8 @@ async def arbitrage_hunt_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
     await update.message.reply_text(
         "🛰️ *Arbitrage hunter started*\n\n"
-        "Shortlisting liquid, high-volume Solana tokens with multiple venues, "
-        "then running the existing Jupiter size sweep.\n\n"
+        "Broadening Solana candidate discovery, then running the existing "
+        "unrestricted Jupiter size sweep.\n\n"
         "_Observe-only. No transaction will be submitted._",
         parse_mode="Markdown",
     )
@@ -47,25 +47,38 @@ async def arbitrage_hunt_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE)
     finally:
         await hunter.close()
 
+    stats = result.stats
     if not result.candidates:
-        reason = result.errors[0] if result.errors else "No candidates met the configured filters."
         await update.message.reply_text(
-            f"🔎 *No arbitrage candidates found*\n\nReason: `{reason}`\n\n"
-            "This was observe-only. No transaction was submitted.",
+            "🔎 *No arbitrage candidates found*\n\n"
+            f"Profiles/boost addresses: `{stats.profile_addresses}`\n"
+            f"Pair observations: `{stats.search_pairs}`\n"
+            f"Unique tokens: `{stats.unique_tokens}`\n"
+            f"Liquidity-qualified: `{stats.liquidity_qualified}`\n"
+            f"Volume-qualified: `{stats.volume_qualified}`\n"
+            f"Venue-qualified: `{stats.venue_qualified}`\n\n"
+            "The candidate screen found nothing to send to Jupiter. "
+            "No transaction was submitted.",
             parse_mode="Markdown",
         )
         return
 
     rows: list[str] = []
+    complete_routes = 0
+    executable = 0
     for candidate, discovery in result.discoveries:
         opportunity = discovery.opportunity
         if opportunity is None:
-            rows.append(f"• `{candidate.symbol}` → no complete Jupiter round-trip")
+            reason = discovery.error or "no complete Jupiter round-trip"
+            rows.append(f"• `{candidate.symbol}` [{candidate.tier}] → `{reason}`")
             continue
 
-        status = "✅" if opportunity.executable else "—"
+        complete_routes += 1
+        if opportunity.executable:
+            executable += 1
+        status = "✅" if opportunity.executable else "🟡"
         rows.append(
-            f"{status} `{candidate.symbol}` | `{discovery.amount_sol:g} SOL` | "
+            f"{status} `{candidate.symbol}` [{candidate.tier}] | `{discovery.amount_sol:g} SOL` | "
             f"net `{opportunity.net_profit_bps:.1f} bps` / "
             f"`{opportunity.net_profit_atomic / 1_000_000_000:.9f} SOL` | "
             f"DEXes `{candidate.dex_count}` | liq `${candidate.liquidity_usd:,.0f}`"
@@ -73,8 +86,11 @@ async def arbitrage_hunt_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
     message = (
         "🛰️ *Arbitrage hunt results*\n\n"
-        "Candidates were filtered by liquidity, 24h volume and venue diversity, "
-        "then priced through unrestricted Jupiter discovery.\n\n"
+        f"Pair observations: `{stats.search_pairs}`\n"
+        f"Unique tokens: `{stats.unique_tokens}`\n"
+        f"Screen-qualified: `{stats.final_candidates}`\n"
+        f"Jupiter round-trips: `{complete_routes}`\n"
+        f"Executable at current thresholds: `{executable}`\n\n"
         + "\n".join(rows)
         + "\n\n*Top candidate details:*"
     )
