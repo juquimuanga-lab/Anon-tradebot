@@ -11,8 +11,6 @@ from app.arbitrage.rpc_health import ArbitrageRpcHealth, RpcHealth
 from app.execution.onchain.jupiter import SOL_MINT
 
 LAMPORTS_PER_SOL = 1_000_000_000
-# Default production discovery ladder. ARBITRAGE_DISCOVERY_SIZES_SOL may still
-# override it, but Railway does not need the variable for normal operation.
 DEFAULT_DISCOVERY_SIZES_SOL = (0.02, 0.05, 0.10, 0.25, 0.50, 1.00)
 
 
@@ -68,17 +66,22 @@ class ArbitrageDiscovery:
         token_mint: str,
         amount_sol: float | None = None,
         config: ArbitrageConfig | None = None,
+        sizes_sol: tuple[float, ...] | None = None,
     ) -> DiscoveryResult:
         if not token_mint or len(token_mint) < 20:
             raise ValueError("token_mint does not look like a Solana mint")
         if amount_sol is not None and amount_sol <= 0:
             raise ValueError("amount_sol must be positive")
+        if sizes_sol is not None and any(size <= 0 for size in sizes_sol):
+            raise ValueError("sizes_sol must contain only positive values")
 
         health = await self.rpc_health.check()
         if not health.healthy:
             return DiscoveryResult(token_mint, amount_sol or 0.0, None, None, None, health, health.error)
 
-        sizes = (amount_sol,) if amount_sol is not None else configured_discovery_sizes()
+        sizes = (amount_sol,) if amount_sol is not None else (sizes_sol or configured_discovery_sizes())
+        if not sizes:
+            raise ValueError("at least one discovery size is required")
         cfg = config or ArbitrageConfig.from_env()
         candidates: list[DiscoveryCandidate] = []
 
