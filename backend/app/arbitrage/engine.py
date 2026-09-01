@@ -4,6 +4,11 @@ Jupiter quote output amounts are treated as the quoted executable outputs.
 DEX fees and price impact are not subtracted a second time. Price impact
 remains a safety gate, while priority fees and Jito tips remain explicit
 external execution costs.
+
+Execution economics are expressed dynamically relative to trade size. The
+engine never makes a tiny trade look profitable by lowering its real costs;
+instead it reports the gross edge required to cover those costs plus a
+configurable safety buffer.
 """
 from __future__ import annotations
 
@@ -21,6 +26,14 @@ class ArbitrageConfig:
     max_slippage_bps: float = 50.0
     estimated_priority_fee_atomic: int = 50_000
     estimated_jito_tip_atomic: int = 100_000
+    execution_safety_bps: float = 10.0
+
+    @property
+    def external_execution_cost_atomic(self) -> int:
+        """Return non-quote execution costs, never allowing negatives."""
+        return max(self.estimated_priority_fee_atomic, 0) + max(
+            self.estimated_jito_tip_atomic, 0
+        )
 
 
 def find_two_venue_opportunity(
@@ -29,7 +42,13 @@ def find_two_venue_opportunity(
     sell_quote: Quote,
     config: ArbitrageConfig = ArbitrageConfig(),
 ) -> ArbitrageOpportunity:
-    """Evaluate a buy quote followed by a sell quote."""
+    """Evaluate a buy quote followed by a sell quote.
+
+    Jupiter's quoted output already incorporates the quoted route economics,
+    so DEX fee/price-impact metadata is not deducted again. External execution
+    costs are deducted and the safety buffer is converted into an atomic
+    threshold relative to the input size.
+    """
     if buy_quote.output_amount_atomic <= 0:
         return _rejected(token_mint, buy_quote, sell_quote, "buy_quote_zero_output")
     if sell_quote.output_amount_atomic <= 0:
@@ -37,61 +56,39 @@ def find_two_venue_opportunity(
     if sell_quote.input_amount_atomic != buy_quote.output_amount_atomic:
         return _rejected(token_mint, buy_quote, sell_quote, "quote_size_mismatch")
 
-    gross_profit = sell_quote.output_amount_atomic - buy_quote.input_amount_atomic
+    input_atomic = buy_quote.input_amount_atomic
+    gross_profit = sell_quote.output_amount_atomic - input_atomic
+    gross_profit_bps = gross_profit / input_atomic * 10_000 if input_atomic else 0.0
 
-    # Jupiter's quote output already reflects the quoted route economics.
-    # Do not subtract DEX fees or price impact again.
-    execution_costs = (
-        max(config.estimated_priority_fee_atomic, 0)
-        + max(config.estimated_jito_tip_atomic, 0)
+    execution_costs = config.external_execution_cost_atomic
+    execution_cost_bps = execution_costs / input_atomic * 10_000 if input_atomic else float("inf")
+    safety_atomic = max(int(input_atomic * max(config.execution_safety_bps, 0.0) / 10_000), 0)
+    required_gross_profit_atomic = execution_costs + safety_atomic + max(config.min_profit_atomic, 0)
+    required_gross_profit_bps = (
+        required_gross_profit_atomic / input_atomic * 10_000 if input_atomic else float("inf")
     )
+
     net_profit = gross_profit - execution_costs
-    net_profit_bps = (
-        net_profit / buy_quote.input_amount_atomic * 10_000
-        if buy_quote.input_amount_atomic
-        else 0.0
-    )
+    net_profit_bps = net_profit / input_atomic * 10_000 if input_atomic else 0.0
 
     max_impact = max(buy_quote.price_impact_bps, sell_quote.price_impact_bps)
     if max_impact > config.max_price_impact_bps:
-        return ArbitrageOpportunity(
-            token_mint=token_mint,
-            buy_venue=buy_quote.venue,
-            sell_venue=sell_quote.venue,
-            input_amount_atomic=buy_quote.input_amount_atomic,
-            buy_output_atomic=buy_quote.output_amount_atomic,
-            final_output_atomic=sell_quote.output_amount_atomic,
-            gross_profit_atomic=gross_profit,
-            total_cost_atomic=execution_costs,
-            net_profit_atomic=net_profit,
-            net_profit_bps=net_profit_bps,
-            estimated_priority_fee_atomic=config.estimated_priority_fee_atomic,
-            estimated_jito_tip_atomic=config.estimated_jito_tip_atomic,
-            executable=False,
-            reason="price_impact_too_high",
+        return _build(
+            token_mint, buy_quote, sell_quote, gross_profit, execution_costs,
+            net_profit, net_profit_bps, gross_profit_bps, execution_cost_bps,
+            required_gross_profit_bps, config, False, "price_impact_too_high",
         )
 
     executable = (
-        net_profit >= config.min_profit_atomic
-        and net_profit_bps >= config.min_profit_bps
+        net_profit >= max(config.min_profit_atomic, 0) + safety_atomic
+        and net_profit_bps >= config.min_profit_bps + config.execution_safety_bps
     )
     reason = "profit_threshold_met" if executable else "profit_threshold_not_met"
 
-    return ArbitrageOpportunity(
-        token_mint=token_mint,
-        buy_venue=buy_quote.venue,
-        sell_venue=sell_quote.venue,
-        input_amount_atomic=buy_quote.input_amount_atomic,
-        buy_output_atomic=buy_quote.output_amount_atomic,
-        final_output_atomic=sell_quote.output_amount_atomic,
-        gross_profit_atomic=gross_profit,
-        total_cost_atomic=execution_costs,
-        net_profit_atomic=net_profit,
-        net_profit_bps=net_profit_bps,
-        estimated_priority_fee_atomic=config.estimated_priority_fee_atomic,
-        estimated_jito_tip_atomic=config.estimated_jito_tip_atomic,
-        executable=executable,
-        reason=reason,
+    return _build(
+        token_mint, buy_quote, sell_quote, gross_profit, execution_costs,
+        net_profit, net_profit_bps, gross_profit_bps, execution_cost_bps,
+        required_gross_profit_bps, config, executable, reason,
     )
 
 
@@ -106,6 +103,42 @@ def rank_opportunities(
             item.net_profit_atomic,
         ),
         reverse=True,
+    )
+
+
+def _build(
+    token_mint: str,
+    buy_quote: Quote,
+    sell_quote: Quote,
+    gross_profit: int,
+    execution_costs: int,
+    net_profit: int,
+    net_profit_bps: float,
+    gross_profit_bps: float,
+    execution_cost_bps: float,
+    required_gross_profit_bps: float,
+    config: ArbitrageConfig,
+    executable: bool,
+    reason: str,
+) -> ArbitrageOpportunity:
+    return ArbitrageOpportunity(
+        token_mint=token_mint,
+        buy_venue=buy_quote.venue,
+        sell_venue=sell_quote.venue,
+        input_amount_atomic=buy_quote.input_amount_atomic,
+        buy_output_atomic=buy_quote.output_amount_atomic,
+        final_output_atomic=sell_quote.output_amount_atomic,
+        gross_profit_atomic=gross_profit,
+        total_cost_atomic=execution_costs,
+        net_profit_atomic=net_profit,
+        net_profit_bps=net_profit_bps,
+        estimated_priority_fee_atomic=max(config.estimated_priority_fee_atomic, 0),
+        estimated_jito_tip_atomic=max(config.estimated_jito_tip_atomic, 0),
+        gross_profit_bps=gross_profit_bps,
+        execution_cost_bps=execution_cost_bps,
+        required_gross_profit_bps=required_gross_profit_bps,
+        executable=executable,
+        reason=reason,
     )
 
 
