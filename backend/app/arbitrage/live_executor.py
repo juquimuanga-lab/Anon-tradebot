@@ -9,12 +9,12 @@ from dataclasses import dataclass, field
 from typing import Any
 
 import httpx
-
 from solders.keypair import Keypair
 
 from app.arbitrage.jupiter_bundle import (
     JupiterInstructionBuildError,
     build_signed_swap_with_tip,
+    build_signed_swap_without_tip,
 )
 from app.arbitrage.jupiter_quotes import VenueConfig
 from app.arbitrage.jito import JitoClient
@@ -125,11 +125,11 @@ class ArbitrageLiveExecutor:
         return payload
 
     async def _simulate(self, rpc_url: str, signed_tx: bytes) -> None:
-        """Simulate one transaction where its state is independently valid.
+        """Simulate only a leg whose required state already exists.
 
-        The sell leg is intentionally NOT simulated in isolation because its
-        token input is created by the preceding buy transaction in the bundle.
-        Jito's bundle simulator/Block Engine performs ordered bundle simulation.
+        The sell leg is deliberately not simulated independently because its
+        token input is created by the preceding buy transaction. Jito performs
+        ordered bundle simulation before considering the bundle for landing.
         """
         encoded = base64.b64encode(signed_tx).decode("ascii")
         payload = {
@@ -165,7 +165,6 @@ class ArbitrageLiveExecutor:
         rpc_url: str,
         bundle_status: dict[str, Any],
     ) -> tuple[bool, str, tuple[str, ...]]:
-        """Verify every landed bundle transaction succeeded on-chain."""
         confirmation = str(
             bundle_status.get("confirmation_status")
             or bundle_status.get("confirmationStatus")
@@ -174,12 +173,10 @@ class ArbitrageLiveExecutor:
         signatures = tuple(
             str(sig) for sig in (bundle_status.get("transactions") or [])
         )
-
         if confirmation not in {"processed", "confirmed", "finalized"}:
             return False, f"bundle_not_confirmed:{confirmation or 'unknown'}", signatures
         if len(signatures) != 2:
             return False, f"unexpected_bundle_transaction_count:{len(signatures)}", signatures
-
         for signature in signatures:
             transaction = await get_transaction_details(rpc_url, signature)
             if not transaction:
@@ -187,7 +184,6 @@ class ArbitrageLiveExecutor:
             meta = transaction.get("meta") or {}
             if meta.get("err") is not None:
                 return False, f"transaction_failed:{signature}:{meta.get('err')}", signatures
-
         return True, "settled", signatures
 
     async def execute(
@@ -215,16 +211,12 @@ class ArbitrageLiveExecutor:
         if not rpc_url:
             raise ArbitrageLiveExecutionError("SOLANA_RPC_URL/Helius RPC is not configured")
 
-        buy_quote = await self._quote(
-            SOL_MINT, token_mint, input_lamports, buy_venue
-        )
+        buy_quote = await self._quote(SOL_MINT, token_mint, input_lamports, buy_venue)
         guaranteed_tokens = int(buy_quote.get("otherAmountThreshold") or 0)
         if guaranteed_tokens <= 0:
             raise ArbitrageLiveExecutionError("buy quote has no positive minimum output")
 
-        sell_quote = await self._quote(
-            token_mint, SOL_MINT, guaranteed_tokens, sell_venue
-        )
+        sell_quote = await self._quote(token_mint, SOL_MINT, guaranteed_tokens, sell_venue)
         final_lamports = int(sell_quote.get("outAmount") or 0)
         if final_lamports <= 0:
             raise ArbitrageLiveExecutionError("sell quote has no positive output")
@@ -234,11 +226,7 @@ class ArbitrageLiveExecutor:
         estimated_cost += int(final_lamports * sell_venue.fee_bps / 10_000)
         estimated_cost += self._tip_lamports
         net_before_priority = gross - estimated_cost
-        net_bps = (
-            net_before_priority / input_lamports * 10_000
-            if input_lamports
-            else 0.0
-        )
+        net_bps = net_before_priority / input_lamports * 10_000
         if (
             net_before_priority < self._min_profit_lamports
             or net_bps < self._min_profit_bps
@@ -258,48 +246,26 @@ class ArbitrageLiveExecutor:
             if not tip_accounts:
                 raise ArbitrageLiveExecutionError("Jito returned no tip accounts")
             tip_account = random.choice(tip_accounts)
-
-            # Buy has no tip. Sell carries the tip in the SAME transaction.
-            # Therefore a failed sell cannot pay the Jito tip independently.
-            buy_signed, buy_priority = await build_signed_swap_with_tip(
+            buy_signed, buy_priority = await build_signed_swap_without_tip(
                 base_url=settings.jupiter_base_url,
                 quote_response=buy_quote,
                 user_pubkey=user_pubkey,
                 keypair=keypair,
                 rpc_url=rpc_url,
+                api_key=os.getenv("JUPITER_API_KEY"),
+            )
+            sell_signed, sell_priority = await build_signed_swap_with_tip(
+                base_url=settings.jupiter_base_url,
+                quote_response=sell_quote,
+                user_pubkey=user_pubkey,
+                keypair=keypair,
+                rpc_url=rpc_url,
                 tip_account=tip_account,
-                tip_lamports=0,
+                tip_lamports=self._tip_lamports,
                 api_key=os.getenv("JUPITER_API_KEY"),
             )
         except JupiterInstructionBuildError as exc:
-            # Rebuild the buy without a tip through the instruction path is not
-            # safe if the helper enforces the minimum. A zero-tip instruction
-            # path is supported explicitly by the helper below.
             raise ArbitrageLiveExecutionError(str(exc)) from exc
-
-        # The helper's tip floor is only for tipped transactions. The buy leg
-        # is rebuilt through the same instruction endpoint with a zero tip by
-        # using the dedicated no-tip builder.
-        from app.arbitrage.jupiter_bundle import build_signed_swap_without_tip
-
-        buy_signed, buy_priority = await build_signed_swap_without_tip(
-            base_url=settings.jupiter_base_url,
-            quote_response=buy_quote,
-            user_pubkey=user_pubkey,
-            keypair=keypair,
-            rpc_url=rpc_url,
-            api_key=os.getenv("JUPITER_API_KEY"),
-        )
-        sell_signed, sell_priority = await build_signed_swap_with_tip(
-            base_url=settings.jupiter_base_url,
-            quote_response=sell_quote,
-            user_pubkey=user_pubkey,
-            keypair=keypair,
-            rpc_url=rpc_url,
-            tip_account=tip_account,
-            tip_lamports=self._tip_lamports,
-            api_key=os.getenv("JUPITER_API_KEY"),
-        )
 
         net_after_priority = net_before_priority - buy_priority - sell_priority
         if (
@@ -316,8 +282,8 @@ class ArbitrageLiveExecutor:
                 reason="actual_priority_fee_profit_gate_failed",
             )
 
-        # Only the buy is simulated independently. The sell depends on the
-        # buy's state and is validated by Jito's ordered bundle simulation.
+        # The tip is embedded in the sell transaction. If the sell fails, the
+        # atomic bundle fails and the tip cannot execute independently.
         await self._simulate(rpc_url, buy_signed)
 
         bundle_id = await self._jito.send_bundle(
