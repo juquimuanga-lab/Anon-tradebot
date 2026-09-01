@@ -13,6 +13,7 @@ from app.bot import handlers_admin, handlers_basic, handlers_wallet, rule_manage
 from app.bot.setrule_wizard import COLLECTING, setrule_collect, setrule_start, setrule_fourmeme_start, setrule_pons_start
 from app.config.settings import settings
 from app.arbitrage import telegram as arbitrage_telegram
+from app.arbitrage import discovery_telegram
 
 
 async def set_bot_commands(application: Application) -> None:
@@ -54,7 +55,8 @@ async def set_bot_commands(application: Application) -> None:
         BotCommand("arbitrage", "Show arbitrage status"),
         BotCommand("enablearbitrage", "Enable arbitrage scanning"),
         BotCommand("disablearbitrage", "Disable arbitrage scanning"),
-        BotCommand("arbscan", "Scan live venue spreads"),
+        BotCommand("arbscan", "Scan venue-constrained spreads"),
+        BotCommand("arbdiscover", "Discover best Jupiter routes"),
         BotCommand("arbvenues", "Show arbitrage venues"),
         BotCommand("arblivestatus", "Show live arbitrage gate"),
         BotCommand("arblive", "Submit one atomic arbitrage bundle"),
@@ -88,6 +90,7 @@ def build_application() -> Application:
     application.add_handler(CommandHandler("enablearbitrage", arbitrage_telegram.enable_arbitrage_cmd))
     application.add_handler(CommandHandler("disablearbitrage", arbitrage_telegram.disable_arbitrage_cmd))
     application.add_handler(CommandHandler("arbscan", arbitrage_telegram.arbitrage_scan_cmd))
+    application.add_handler(CommandHandler("arbdiscover", discovery_telegram.arbitrage_discover_cmd))
     application.add_handler(CommandHandler("arbvenues", arbitrage_telegram.arbitrage_venues_cmd))
     application.add_handler(CommandHandler("arblivestatus", arbitrage_telegram.arbitrage_live_status_cmd))
     application.add_handler(CommandHandler("arblive", arbitrage_telegram.arbitrage_live_execute_cmd))
