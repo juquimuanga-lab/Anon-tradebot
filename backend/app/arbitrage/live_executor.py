@@ -1,4 +1,4 @@
-"""Gated live Solana arbitrage execution with safe Jito tip placement."""
+"""Gated live Solana arbitrage execution with transaction-level safety checks."""
 from __future__ import annotations
 
 import base64
@@ -6,9 +6,11 @@ import logging
 import os
 import random
 from dataclasses import dataclass, field
+from decimal import Decimal, InvalidOperation
 from typing import Any
 
 import httpx
+from solana.rpc.async_api import AsyncClient
 from solders.keypair import Keypair
 
 from app.arbitrage.jupiter_bundle import (
@@ -62,6 +64,12 @@ class ArbitrageLiveExecutor:
         self._min_profit_lamports = int(
             os.getenv("ARBITRAGE_LIVE_MIN_PROFIT_LAMPORTS", "5000000")
         )
+        self._max_trade_lamports = int(
+            Decimal(os.getenv("ARBITRAGE_LIVE_MAX_SOL", "0.10")) * LAMPORTS_PER_SOL
+        )
+        self._reserve_lamports = int(
+            Decimal(os.getenv("ARBITRAGE_LIVE_RESERVE_SOL", "0.02")) * LAMPORTS_PER_SOL
+        )
         self._slippage_bps = max(
             1, min(int(os.getenv("ARBITRAGE_LIVE_SLIPPAGE_BPS", "30")), 300)
         )
@@ -89,6 +97,14 @@ class ArbitrageLiveExecutor:
             return load_keypair(raw_key)
         except Exception as exc:
             raise ArbitrageLiveExecutionError("stored Solana wallet key is invalid") from exc
+
+    async def _wallet_balance(self, rpc_url: str, owner: Keypair) -> int:
+        try:
+            async with AsyncClient(rpc_url) as rpc:
+                result = await rpc.get_balance(owner.pubkey(), commitment="confirmed")
+            return int(result.value)
+        except Exception as exc:
+            raise ArbitrageLiveExecutionError("unable to verify wallet SOL balance") from exc
 
     async def _quote(
         self,
@@ -124,12 +140,22 @@ class ArbitrageLiveExecutor:
             )
         return payload
 
-    async def _simulate(self, rpc_url: str, signed_tx: bytes) -> None:
-        """Simulate only a leg whose required state already exists.
+    @staticmethod
+    def _positive_int(payload: dict[str, Any], field: str, label: str) -> int:
+        try:
+            value = int(payload.get(field) or 0)
+        except (TypeError, ValueError) as exc:
+            raise ArbitrageLiveExecutionError(f"{label} has invalid {field}") from exc
+        if value <= 0:
+            raise ArbitrageLiveExecutionError(f"{label} has no positive {field}")
+        return value
 
-        The sell leg is deliberately not simulated independently because its
-        token input is created by the preceding buy transaction. Jito performs
-        ordered bundle simulation before considering the bundle for landing.
+    async def _simulate(self, rpc_url: str, signed_tx: bytes) -> None:
+        """Simulate a signed leg before submission.
+
+        The sell leg cannot be independently simulated against the current
+        ledger because its token input is produced by the preceding buy leg.
+        Jito performs ordered bundle simulation before accepting a bundle.
         """
         encoded = base64.b64encode(signed_tx).decode("ascii")
         payload = {
@@ -165,6 +191,12 @@ class ArbitrageLiveExecutor:
         rpc_url: str,
         bundle_status: dict[str, Any],
     ) -> tuple[bool, str, tuple[str, ...]]:
+        bundle_error = bundle_status.get("err")
+        if bundle_error not in (None, {"Ok": None}):
+            return False, f"bundle_error:{bundle_error}", tuple(
+                str(sig) for sig in (bundle_status.get("transactions") or [])
+            )
+
         confirmation = str(
             bundle_status.get("confirmation_status")
             or bundle_status.get("confirmationStatus")
@@ -175,8 +207,9 @@ class ArbitrageLiveExecutor:
         )
         if confirmation not in {"processed", "confirmed", "finalized"}:
             return False, f"bundle_not_confirmed:{confirmation or 'unknown'}", signatures
-        if len(signatures) != 2:
+        if len(signatures) != 2 or any(not sig for sig in signatures):
             return False, f"unexpected_bundle_transaction_count:{len(signatures)}", signatures
+
         for signature in signatures:
             transaction = await get_transaction_details(rpc_url, signature)
             if not transaction:
@@ -203,27 +236,60 @@ class ArbitrageLiveExecutor:
             )
         if amount_sol <= 0:
             return LiveExecutionResult(False, reason="amount_must_be_positive")
+        try:
+            amount_decimal = Decimal(str(amount_sol))
+        except (InvalidOperation, ValueError) as exc:
+            raise ArbitrageLiveExecutionError("amount_sol is not a valid decimal") from exc
+        input_lamports = int(amount_decimal * LAMPORTS_PER_SOL)
+        if input_lamports <= 0:
+            return LiveExecutionResult(False, reason="amount_too_small")
+        if input_lamports > self._max_trade_lamports:
+            return LiveExecutionResult(
+                False,
+                buy_venue=buy_venue.name,
+                sell_venue=sell_venue.name,
+                input_lamports=input_lamports,
+                reason="live_trade_size_limit_exceeded",
+            )
 
         keypair = await self._wallet(owner_user_id)
         user_pubkey = str(keypair.pubkey())
-        input_lamports = int(amount_sol * LAMPORTS_PER_SOL)
         rpc_url = settings.solana_rpc_url
         if not rpc_url:
             raise ArbitrageLiveExecutionError("SOLANA_RPC_URL/Helius RPC is not configured")
 
+        balance_lamports = await self._wallet_balance(rpc_url, keypair)
+        required_balance = input_lamports + self._tip_lamports + self._reserve_lamports
+        if balance_lamports < required_balance:
+            return LiveExecutionResult(
+                False,
+                buy_venue=buy_venue.name,
+                sell_venue=sell_venue.name,
+                input_lamports=input_lamports,
+                reason="insufficient_wallet_reserve",
+            )
+
         buy_quote = await self._quote(SOL_MINT, token_mint, input_lamports, buy_venue)
-        guaranteed_tokens = int(buy_quote.get("otherAmountThreshold") or 0)
-        if guaranteed_tokens <= 0:
-            raise ArbitrageLiveExecutionError("buy quote has no positive minimum output")
+        buy_out = self._positive_int(buy_quote, "outAmount", "buy quote")
+        guaranteed_tokens = self._positive_int(
+            buy_quote, "otherAmountThreshold", "buy quote"
+        )
+        if guaranteed_tokens > buy_out:
+            raise ArbitrageLiveExecutionError("buy quote minimum output exceeds quoted output")
 
-        sell_quote = await self._quote(token_mint, SOL_MINT, guaranteed_tokens, sell_venue)
-        final_lamports = int(sell_quote.get("outAmount") or 0)
-        if final_lamports <= 0:
-            raise ArbitrageLiveExecutionError("sell quote has no positive output")
+        sell_quote = await self._quote(
+            token_mint, SOL_MINT, guaranteed_tokens, sell_venue
+        )
+        sell_out = self._positive_int(sell_quote, "outAmount", "sell quote")
+        guaranteed_sol = self._positive_int(
+            sell_quote, "otherAmountThreshold", "sell quote"
+        )
+        if guaranteed_sol > sell_out:
+            raise ArbitrageLiveExecutionError("sell quote minimum output exceeds quoted output")
 
-        gross = final_lamports - input_lamports
+        gross = guaranteed_sol - input_lamports
         estimated_cost = int(input_lamports * buy_venue.fee_bps / 10_000)
-        estimated_cost += int(final_lamports * sell_venue.fee_bps / 10_000)
+        estimated_cost += int(guaranteed_sol * sell_venue.fee_bps / 10_000)
         estimated_cost += self._tip_lamports
         net_before_priority = gross - estimated_cost
         net_bps = net_before_priority / input_lamports * 10_000
@@ -282,8 +348,9 @@ class ArbitrageLiveExecutor:
                 reason="actual_priority_fee_profit_gate_failed",
             )
 
-        # The tip is embedded in the sell transaction. If the sell fails, the
-        # atomic bundle fails and the tip cannot execute independently.
+        # Only the buy leg is independently simulatable from the current
+        # ledger. Jito's bundle execution is ordered and atomic, so the sell
+        # leg is evaluated together with the buy when the bundle is processed.
         await self._simulate(rpc_url, buy_signed)
 
         bundle_id = await self._jito.send_bundle(
@@ -301,6 +368,7 @@ class ArbitrageLiveExecutor:
                 "sell_venue": sell_venue.name,
                 "input_lamports": input_lamports,
                 "guaranteed_tokens": guaranteed_tokens,
+                "guaranteed_sol_output": guaranteed_sol,
                 "estimated_net_profit_lamports": net_after_priority,
             },
         )
