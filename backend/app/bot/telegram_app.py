@@ -54,6 +54,8 @@ async def set_bot_commands(application: Application) -> None:
         BotCommand("arbitrage", "Show arbitrage status"),
         BotCommand("enablearbitrage", "Enable arbitrage scanning"),
         BotCommand("disablearbitrage", "Disable arbitrage scanning"),
+        BotCommand("arbscan", "Scan live venue spreads"),
+        BotCommand("arbvenues", "Show arbitrage venues"),
         BotCommand("arbhelp", "Show arbitrage commands"),
     ]
     await application.bot.set_my_commands(commands)
@@ -84,6 +86,8 @@ def build_application() -> Application:
     application.add_handler(CommandHandler("arbitrage", arbitrage_telegram.arbitrage_cmd))
     application.add_handler(CommandHandler("enablearbitrage", arbitrage_telegram.enable_arbitrage_cmd))
     application.add_handler(CommandHandler("disablearbitrage", arbitrage_telegram.disable_arbitrage_cmd))
+    application.add_handler(CommandHandler("arbscan", arbitrage_telegram.arbitrage_scan_cmd))
+    application.add_handler(CommandHandler("arbvenues", arbitrage_telegram.arbitrage_venues_cmd))
     application.add_handler(CommandHandler("arbhelp", arbitrage_telegram.arbitrage_help_cmd))
 
     application.add_handler(CommandHandler("enable", handlers_admin.enable_cmd))
