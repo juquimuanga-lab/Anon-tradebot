@@ -14,6 +14,7 @@ from app.bot.setrule_wizard import COLLECTING, setrule_collect, setrule_start, s
 from app.config.settings import settings
 from app.arbitrage import telegram as arbitrage_telegram
 from app.arbitrage import discovery_telegram
+from app.arbitrage import hunt_telegram
 
 
 async def set_bot_commands(application: Application) -> None:
@@ -57,6 +58,7 @@ async def set_bot_commands(application: Application) -> None:
         BotCommand("disablearbitrage", "Disable arbitrage scanning"),
         BotCommand("arbscan", "Scan venue-constrained spreads"),
         BotCommand("arbdiscover", "Discover best Jupiter routes"),
+        BotCommand("arbhunt", "Hunt for arbitrage candidates"),
         BotCommand("arbvenues", "Show arbitrage venues"),
         BotCommand("arblivestatus", "Show live arbitrage gate"),
         BotCommand("arblive", "Submit one atomic arbitrage bundle"),
@@ -91,6 +93,7 @@ def build_application() -> Application:
     application.add_handler(CommandHandler("disablearbitrage", arbitrage_telegram.disable_arbitrage_cmd))
     application.add_handler(CommandHandler("arbscan", arbitrage_telegram.arbitrage_scan_cmd))
     application.add_handler(CommandHandler("arbdiscover", discovery_telegram.arbitrage_discover_cmd))
+    application.add_handler(CommandHandler("arbhunt", hunt_telegram.arbitrage_hunt_cmd))
     application.add_handler(CommandHandler("arbvenues", arbitrage_telegram.arbitrage_venues_cmd))
     application.add_handler(CommandHandler("arblivestatus", arbitrage_telegram.arbitrage_live_status_cmd))
     application.add_handler(CommandHandler("arblive", arbitrage_telegram.arbitrage_live_execute_cmd))
@@ -165,7 +168,7 @@ def build_application() -> Application:
 
     rent_recovery_conv = ConversationHandler(
         entry_points=[CommandHandler("recoverent", handlers_admin.recoverent_cmd)],
-        states={handlers_admin.RENT_RECOVERY_WAITING_SIGNATURES: [MessageHandler(filters.TEXT & ~filters.COMMAND | filters.Regex("^/cancel$"), handlers_admin.recoverent_receive)]},
+        states={handlers_admin.RENT_RECOVERY_WAITING_SIGNATURES: [MessageHandler(filters.TEXT & ~filters.COMMAND | filters.Regex("^/(skip|cancel)$"), handlers_admin.recoverent_receive)]},
         fallbacks=[CommandHandler("cancel", handlers_admin.recoverent_receive)],
         name="rent_recovery_conversation",
     )

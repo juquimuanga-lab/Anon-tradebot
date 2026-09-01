@@ -56,6 +56,8 @@ async def arbitrage_help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE)
         "/enablearbitrage — enable quote scanning\n"
         "/disablearbitrage — disable scanning\n"
         "/arbscan <mint> [SOL] — scan live venue spreads\n"
+        "/arbdiscover <mint> [SOL] — discover unrestricted Jupiter routes; no amount runs the size sweep\n"
+        "/arbhunt [1-10] — shortlist liquid multi-venue Solana tokens and run observe-only Jupiter discovery\n"
         "/arbvenues — show configured venues\n"
         "/arblivestatus — show live execution gate\n"
         "/arblive <mint> <SOL> <buy_venue> <sell_venue> — explicitly submit one atomic bundle\n"
