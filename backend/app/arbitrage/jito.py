@@ -28,7 +28,7 @@ class JitoClient:
         return body.get("result")
 
     async def get_tip_accounts(self) -> list[str]:
-        return list(await self._rpc("/api/v1/bundles", "getTipAccounts", []))
+        return list(await self._rpc("/api/v1/getTipAccounts", "getTipAccounts", []))
 
     async def send_bundle(self, signed_transactions_b64: list[str]) -> str:
         if not signed_transactions_b64:
@@ -48,7 +48,7 @@ class JitoClient:
         if not bundle_ids:
             return []
         result = await self._rpc(
-            "/api/v1/bundles",
+            "/api/v1/getBundleStatuses",
             "getBundleStatuses",
             [bundle_ids],
         )
@@ -59,7 +59,7 @@ class JitoClient:
         if not bundle_ids:
             return []
         result = await self._rpc(
-            "/api/v1/bundles",
+            "/api/v1/getInflightBundleStatuses",
             "getInflightBundleStatuses",
             [bundle_ids],
         )
@@ -71,11 +71,7 @@ class JitoClient:
         timeout_seconds: float = 20.0,
         poll_seconds: float = 0.5,
     ) -> dict[str, Any]:
-        """Wait until Jito reports the bundle landed/failed/invalid.
-
-        Jito explicitly distinguishes receipt of a bundle ID from successful
-        landing, so callers must not treat sendBundle success as trade success.
-        """
+        """Wait until Jito reports the bundle landed/failed/invalid."""
         deadline = asyncio.get_running_loop().time() + timeout_seconds
         last_status: dict[str, Any] = {"status": "Pending"}
 
@@ -93,7 +89,11 @@ class JitoClient:
             if statuses:
                 status = dict(statuses[0])
                 last_status = status
-                confirmation = str(status.get("confirmation_status") or status.get("confirmationStatus") or "").lower()
+                confirmation = str(
+                    status.get("confirmation_status")
+                    or status.get("confirmationStatus")
+                    or ""
+                ).lower()
                 if status.get("err") not in (None, {"Ok": None}):
                     status["status"] = "Failed"
                     return status
