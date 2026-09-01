@@ -1,4 +1,4 @@
-"""Gated live Solana arbitrage execution.
+"""Gated live Solana arbitrage execution with post-submission settlement checks.
 
 This module is deliberately separate from the sniper execution router.
 Live execution is disabled unless ARBITRAGE_LIVE_TRADING_ENABLED=true is set
@@ -15,7 +15,7 @@ import asyncio
 import base64
 import logging
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 import httpx
@@ -29,7 +29,7 @@ from app.arbitrage.jupiter_quotes import VenueConfig
 from app.arbitrage.jito import JitoClient
 from app.arbitrage.service import ArbitrageService
 from app.execution.onchain.jupiter import SOL_MINT
-from app.execution.onchain.solana_rpc import sign_versioned_transaction
+from app.execution.onchain.solana_rpc import get_transaction_details, sign_versioned_transaction
 from app.security.secrets_manager import secrets_manager
 from app.execution.onchain.wallet_keys import load_keypair
 from app.config.settings import settings
@@ -52,10 +52,12 @@ class LiveExecutionResult:
     guaranteed_token_amount: int = 0
     estimated_net_profit_lamports: int = 0
     reason: str = ""
+    settlement_status: str | None = None
+    transaction_signatures: tuple[str, ...] = field(default_factory=tuple)
 
 
 class ArbitrageLiveExecutor:
-    """Build, simulate and atomically submit an arbitrage bundle."""
+    """Build, simulate, atomically submit and reconcile an arbitrage bundle."""
 
     def __init__(self, service: ArbitrageService | None = None) -> None:
         self._service = service or ArbitrageService()
@@ -65,6 +67,8 @@ class ArbitrageLiveExecutor:
         self._min_profit_lamports = int(os.getenv("ARBITRAGE_LIVE_MIN_PROFIT_LAMPORTS", "5000000"))
         self._slippage_bps = max(1, min(int(os.getenv("ARBITRAGE_LIVE_SLIPPAGE_BPS", "30")), 300))
         self._tip_lamports = max(1000, int(os.getenv("ARBITRAGE_LIVE_JITO_TIP_LAMPORTS", "2000000")))
+        self._settlement_timeout_seconds = max(3.0, float(os.getenv("ARBITRAGE_LIVE_SETTLEMENT_TIMEOUT_SECONDS", "20")))
+        self._settlement_poll_seconds = max(0.25, float(os.getenv("ARBITRAGE_LIVE_SETTLEMENT_POLL_SECONDS", "0.5")))
 
     @property
     def live_enabled(self) -> bool:
@@ -163,6 +167,29 @@ class ArbitrageLiveExecutor:
         )
         return bytes(tx)
 
+    async def _reconcile_landed_bundle(self, rpc_url: str, bundle_status: dict[str, Any]) -> tuple[bool, str, tuple[str, ...]]:
+        """Verify every transaction reported by Jito actually succeeded on-chain."""
+        confirmation = str(bundle_status.get("confirmation_status") or bundle_status.get("confirmationStatus") or "").lower()
+        signatures = tuple(str(sig) for sig in (bundle_status.get("transactions") or []))
+
+        if confirmation not in {"processed", "confirmed", "finalized"}:
+            return False, f"bundle_not_confirmed:{confirmation or 'unknown'}", signatures
+        if len(signatures) != 3:
+            return False, f"unexpected_bundle_transaction_count:{len(signatures)}", signatures
+
+        # Jito's bundle status confirms inclusion, while getTransaction gives
+        # the definitive per-transaction execution result. Require every leg
+        # to have meta.err == null before treating the arbitrage as settled.
+        for signature in signatures:
+            transaction = await get_transaction_details(rpc_url, signature)
+            if not transaction:
+                return False, f"transaction_details_missing:{signature}", signatures
+            meta = transaction.get("meta") or {}
+            if meta.get("err") is not None:
+                return False, f"transaction_failed:{signature}:{meta.get('err')}", signatures
+
+        return True, "settled", signatures
+
     async def execute(
         self,
         owner_user_id: int,
@@ -183,14 +210,11 @@ class ArbitrageLiveExecutor:
         if not rpc_url:
             raise ArbitrageLiveExecutionError("SOLANA_RPC_URL/Helius RPC is not configured")
 
-        # Fresh buy quote immediately before transaction construction.
         buy_quote = await self._quote(SOL_MINT, token_mint, input_lamports, buy_venue)
         guaranteed_tokens = int(buy_quote.get("otherAmountThreshold") or 0)
         if guaranteed_tokens <= 0:
             raise ArbitrageLiveExecutionError("buy quote has no positive minimum output")
 
-        # The sell leg consumes only the minimum token amount guaranteed by the
-        # buy leg. This avoids depending on a dynamic post-buy token balance.
         sell_quote = await self._quote(token_mint, SOL_MINT, guaranteed_tokens, sell_venue)
         final_lamports = int(sell_quote.get("outAmount") or 0)
         if final_lamports <= 0:
@@ -216,11 +240,6 @@ class ArbitrageLiveExecutor:
         tip_account = (await self._jito.get_tip_accounts())[0]
         tip_signed = await self._tip_transaction(keypair, tip_account, rpc_url)
 
-        # Jupiter's build path already performs swap simulation when dynamic
-        # compute units are enabled. We additionally simulate the buy leg on
-        # our configured RPC before submitting the bundle. The sell leg cannot
-        # be independently simulated against the post-buy state without
-        # mutating a real bank; atomic bundling is the protection for that leg.
         await self._simulate(rpc_url, buy_signed)
         await self._simulate(rpc_url, tip_signed)
 
@@ -241,4 +260,54 @@ class ArbitrageLiveExecutor:
             "buy_last_valid_block_height": buy_last_valid,
             "sell_last_valid_block_height": sell_last_valid,
         })
-        return LiveExecutionResult(True, bundle_id=bundle_id, buy_venue=buy_venue.name, sell_venue=sell_venue.name, input_lamports=input_lamports, guaranteed_token_amount=guaranteed_tokens, estimated_net_profit_lamports=net_after_priority, reason="bundle_submitted")
+
+        settlement = await self._jito.wait_for_bundle(
+            bundle_id,
+            timeout_seconds=self._settlement_timeout_seconds,
+            poll_seconds=self._settlement_poll_seconds,
+        )
+        settlement_state = str(settlement.get("status") or "Unknown")
+        if settlement_state.lower() in {"failed", "invalid", "timeout"}:
+            logger.error("arbitrage_live_bundle_not_settled", extra={"bundle_id": bundle_id, "status": settlement_state})
+            return LiveExecutionResult(
+                False,
+                bundle_id=bundle_id,
+                buy_venue=buy_venue.name,
+                sell_venue=sell_venue.name,
+                input_lamports=input_lamports,
+                guaranteed_token_amount=guaranteed_tokens,
+                estimated_net_profit_lamports=net_after_priority,
+                reason=f"bundle_{settlement_state.lower()}",
+                settlement_status=settlement_state,
+                transaction_signatures=tuple(str(sig) for sig in (settlement.get("transactions") or [])),
+            )
+
+        reconciled, reason, signatures = await self._reconcile_landed_bundle(rpc_url, settlement)
+        if not reconciled:
+            logger.error("arbitrage_live_reconciliation_failed", extra={"bundle_id": bundle_id, "reason": reason, "signatures": signatures})
+            return LiveExecutionResult(
+                False,
+                bundle_id=bundle_id,
+                buy_venue=buy_venue.name,
+                sell_venue=sell_venue.name,
+                input_lamports=input_lamports,
+                guaranteed_token_amount=guaranteed_tokens,
+                estimated_net_profit_lamports=net_after_priority,
+                reason=reason,
+                settlement_status=settlement_state,
+                transaction_signatures=signatures,
+            )
+
+        logger.warning("arbitrage_live_bundle_settled", extra={"bundle_id": bundle_id, "signatures": signatures, "status": settlement_state})
+        return LiveExecutionResult(
+            True,
+            bundle_id=bundle_id,
+            buy_venue=buy_venue.name,
+            sell_venue=sell_venue.name,
+            input_lamports=input_lamports,
+            guaranteed_token_amount=guaranteed_tokens,
+            estimated_net_profit_lamports=net_after_priority,
+            reason="settled",
+            settlement_status=settlement_state,
+            transaction_signatures=signatures,
+        )
