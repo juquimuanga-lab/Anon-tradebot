@@ -1,7 +1,8 @@
 """Persistent observe-only arbitrage hunt controller.
 
-Runs candidate discovery repeatedly until explicitly stopped or a qualifying
-opportunity is found. Never signs or submits transactions.
+Runs candidate discovery repeatedly until explicitly stopped. Never signs or
+submits transactions. Qualifying opportunities are reported through the
+callback but do not stop the watcher.
 """
 from __future__ import annotations
 
@@ -30,7 +31,7 @@ class ContinuousHuntStatus:
 
 
 class ContinuousArbitrageHunt:
-    """One process-wide background hunt; /arbstop cancels it explicitly."""
+    """One process-wide background hunt controlled by /arbstop."""
 
     def __init__(self) -> None:
         self._task: asyncio.Task | None = None
@@ -38,6 +39,7 @@ class ContinuousArbitrageHunt:
         self._cycles = 0
         self._last_result: HuntResult | None = None
         self._lock = asyncio.Lock()
+        self._alerted: set[tuple[str, float, str, str]] = set()
 
     @property
     def status(self) -> ContinuousHuntStatus:
@@ -58,6 +60,7 @@ class ContinuousArbitrageHunt:
             self._stop_event = asyncio.Event()
             self._cycles = 0
             self._last_result = None
+            self._alerted.clear()
             self._task = asyncio.create_task(self._run(limit, on_profitable))
             return True
 
@@ -67,6 +70,8 @@ class ContinuousArbitrageHunt:
                 return False
             self._stop_event.set()
             task = self._task
+            self._task = None
+        task.cancel()
         try:
             await task
         except asyncio.CancelledError:
@@ -84,10 +89,9 @@ class ContinuousArbitrageHunt:
                 self._cycles += 1
                 result = await hunter.hunt(limit)
                 self._last_result = result
-                if _has_executable(result):
-                    if on_profitable:
-                        await on_profitable(result)
-                    return
+                await self._notify_new_opportunities(result, on_profitable)
+            except asyncio.CancelledError:
+                raise
             except Exception:
                 # A single failed cycle must not kill the 24/7 watcher.
                 pass
@@ -98,6 +102,25 @@ class ContinuousArbitrageHunt:
                 await asyncio.wait_for(self._stop_event.wait(), timeout=_interval_seconds())
             except asyncio.TimeoutError:
                 continue
+
+    async def _notify_new_opportunities(
+        self,
+        result: HuntResult,
+        on_profitable: Callable[[HuntResult], Awaitable[None]] | None,
+    ) -> None:
+        if on_profitable is None:
+            return
+        for candidate, discovery in result.discoveries:
+            opportunity = discovery.opportunity
+            if opportunity is None or not opportunity.executable:
+                continue
+            buy_route = discovery.buy_quote.route_id if discovery.buy_quote else "unknown"
+            sell_route = discovery.sell_quote.route_id if discovery.sell_quote else "unknown"
+            key = (candidate.token_mint, discovery.amount_sol, buy_route, sell_route)
+            if key in self._alerted:
+                continue
+            self._alerted.add(key)
+            await on_profitable(HuntResult((candidate,), ((candidate, discovery),)))
 
 
 def _has_executable(result: HuntResult) -> bool:
