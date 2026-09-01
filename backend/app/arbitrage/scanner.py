@@ -5,6 +5,7 @@ from dataclasses import dataclass
 
 from app.arbitrage.jupiter_quotes import JupiterArbitrageQuoteProvider, VenueConfig, configured_venues
 from app.arbitrage.models import ArbitrageOpportunity, Quote
+from app.arbitrage.rpc_health import ArbitrageRpcHealth, RpcHealth
 from app.arbitrage.service import ArbitrageService
 from app.config.settings import settings
 
@@ -17,6 +18,7 @@ class ScanResult:
     token_mint: str
     input_amount_lamports: int
     opportunities: tuple[ArbitrageOpportunity, ...]
+    rpc_health: RpcHealth | None = None
 
 
 class ArbitrageScanner:
@@ -26,9 +28,11 @@ class ArbitrageScanner:
         self,
         service: ArbitrageService,
         provider: JupiterArbitrageQuoteProvider | None = None,
+        rpc_health: ArbitrageRpcHealth | None = None,
     ) -> None:
         self.service = service
         self.provider = provider or JupiterArbitrageQuoteProvider(settings.jupiter_base_url)
+        self.rpc_health = rpc_health or ArbitrageRpcHealth()
 
     async def close(self) -> None:
         await self.provider.aclose()
@@ -43,6 +47,17 @@ class ArbitrageScanner:
             raise ValueError("token_mint does not look like a Solana mint")
         if amount_sol <= 0:
             raise ValueError("amount_sol must be positive")
+
+        # Verify the Solana data plane before observing quotes. Helius is used
+        # as primary when configured; Alchemy is the optional fallback.
+        health = await self.rpc_health.check()
+        if not health.healthy:
+            return ScanResult(
+                token_mint=token_mint,
+                input_amount_lamports=int(amount_sol * LAMPORTS_PER_SOL),
+                opportunities=tuple(),
+                rpc_health=health,
+            )
 
         amount_lamports = int(amount_sol * LAMPORTS_PER_SOL)
         selected = venues or configured_venues()
@@ -109,4 +124,5 @@ class ArbitrageScanner:
             token_mint=token_mint,
             input_amount_lamports=amount_lamports,
             opportunities=tuple(opportunities),
+            rpc_health=health,
         )
