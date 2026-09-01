@@ -12,6 +12,7 @@ from telegram.ext import (
 from app.bot import handlers_admin, handlers_basic, handlers_wallet, rule_manager
 from app.bot.setrule_wizard import COLLECTING, setrule_collect, setrule_start, setrule_fourmeme_start, setrule_pons_start
 from app.config.settings import settings
+from app.arbitrage import telegram as arbitrage_telegram
 
 
 async def set_bot_commands(application: Application) -> None:
@@ -50,6 +51,14 @@ async def set_bot_commands(application: Application) -> None:
         BotCommand("recoverent", "Recover token-account rent"),
         BotCommand("burnclose", "Burn and close token accounts"),
         BotCommand("guardian", "GO Guardian AI dashboard"),
+        BotCommand("arbitrage", "Show arbitrage status"),
+        BotCommand("enablearbitrage", "Enable arbitrage scanning"),
+        BotCommand("disablearbitrage", "Disable arbitrage scanning"),
+        BotCommand("arbscan", "Scan live venue spreads"),
+        BotCommand("arbvenues", "Show arbitrage venues"),
+        BotCommand("arblivestatus", "Show live arbitrage gate"),
+        BotCommand("arblive", "Submit one atomic arbitrage bundle"),
+        BotCommand("arbhelp", "Show arbitrage commands"),
     ]
     await application.bot.set_my_commands(commands)
 
@@ -65,7 +74,6 @@ def build_application() -> Application:
     application.add_handler(CommandHandler("start", handlers_basic.start))
     application.add_handler(CommandHandler("help", handlers_basic.help_cmd))
     application.add_handler(CommandHandler("status", handlers_basic.status))
-    # /rules now opens the button-driven manager; /listrules remains the legacy text view.
     application.add_handler(CommandHandler("rules", rule_manager.rule_manager_start))
     application.add_handler(CommandHandler("rulemanager", rule_manager.rule_manager_start))
     application.add_handler(CommandHandler("listrules", handlers_basic.listrules))
@@ -74,6 +82,16 @@ def build_application() -> Application:
     application.add_handler(CommandHandler("positions", handlers_basic.positions_cmd))
     application.add_handler(CommandHandler("history", handlers_basic.history))
     application.add_handler(CommandHandler("guardian", handlers_admin.guardian_cmd))
+
+    # Isolated Solana arbitrage controls. Live execution is separately gated.
+    application.add_handler(CommandHandler("arbitrage", arbitrage_telegram.arbitrage_cmd))
+    application.add_handler(CommandHandler("enablearbitrage", arbitrage_telegram.enable_arbitrage_cmd))
+    application.add_handler(CommandHandler("disablearbitrage", arbitrage_telegram.disable_arbitrage_cmd))
+    application.add_handler(CommandHandler("arbscan", arbitrage_telegram.arbitrage_scan_cmd))
+    application.add_handler(CommandHandler("arbvenues", arbitrage_telegram.arbitrage_venues_cmd))
+    application.add_handler(CommandHandler("arblivestatus", arbitrage_telegram.arbitrage_live_status_cmd))
+    application.add_handler(CommandHandler("arblive", arbitrage_telegram.arbitrage_live_execute_cmd))
+    application.add_handler(CommandHandler("arbhelp", arbitrage_telegram.arbitrage_help_cmd))
 
     application.add_handler(CommandHandler("enable", handlers_admin.enable_cmd))
     application.add_handler(CommandHandler("disable", handlers_admin.disable_cmd))
@@ -174,11 +192,9 @@ def build_application() -> Application:
     )
     application.add_handler(setrule_conv)
 
-    # Rule manager: upload JSON only after the admin explicitly chooses Import.
     application.add_handler(MessageHandler(filters.Document.ALL, rule_manager.rule_manager_document))
     application.add_handler(CommandHandler("cancel", rule_manager.rule_manager_cancel))
     application.add_handler(CallbackQueryHandler(rule_manager.rule_manager_callback, pattern=r"^rulemgr:"))
-
     application.add_handler(CallbackQueryHandler(handlers_admin.action_confirmation_callback, pattern=r"^actionconfirm:"))
     application.add_handler(CallbackQueryHandler(handlers_admin.confirmation_callback, pattern=r"^confirm:"))
     application.add_handler(CallbackQueryHandler(handlers_admin.pumpfun_snipers_callback, pattern=r"^sniper:"))
