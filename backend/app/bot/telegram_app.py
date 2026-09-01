@@ -58,12 +58,12 @@ async def set_bot_commands(application: Application) -> None:
         BotCommand("disablearbitrage", "Disable arbitrage scanning"),
         BotCommand("arbscan", "Scan venue-constrained spreads"),
         BotCommand("arbdiscover", "Discover best Jupiter routes"),
-        BotCommand("arbhunt", "Start continuous arbitrage hunter"),
+        BotCommand("arbhunt", "Start observe-only arbitrage hunter"),
         BotCommand("arbstatus", "Show arbitrage hunter status"),
-        BotCommand("arbstop", "Stop continuous arbitrage hunter"),
-        BotCommand("arbvenues", "Show arbitrage venues"),
+        BotCommand("arbstop", "Stop arbitrage hunter"),
+        BotCommand("arbvenues", "Show configured venue labels"),
         BotCommand("arblivestatus", "Show live arbitrage gate"),
-        BotCommand("arblive", "Submit one atomic arbitrage bundle"),
+        BotCommand("arblive", "Start global live arbitrage hunter"),
         BotCommand("arbhelp", "Show arbitrage commands"),
     ]
     await application.bot.set_my_commands(commands)
@@ -89,7 +89,6 @@ def build_application() -> Application:
     application.add_handler(CommandHandler("history", handlers_basic.history))
     application.add_handler(CommandHandler("guardian", handlers_admin.guardian_cmd))
 
-    # Isolated Solana arbitrage controls. Live execution is separately gated.
     application.add_handler(CommandHandler("arbitrage", arbitrage_telegram.arbitrage_cmd))
     application.add_handler(CommandHandler("enablearbitrage", arbitrage_telegram.enable_arbitrage_cmd))
     application.add_handler(CommandHandler("disablearbitrage", arbitrage_telegram.disable_arbitrage_cmd))
@@ -100,7 +99,7 @@ def build_application() -> Application:
     application.add_handler(CommandHandler("arbstop", continuous_telegram.arbitrage_hunt_stop_cmd))
     application.add_handler(CommandHandler("arbvenues", arbitrage_telegram.arbitrage_venues_cmd))
     application.add_handler(CommandHandler("arblivestatus", arbitrage_telegram.arbitrage_live_status_cmd))
-    application.add_handler(CommandHandler("arblive", arbitrage_telegram.arbitrage_live_execute_cmd))
+    application.add_handler(CommandHandler("arblive", arbitrage_telegram.arbitrage_live_hunt_start_cmd))
     application.add_handler(CommandHandler("arbhelp", arbitrage_telegram.arbitrage_help_cmd))
 
     application.add_handler(CommandHandler("enable", handlers_admin.enable_cmd))
@@ -110,7 +109,6 @@ def build_application() -> Application:
     application.add_handler(CommandHandler("enablepumpfun", handlers_admin.enablepumpfun_cmd))
     application.add_handler(CommandHandler("disablepumpfun", handlers_admin.disablepumpfun_cmd))
 
-    # Pump.fun sniper lanes
     application.add_handler(CommandHandler("pumpfunsnipers", handlers_admin.pumpfun_snipers_cmd))
     application.add_handler(CommandHandler("setfast", handlers_admin.setfast_cmd))
     application.add_handler(CommandHandler("setsmart", handlers_admin.setsmart_cmd))
@@ -142,7 +140,7 @@ def build_application() -> Application:
         entry_points=[CommandHandler("connectbscwallet", handlers_wallet.connectbscwallet_start)],
         states={handlers_wallet.BSC_CONNECT_WALLET_WAITING: [MessageHandler(filters.TEXT & ~filters.COMMAND | filters.Regex("^/cancel$"), handlers_wallet.connectbscwallet_receive)]},
         fallbacks=[CommandHandler("cancel", handlers_wallet.connectbscwallet_receive)],
-        name="connect_bsc_wallet_conversation",
+        name="connect_bscwallet_conversation",
     )
     application.add_handler(connectbscwallet_conv)
 
@@ -150,7 +148,7 @@ def build_application() -> Application:
         entry_points=[CommandHandler("connectrobinhoodwallet", handlers_wallet.connectrobinhoodwallet_start)],
         states={handlers_wallet.ROBINHOOD_CONNECT_WALLET_WAITING: [MessageHandler(filters.TEXT & ~filters.COMMAND | filters.Regex("^/cancel$"), handlers_wallet.connectrobinhoodwallet_receive)]},
         fallbacks=[CommandHandler("cancel", handlers_wallet.connectrobinhoodwallet_receive)],
-        name="connect_robinhood_wallet_conversation",
+        name="connect_robinhoodwallet_conversation",
     )
     application.add_handler(connectrobinhoodwallet_conv)
 
