@@ -13,16 +13,26 @@ from typing import Iterable
 
 from app.arbitrage.models import ArbitrageOpportunity, Quote
 
+# Production-safe defaults. Environment variables may still override these,
+# but a Railway deployment does not need them merely to start correctly.
+DEFAULT_MIN_PROFIT_BPS = 35.0
+DEFAULT_MIN_PROFIT_LAMPORTS = 50_000
+DEFAULT_MAX_PRICE_IMPACT_BPS = 80.0
+DEFAULT_MAX_SLIPPAGE_BPS = 50.0
+DEFAULT_ESTIMATED_PRIORITY_FEE_LAMPORTS = 50_000
+DEFAULT_ESTIMATED_JITO_TIP_LAMPORTS = 100_000
+DEFAULT_EXECUTION_SAFETY_BPS = 10.0
+
 
 @dataclass(frozen=True)
 class ArbitrageConfig:
-    min_profit_bps: float = 35.0
-    min_profit_atomic: int = 50_000
-    max_price_impact_bps: float = 80.0
-    max_slippage_bps: float = 50.0
-    estimated_priority_fee_atomic: int = 50_000
-    estimated_jito_tip_atomic: int = 100_000
-    execution_safety_bps: float = 10.0
+    min_profit_bps: float = DEFAULT_MIN_PROFIT_BPS
+    min_profit_atomic: int = DEFAULT_MIN_PROFIT_LAMPORTS
+    max_price_impact_bps: float = DEFAULT_MAX_PRICE_IMPACT_BPS
+    max_slippage_bps: float = DEFAULT_MAX_SLIPPAGE_BPS
+    estimated_priority_fee_atomic: int = DEFAULT_ESTIMATED_PRIORITY_FEE_LAMPORTS
+    estimated_jito_tip_atomic: int = DEFAULT_ESTIMATED_JITO_TIP_LAMPORTS
+    execution_safety_bps: float = DEFAULT_EXECUTION_SAFETY_BPS
 
     @classmethod
     def from_env(cls) -> "ArbitrageConfig":
@@ -34,13 +44,13 @@ class ArbitrageConfig:
                 return default
 
         return cls(
-            min_profit_bps=max(number("ARBITRAGE_MIN_PROFIT_BPS", 35.0), 0.0),
-            min_profit_atomic=max(int(number("ARBITRAGE_MIN_PROFIT_LAMPORTS", 50_000)), 0),
-            max_price_impact_bps=max(number("ARBITRAGE_MAX_PRICE_IMPACT_BPS", 80.0), 0.0),
-            max_slippage_bps=max(number("ARBITRAGE_MAX_SLIPPAGE_BPS", 50.0), 0.0),
-            estimated_priority_fee_atomic=max(int(number("ARBITRAGE_ESTIMATED_PRIORITY_FEE_LAMPORTS", 50_000)), 0),
-            estimated_jito_tip_atomic=max(int(number("ARBITRAGE_ESTIMATED_JITO_TIP_LAMPORTS", 100_000)), 0),
-            execution_safety_bps=max(number("ARBITRAGE_EXECUTION_SAFETY_BPS", 10.0), 0.0),
+            min_profit_bps=max(number("ARBITRAGE_MIN_PROFIT_BPS", DEFAULT_MIN_PROFIT_BPS), 0.0),
+            min_profit_atomic=max(int(number("ARBITRAGE_MIN_PROFIT_LAMPORTS", DEFAULT_MIN_PROFIT_LAMPORTS)), 0),
+            max_price_impact_bps=max(number("ARBITRAGE_MAX_PRICE_IMPACT_BPS", DEFAULT_MAX_PRICE_IMPACT_BPS), 0.0),
+            max_slippage_bps=max(number("ARBITRAGE_MAX_SLIPPAGE_BPS", DEFAULT_MAX_SLIPPAGE_BPS), 0.0),
+            estimated_priority_fee_atomic=max(int(number("ARBITRAGE_ESTIMATED_PRIORITY_FEE_LAMPORTS", DEFAULT_ESTIMATED_PRIORITY_FEE_LAMPORTS)), 0),
+            estimated_jito_tip_atomic=max(int(number("ARBITRAGE_ESTIMATED_JITO_TIP_LAMPORTS", DEFAULT_ESTIMATED_JITO_TIP_LAMPORTS)), 0),
+            execution_safety_bps=max(number("ARBITRAGE_EXECUTION_SAFETY_BPS", DEFAULT_EXECUTION_SAFETY_BPS), 0.0),
         )
 
     @property
