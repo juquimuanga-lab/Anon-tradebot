@@ -114,9 +114,10 @@ class ArbitrageLiveExecutor:
             "outputMint": output_mint,
             "amount": amount,
             "slippageBps": self._slippage_bps,
-            "dexes": venue.jupiter_dex_label,
             "restrictIntermediateTokens": "true",
         }
+        if venue.jupiter_dex_label:
+            params["dexes"] = venue.jupiter_dex_label
         headers: dict[str, str] = {}
         api_key = os.getenv("JUPITER_API_KEY")
         if api_key:
@@ -135,6 +136,27 @@ class ArbitrageLiveExecutor:
                 f"Jupiter returned no executable quote for {venue.name}"
             )
         return payload
+
+    async def execute_unrestricted(
+        self,
+        owner_user_id: int,
+        token_mint: str,
+        amount_sol: float,
+    ) -> LiveExecutionResult:
+        """Execute a freshly re-quoted unrestricted Jupiter round-trip.
+
+        Used by the global arbitrage hunter. Discovery chooses the candidate
+        and size; this method re-quotes both legs without restricting Jupiter
+        to the configured venue list before any transaction is signed.
+        """
+        unrestricted = VenueConfig("jupiter_best_route", "", 0.0)
+        return await self.execute(
+            owner_user_id=owner_user_id,
+            token_mint=token_mint,
+            amount_sol=amount_sol,
+            buy_venue=unrestricted,
+            sell_venue=unrestricted,
+        )
 
     @staticmethod
     def _positive_int(payload: dict[str, Any], field: str, label: str) -> int:
@@ -337,9 +359,6 @@ class ArbitrageLiveExecutor:
                 reason="actual_priority_fee_profit_gate_failed",
             )
 
-        # Only the buy leg is independently simulatable from the current
-        # ledger. Jito's bundle execution is ordered and atomic, so the sell
-        # leg is evaluated together with the buy when the bundle is processed.
         await self._simulate(rpc_url, buy_signed)
 
         bundle_id = await self._jito.send_bundle(

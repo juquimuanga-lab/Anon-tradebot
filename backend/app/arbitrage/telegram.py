@@ -8,6 +8,7 @@ from app.arbitrage.scanner import ArbitrageScanner
 from app.arbitrage.service import ArbitrageService
 from app.arbitrage.jupiter_quotes import configured_venues
 from app.arbitrage.live_executor import ArbitrageLiveExecutor
+from app.arbitrage import continuous_telegram
 from app.security.allowlist import admin_required
 
 service = ArbitrageService()
@@ -58,11 +59,12 @@ async def arbitrage_help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE)
         "/arbscan <mint> [SOL] — scan live venue spreads\n"
         "/arbdiscover <mint> [SOL] — discover unrestricted Jupiter routes; no amount runs the size sweep\n"
         "/arbhunt [1-10] — shortlist liquid multi-venue Solana tokens and run observe-only Jupiter discovery\n"
-        "/arbvenues — show configured venues\n"
+        "/arbvenues — show configured venue labels (manual/debug scan only)\n"
         "/arblivestatus — show live execution gate\n"
-        "/arblive <mint> <SOL> <buy_venue> <sell_venue> — explicitly submit one atomic bundle\n"
+        "/arblive [1-10] — start/arm the global live arbitrage hunter\n"
+        "/arbstop — stop the arbitrage hunter immediately\n"
         "/arbhelp — show this help\n\n"
-        "Observe mode uses live quotes but never submits transactions. Live execution requires ARBITRAGE_LIVE_TRADING_ENABLED=true and an explicitly invoked /arblive command.",
+        "Live mode uses global candidate discovery and unrestricted Jupiter routing. Every candidate is re-quoted before signing; the final net profit must be strictly positive.",
         parse_mode="Markdown",
     )
 
@@ -117,78 +119,19 @@ async def arbitrage_scan_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE)
 @admin_required
 async def arbitrage_live_status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     state = "ARMED" if live_executor.live_enabled else "LOCKED"
+    hunt_status = continuous_telegram.continuous_hunt.status
     await update.message.reply_text(
         "⚠️ *Arbitrage live execution*\n\n"
-        f"Environment gate: `{state}`\n\n"
-        "Default deployment state is LOCKED.\n"
-        "The scanner cannot submit trades automatically.\n"
-        "When explicitly armed, `/arblive` re-quotes both legs, applies the minimum-profit gate, simulates the required transactions, submits an atomic Jito bundle, waits for settlement, and reconciles every transaction signature.",
+        f"Environment gate: `{state}`\n"
+        f"Global hunter running: `{'YES' if hunt_status.running else 'NO'}`\n"
+        f"Hunter cycles: `{hunt_status.cycles}`\n\n"
+        "`/arblive` starts the global candidate hunter when the environment gate is ARMED. "
+        "The hunter uses unrestricted Jupiter discovery, then live execution re-quotes both legs before signing. "
+        "Only strictly positive final net profit is eligible. Use `/arbstop` to stop it.",
         parse_mode="Markdown",
     )
 
 
 @admin_required
 async def arbitrage_live_execute_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    args = context.args or []
-    if len(args) != 4:
-        await update.message.reply_text(
-            "Usage: `/arblive <mint> <SOL> <buy_venue> <sell_venue>`\n"
-            "Example: `/arblive <mint> 0.05 raydium orca_whirlpool`\n\n"
-            "Use /arbvenues for valid venue names.",
-            parse_mode="Markdown",
-        )
-        return
-    if not live_executor.live_enabled:
-        await update.message.reply_text("🔒 Live arbitrage is LOCKED. Set `ARBITRAGE_LIVE_TRADING_ENABLED=true` in deployment before using /arblive.", parse_mode="Markdown")
-        return
-
-    token_mint, amount_raw, buy_name, sell_name = args
-    try:
-        amount_sol = float(amount_raw)
-    except ValueError:
-        await update.message.reply_text("SOL amount must be numeric.")
-        return
-    venues = {venue.name: venue for venue in configured_venues()}
-    if buy_name not in venues or sell_name not in venues or buy_name == sell_name:
-        await update.message.reply_text("Invalid venue pair. Use /arbvenues and choose two different venue names.")
-        return
-
-    await update.message.reply_text("⚠️ Re-quoting, building and simulating the two legs before atomic submission…")
-    try:
-        result = await live_executor.execute(
-            owner_user_id=int(update.effective_user.id),
-            token_mint=token_mint,
-            amount_sol=amount_sol,
-            buy_venue=venues[buy_name],
-            sell_venue=venues[sell_name],
-        )
-    except Exception as exc:
-        await update.message.reply_text(f"❌ Live arbitrage refused safely: `{type(exc).__name__}: {exc}`", parse_mode="Markdown")
-        return
-
-    if not result.success:
-        signatures = "\n".join(f"`{sig}`" for sig in result.transaction_signatures[:3]) or "none"
-        await update.message.reply_text(
-            "🛑 *Arbitrage not settled*\n\n"
-            f"Reason: `{result.reason}`\n"
-            f"Settlement: `{result.settlement_status or 'not submitted'}`\n"
-            f"Bundle ID: `{result.bundle_id or 'none'}`\n"
-            f"Estimated net: `{result.estimated_net_profit_lamports / 1_000_000_000:.9f} SOL`\n"
-            f"Transactions observed:\n{signatures}",
-            parse_mode="Markdown",
-        )
-        return
-
-    signatures = "\n".join(f"`{sig}`" for sig in result.transaction_signatures)
-    await update.message.reply_text(
-        "✅ *Arbitrage bundle settled*\n\n"
-        f"Buy: `{result.buy_venue}`\n"
-        f"Sell: `{result.sell_venue}`\n"
-        f"Input: `{result.input_lamports / 1_000_000_000:.9f} SOL`\n"
-        f"Guaranteed token amount: `{result.guaranteed_token_amount}`\n"
-        f"Estimated net: `{result.estimated_net_profit_lamports / 1_000_000_000:.9f} SOL`\n"
-        f"Settlement: `{result.settlement_status}`\n"
-        f"Bundle ID: `{result.bundle_id}`\n"
-        f"Transactions:\n{signatures}",
-        parse_mode="Markdown",
-    )
+    await continuous_telegram.arbitrage_live_hunt_start_cmd(update, context)
