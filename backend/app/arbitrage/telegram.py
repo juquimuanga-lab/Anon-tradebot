@@ -93,7 +93,12 @@ async def arbitrage_scan_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE)
     if not result.opportunities:
         rpc = result.rpc_health
         detail = f"RPC: {rpc.provider}" if rpc and rpc.healthy else f"RPC unavailable: {rpc.error if rpc else 'unknown'}"
-        await update.message.reply_text("No two-venue quote pairs were available for that token/size.\n" + detail + "\nUse /arbvenues to inspect the configured venue labels.")
+        diagnostics = "\n".join(f"• `{error}`" for error in result.quote_errors[:8])
+        message = "No two-venue quote pairs were available for that token/size.\n" + detail
+        if diagnostics:
+            message += "\n\nJupiter quote diagnostics:\n" + diagnostics
+        message += "\n\nUse /arbvenues to inspect the configured venue labels."
+        await update.message.reply_text(message, parse_mode="Markdown")
         return
     lines = []
     for item in result.opportunities[:8]:
@@ -101,7 +106,10 @@ async def arbitrage_scan_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE)
         lines.append(f"{status} `{item.buy_venue} → {item.sell_venue}` | net `{item.net_profit_bps:.1f} bps` | reason `{item.reason}`")
     rpc = result.rpc_health
     rpc_line = f"RPC: `{rpc.provider}`" if rpc and rpc.healthy else "RPC: `unavailable`"
-    await update.message.reply_text("⚖️ *Arbitrage scan result*\n\n" + "\n".join(lines) + f"\n\n{rpc_line}\n_No transaction was submitted._", parse_mode="Markdown")
+    diagnostics = "\n".join(f"• `{error}`" for error in result.quote_errors[:4])
+    if diagnostics:
+        diagnostics = "\n\nQuote diagnostics:\n" + diagnostics
+    await update.message.reply_text("⚖️ *Arbitrage scan result*\n\n" + "\n".join(lines) + f"\n\n{rpc_line}{diagnostics}\n_No transaction was submitted._", parse_mode="Markdown")
 
 
 @admin_required
