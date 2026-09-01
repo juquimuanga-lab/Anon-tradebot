@@ -31,5 +31,8 @@ class ArbitrageOpportunity:
     net_profit_bps: float
     estimated_priority_fee_atomic: int = 0
     estimated_jito_tip_atomic: int = 0
+    gross_profit_bps: float = 0.0
+    execution_cost_bps: float = 0.0
+    required_gross_profit_bps: float = 0.0
     executable: bool = False
     reason: str = ""
