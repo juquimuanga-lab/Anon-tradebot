@@ -37,12 +37,29 @@ DEFAULT_VENUES = (
 )
 
 
+DEFAULT_JUPITER_API_BASE_URL = "https://api.jup.ag/swap/v1"
+DEFAULT_JUPITER_LITE_BASE_URL = "https://lite-api.jup.ag/swap/v1"
+
+
 class JupiterArbitrageQuoteProvider:
     """Fetch exact-input quotes restricted to one Jupiter DEX label."""
 
-    def __init__(self, base_url: str, timeout_seconds: float = 8.0) -> None:
+    def __init__(self, base_url: str | None = None, timeout_seconds: float = 8.0) -> None:
+        configured_base_url = (base_url or os.getenv("JUPITER_BASE_URL", "")).strip()
+        api_key = os.getenv("JUPITER_API_KEY", "").strip()
+        if configured_base_url:
+            resolved_base_url = configured_base_url
+        elif api_key:
+            # Authenticated Jupiter API endpoint when a production API key is present.
+            resolved_base_url = DEFAULT_JUPITER_API_BASE_URL
+        else:
+            resolved_base_url = DEFAULT_JUPITER_LITE_BASE_URL
+
+        headers = {"x-api-key": api_key} if api_key else {}
+        self.base_url = resolved_base_url.rstrip("/")
         self._client = httpx.AsyncClient(
-            base_url=base_url.rstrip("/"),
+            base_url=self.base_url,
+            headers=headers,
             timeout=timeout_seconds,
         )
 
@@ -77,8 +94,10 @@ class JupiterArbitrageQuoteProvider:
             },
         )
         if response.status_code != 200:
+            detail = response.text[:300].replace("\n", " ")
             raise JupiterArbitrageError(
                 f"Jupiter quote failed for {venue.name}: HTTP {response.status_code}"
+                + (f" - {detail}" if detail else "")
             )
 
         payload = response.json()
