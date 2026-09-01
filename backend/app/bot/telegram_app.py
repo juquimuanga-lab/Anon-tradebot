@@ -12,6 +12,7 @@ from telegram.ext import (
 from app.bot import handlers_admin, handlers_basic, handlers_wallet, rule_manager
 from app.bot.setrule_wizard import COLLECTING, setrule_collect, setrule_start, setrule_fourmeme_start, setrule_pons_start
 from app.config.settings import settings
+from app.arbitrage import telegram as arbitrage_telegram
 
 
 async def set_bot_commands(application: Application) -> None:
@@ -50,6 +51,10 @@ async def set_bot_commands(application: Application) -> None:
         BotCommand("recoverent", "Recover token-account rent"),
         BotCommand("burnclose", "Burn and close token accounts"),
         BotCommand("guardian", "GO Guardian AI dashboard"),
+        BotCommand("arbitrage", "Show arbitrage status"),
+        BotCommand("enablearbitrage", "Enable arbitrage scanning"),
+        BotCommand("disablearbitrage", "Disable arbitrage scanning"),
+        BotCommand("arbhelp", "Show arbitrage commands"),
     ]
     await application.bot.set_my_commands(commands)
 
@@ -74,6 +79,12 @@ def build_application() -> Application:
     application.add_handler(CommandHandler("positions", handlers_basic.positions_cmd))
     application.add_handler(CommandHandler("history", handlers_basic.history))
     application.add_handler(CommandHandler("guardian", handlers_admin.guardian_cmd))
+
+    # Isolated Solana arbitrage controls. These commands share no sniper state.
+    application.add_handler(CommandHandler("arbitrage", arbitrage_telegram.arbitrage_cmd))
+    application.add_handler(CommandHandler("enablearbitrage", arbitrage_telegram.enable_arbitrage_cmd))
+    application.add_handler(CommandHandler("disablearbitrage", arbitrage_telegram.disable_arbitrage_cmd))
+    application.add_handler(CommandHandler("arbhelp", arbitrage_telegram.arbitrage_help_cmd))
 
     application.add_handler(CommandHandler("enable", handlers_admin.enable_cmd))
     application.add_handler(CommandHandler("disable", handlers_admin.disable_cmd))
