@@ -31,7 +31,7 @@ class ArbitrageService:
     """Owns arbitrage state without sharing mutable state with sniper lanes."""
 
     def __init__(self, config: ArbitrageConfig | None = None) -> None:
-        self.config = config or ArbitrageConfig()
+        self.config = config or ArbitrageConfig.from_env()
         self._status = ArbitrageStatus(enabled=False, running=False)
         self._task: Optional[asyncio.Task] = None
         self._lock = asyncio.Lock()
@@ -63,11 +63,7 @@ class ArbitrageService:
         venues: Iterable[tuple[str, str]],
         quote_provider: QuoteProvider,
     ) -> list[ArbitrageOpportunity]:
-        """Fetch normalized quotes and compare every ordered venue pair.
-
-        This is intentionally an orchestration primitive; no network-specific
-        connector is embedded so adding venue support cannot affect sniper code.
-        """
+        """Fetch normalized quotes and compare every ordered venue pair."""
         venue_list = list(venues)
         quotes: dict[str, Quote] = {}
         for venue, direction in venue_list:
@@ -80,7 +76,6 @@ class ArbitrageService:
             for sell_venue, sell_quote in quotes.items():
                 if buy_venue == sell_venue:
                     continue
-                # A sell quote must consume exactly what the buy quote returns.
                 adjusted_sell = Quote(
                     venue=sell_quote.venue,
                     input_mint=sell_quote.input_mint,
