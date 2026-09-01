@@ -1,3 +1,5 @@
+import pytest
+
 from app.arbitrage.engine import ArbitrageConfig, find_two_venue_opportunity
 from app.arbitrage.models import Quote
 
@@ -22,8 +24,8 @@ def test_profitable_spread_is_qualified_without_double_counting_quote_costs():
     assert result.total_cost_atomic == 150_000
     assert result.net_profit_atomic == 5_850_000
     assert result.gross_profit_bps == 600.0
-    assert result.execution_cost_bps == 15.0
-    assert result.required_gross_profit_bps == 15.0
+    assert result.execution_cost_bps == pytest.approx(15.0)
+    assert result.required_gross_profit_bps == pytest.approx(15.0)
     assert result.executable is True
     assert result.reason == "profit_threshold_met"
 
@@ -52,9 +54,9 @@ def test_execution_cost_bps_is_dynamic_with_trade_size():
                         estimated_priority_fee_atomic=50_000, estimated_jito_tip_atomic=100_000,
                         execution_safety_bps=10.0),
     )
-    assert result.execution_cost_bps == 1.5
-    assert result.gross_profit_bps == 100.0
-    assert result.net_profit_bps == 98.5
+    assert result.execution_cost_bps == pytest.approx(1.5)
+    assert result.gross_profit_bps == pytest.approx(100.0)
+    assert result.net_profit_bps == pytest.approx(98.5)
     assert result.executable is True
 
 
