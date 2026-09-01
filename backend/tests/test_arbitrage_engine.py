@@ -2,53 +2,40 @@ from app.arbitrage.engine import ArbitrageConfig, find_two_venue_opportunity
 from app.arbitrage.models import Quote
 
 
-def _quote(venue: str, input_amount: int, output_amount: int, impact_bps: float = 0.0) -> Quote:
-    return Quote(
-        venue=venue,
-        input_mint="SOL",
-        output_mint="TOKEN",
-        input_amount_atomic=input_amount,
-        output_amount_atomic=output_amount,
-        fee_bps=30.0,
-        price_impact_bps=impact_bps,
-    )
+def _buy(venue, amount, output, fee=30.0, impact=0.0):
+    return Quote(venue, "SOL", "TOKEN", amount, output, fee, impact)
 
 
-def test_profitable_spread_is_qualified_after_costs() -> None:
-    buy = _quote("raydium", 100_000_000, 1_000_000_000)
-    sell = Quote(
-        venue="orca",
-        input_mint="TOKEN",
-        output_mint="SOL",
-        input_amount_atomic=1_000_000_000,
-        output_amount_atomic=106_000_000,
-        fee_bps=30.0,
-        price_impact_bps=0.0,
-    )
+def _sell(venue, amount, output, fee=30.0, impact=0.0):
+    return Quote(venue, "TOKEN", "SOL", amount, output, fee, impact)
+
+
+def test_profitable_spread_is_qualified_without_double_counting_quote_costs():
+    buy = _buy("raydium", 100_000_000, 1_000_000_000, fee=30.0, impact=20.0)
+    sell = _sell("orca", 1_000_000_000, 106_000_000, fee=30.0, impact=20.0)
 
     result = find_two_venue_opportunity(
         "TOKEN",
         buy,
         sell,
-        ArbitrageConfig(min_profit_bps=35.0, min_profit_atomic=2_000_000),
+        ArbitrageConfig(
+            min_profit_bps=35.0,
+            min_profit_atomic=2_000_000,
+            estimated_priority_fee_atomic=50_000,
+            estimated_jito_tip_atomic=100_000,
+        ),
     )
 
+    assert result.gross_profit_atomic == 6_000_000
+    assert result.total_cost_atomic == 150_000
+    assert result.net_profit_atomic == 5_850_000
     assert result.executable is True
     assert result.reason == "profit_threshold_met"
-    assert result.net_profit_atomic >= 2_000_000
 
 
-def test_high_price_impact_is_rejected() -> None:
-    buy = _quote("raydium", 100_000_000, 1_000_000_000, impact_bps=100.0)
-    sell = Quote(
-        venue="orca",
-        input_mint="TOKEN",
-        output_mint="SOL",
-        input_amount_atomic=1_000_000_000,
-        output_amount_atomic=110_000_000,
-        fee_bps=30.0,
-        price_impact_bps=0.0,
-    )
+def test_high_price_impact_is_still_rejected():
+    buy = _buy("raydium", 100_000_000, 1_000_000_000, impact=100.0)
+    sell = _sell("orca", 1_000_000_000, 110_000_000)
 
     result = find_two_venue_opportunity("TOKEN", buy, sell)
 
@@ -56,17 +43,31 @@ def test_high_price_impact_is_rejected() -> None:
     assert result.reason == "price_impact_too_high"
 
 
-def test_quote_size_mismatch_is_rejected() -> None:
-    buy = _quote("raydium", 100_000_000, 1_000_000_000)
-    sell = Quote(
-        venue="orca",
-        input_mint="TOKEN",
-        output_mint="SOL",
-        input_amount_atomic=999_999_999,
-        output_amount_atomic=101_000_000,
-    )
+def test_quote_size_mismatch_is_rejected():
+    buy = _buy("raydium", 100_000_000, 1_000_000_000)
+    sell = _sell("orca", 999_999_999, 101_000_000)
 
     result = find_two_venue_opportunity("TOKEN", buy, sell)
 
     assert result.executable is False
     assert result.reason == "quote_size_mismatch"
+
+
+def test_negative_external_costs_cannot_increase_profit():
+    buy = _buy("raydium", 100_000_000, 1_000_000_000)
+    sell = _sell("orca", 1_000_000_000, 101_000_000)
+
+    result = find_two_venue_opportunity(
+        "TOKEN",
+        buy,
+        sell,
+        ArbitrageConfig(
+            min_profit_bps=0.0,
+            min_profit_atomic=0,
+            estimated_priority_fee_atomic=-10_000,
+            estimated_jito_tip_atomic=-20_000,
+        ),
+    )
+
+    assert result.total_cost_atomic == 0
+    assert result.net_profit_atomic == 1_000_000
