@@ -7,7 +7,6 @@ from app.arbitrage.jupiter_quotes import JupiterArbitrageQuoteProvider, VenueCon
 from app.arbitrage.models import ArbitrageOpportunity, Quote
 from app.arbitrage.rpc_health import ArbitrageRpcHealth, RpcHealth
 from app.arbitrage.service import ArbitrageService
-from app.config.settings import settings
 
 
 LAMPORTS_PER_SOL = 1_000_000_000
@@ -19,6 +18,7 @@ class ScanResult:
     input_amount_lamports: int
     opportunities: tuple[ArbitrageOpportunity, ...]
     rpc_health: RpcHealth | None = None
+    quote_errors: tuple[str, ...] = ()
 
 
 class ArbitrageScanner:
@@ -31,7 +31,9 @@ class ArbitrageScanner:
         rpc_health: ArbitrageRpcHealth | None = None,
     ) -> None:
         self.service = service
-        self.provider = provider or JupiterArbitrageQuoteProvider(settings.jupiter_base_url)
+        # Let the quote provider select the authenticated Jupiter endpoint from
+        # JUPITER_API_KEY/JUPITER_BASE_URL instead of forcing the old lite URL.
+        self.provider = provider or JupiterArbitrageQuoteProvider()
         self.rpc_health = rpc_health or ArbitrageRpcHealth()
 
     async def close(self) -> None:
@@ -63,6 +65,7 @@ class ArbitrageScanner:
         selected = venues or configured_venues()
         buy_quotes: dict[str, Quote] = {}
         sell_quotes: dict[str, Quote] = {}
+        quote_errors: list[str] = []
 
         for venue in selected:
             try:
@@ -74,8 +77,10 @@ class ArbitrageScanner:
                 )
                 if buy:
                     buy_quotes[venue.name] = buy
-            except Exception:
-                continue
+                else:
+                    quote_errors.append(f"{venue.name} buy: no route")
+            except Exception as exc:
+                quote_errors.append(f"{venue.name} buy: {type(exc).__name__}: {exc}")
 
         for venue in selected:
             buy = buy_quotes.get(venue.name)
@@ -90,8 +95,10 @@ class ArbitrageScanner:
                 )
                 if sell:
                     sell_quotes[venue.name] = sell
-            except Exception:
-                continue
+                else:
+                    quote_errors.append(f"{venue.name} sell: no route")
+            except Exception as exc:
+                quote_errors.append(f"{venue.name} sell: {type(exc).__name__}: {exc}")
 
         opportunities: list[ArbitrageOpportunity] = []
         for buy_venue, buy_quote in buy_quotes.items():
@@ -125,4 +132,5 @@ class ArbitrageScanner:
             input_amount_lamports=amount_lamports,
             opportunities=tuple(opportunities),
             rpc_health=health,
+            quote_errors=tuple(quote_errors),
         )
