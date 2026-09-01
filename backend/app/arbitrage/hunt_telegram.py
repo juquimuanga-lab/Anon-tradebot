@@ -32,8 +32,7 @@ async def arbitrage_hunt_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
     await update.message.reply_text(
         "🛰️ *Arbitrage hunter started*\n\n"
-        "Broadening Solana candidate discovery, then running the existing "
-        "unrestricted Jupiter size sweep.\n\n"
+        "Broadening Solana candidate discovery, then running a rate-limited Jupiter size sweep.\n\n"
         "_Observe-only. No transaction will be submitted._",
         parse_mode="Markdown",
     )
@@ -70,6 +69,8 @@ async def arbitrage_hunt_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE)
         opportunity = discovery.opportunity
         if opportunity is None:
             reason = discovery.error or "no complete Jupiter round-trip"
+            if "HTTP 429" in reason:
+                reason = "Jupiter rate-limited after retries"
             rows.append(f"• `{candidate.symbol}` [{candidate.tier}] → `{reason}`")
             continue
 
@@ -90,6 +91,7 @@ async def arbitrage_hunt_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE)
         f"Unique tokens: `{stats.unique_tokens}`\n"
         f"Screen-qualified: `{stats.final_candidates}`\n"
         f"Jupiter round-trips: `{complete_routes}`\n"
+        f"Jupiter 429s: `{stats.jupiter_429s}`\n"
         f"Executable at current thresholds: `{executable}`\n\n"
         + "\n".join(rows)
         + "\n\n*Top candidate details:*"
