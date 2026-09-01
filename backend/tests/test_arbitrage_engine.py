@@ -21,7 +21,7 @@ def test_profitable_spread_is_qualified_after_costs() -> None:
         input_mint="TOKEN",
         output_mint="SOL",
         input_amount_atomic=1_000_000_000,
-        output_amount_atomic=101_000_000,
+        output_amount_atomic=106_000_000,
         fee_bps=30.0,
         price_impact_bps=0.0,
     )
@@ -34,7 +34,8 @@ def test_profitable_spread_is_qualified_after_costs() -> None:
     )
 
     assert result.executable is True
-    assert result.net_profit_atomic > 0
+    assert result.reason == "profit_threshold_met"
+    assert result.net_profit_atomic >= 2_000_000
 
 
 def test_high_price_impact_is_rejected() -> None:
