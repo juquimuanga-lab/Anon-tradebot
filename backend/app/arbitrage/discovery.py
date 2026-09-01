@@ -11,6 +11,8 @@ from app.arbitrage.rpc_health import ArbitrageRpcHealth, RpcHealth
 from app.execution.onchain.jupiter import SOL_MINT
 
 LAMPORTS_PER_SOL = 1_000_000_000
+# Default production discovery ladder. ARBITRAGE_DISCOVERY_SIZES_SOL may still
+# override it, but Railway does not need the variable for normal operation.
 DEFAULT_DISCOVERY_SIZES_SOL = (0.02, 0.05, 0.10, 0.25, 0.50, 1.00)
 
 
