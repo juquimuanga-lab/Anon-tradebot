@@ -73,15 +73,17 @@ def test_tiny_trade_requires_large_gross_edge_to_cover_fixed_costs():
         sell,
         ArbitrageConfig(
             min_profit_bps=35.0,
-            min_profit_atomic=2_000_000,
+            min_profit_atomic=50_000,
             estimated_priority_fee_atomic=50_000,
             estimated_jito_tip_atomic=100_000,
             execution_safety_bps=10.0,
         ),
     )
 
-    # 150k fixed cost on 0.01 SOL = 150 bps before safety/min-profit.
+    # 150k fixed cost on 0.01 SOL = 150 bps; the 50k minimum-profit floor adds
+    # another 50 bps, plus the 10 bps safety buffer, for 210 bps required.
     assert result.execution_cost_bps == 150.0
+    assert result.required_gross_profit_bps == pytest.approx(210.0)
     assert result.executable is False
     assert result.reason == "profit_threshold_not_met"
 
