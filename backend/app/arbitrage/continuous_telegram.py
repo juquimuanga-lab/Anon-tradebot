@@ -59,7 +59,7 @@ async def arbitrage_hunt_start_cmd(update: Update, context: ContextTypes.DEFAULT
     if started:
         await update.message.reply_text(
             "🛰️ *24/7 arbitrage hunter started*\n\n"
-            "It will continuously scan until you send `/arbstop` or a profitable opportunity is found.\n"
+            "It will continuously scan until you send `/arbstop`. Qualifying opportunities will be reported here while the hunt continues.\n"
             "Observe-only: no transaction will be submitted.\n\n"
             "Use `/arbstatus` to check the hunter.",
             parse_mode="Markdown",
