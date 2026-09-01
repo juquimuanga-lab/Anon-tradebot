@@ -68,8 +68,9 @@ async def arbitrage_discover_cmd(update: Update, context: ContextTypes.DEFAULT_T
         f"Sell route: `{sell_route}`\n"
         f"Token amount: `{buy.output_amount_atomic}`\n"
         f"Final SOL: `{sell.output_amount_atomic / 1_000_000_000:.9f}`\n"
-        f"Gross: `{opportunity.gross_profit_atomic / 1_000_000_000:.9f} SOL`\n"
-        f"External costs: `{opportunity.total_cost_atomic / 1_000_000_000:.9f} SOL`\n"
+        f"Gross: `{opportunity.gross_profit_atomic / 1_000_000_000:.9f} SOL` (`{opportunity.gross_profit_bps:.2f} bps`)\n"
+        f"External costs: `{opportunity.total_cost_atomic / 1_000_000_000:.9f} SOL` (`{opportunity.execution_cost_bps:.2f} bps`)\n"
+        f"Required gross edge: `{opportunity.required_gross_profit_bps:.2f} bps`\n"
         f"Net: `{opportunity.net_profit_atomic / 1_000_000_000:.9f} SOL` (`{opportunity.net_profit_bps:.1f} bps`)\n"
         f"Reason: `{opportunity.reason}`\n\n"
         "This is discovery/observe mode. No transaction was submitted.",
