@@ -30,7 +30,7 @@ const TIP_ACCOUNTS = [
 ];
 
 const DEFAULT_TIP_LAMPORTS = 1_000_000;
-const MIN_TIP_LAMPORTS = 200_000;
+const MIN_TIP_LAMPORTS = 1_000_000;
 
 function tipLamports() {
   const configured = Number(
