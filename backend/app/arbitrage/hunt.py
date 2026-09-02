@@ -15,6 +15,7 @@ from typing import Any
 import httpx
 
 from app.arbitrage.discovery import ArbitrageDiscovery, DiscoveryResult
+from app.arbitrage.hotlist import configured_hotlist_mints
 
 DEXSCREENER_BASE = "https://api.dexscreener.com"
 SOLANA = "solana"
@@ -51,6 +52,7 @@ class HuntCandidate:
     dex_count: int
     score: float
     tier: str = "B"
+    hotlist: bool = False
 
 
 @dataclass(frozen=True)
@@ -61,6 +63,7 @@ class HuntStats:
     liquidity_qualified: int = 0
     volume_qualified: int = 0
     venue_qualified: int = 0
+    hotlist_candidates: int = 0
     final_candidates: int = 0
     jupiter_round_trips: int = 0
     jupiter_429s: int = 0
@@ -144,6 +147,7 @@ class DexScreenerCandidateSource:
         min_liquidity = _env_float("ARBITRAGE_HUNT_MIN_LIQUIDITY_USD", DEFAULT_MIN_LIQUIDITY_USD)
         min_volume = _env_float("ARBITRAGE_HUNT_MIN_VOLUME_24H_USD", DEFAULT_MIN_VOLUME_24H_USD)
         min_dexes = _env_int("ARBITRAGE_HUNT_MIN_DEXES", DEFAULT_MIN_DEXES)
+        hotlist = set(configured_hotlist_mints()) - EXCLUDED_MINTS
 
         profiles, boosts, searches = await asyncio.gather(
             self._get_json("/token-profiles/latest/v1"),
@@ -173,6 +177,12 @@ class DexScreenerCandidateSource:
             address for address in dict.fromkeys(addresses)
             if address and address not in EXCLUDED_MINTS
         ][:30]
+        # Always fetch the configured hotlist directly, even when DexScreener's
+        # broad candidate sources do not currently surface those mints.
+        for address in hotlist:
+            if address not in unique_addresses:
+                unique_addresses.append(address)
+
         sem = asyncio.Semaphore(5)
 
         async def token_pairs(address: str):
@@ -234,17 +244,21 @@ class DexScreenerCandidateSource:
             liquidity = float(value["liquidity"])
             volume = float(value["volume"])
             dex_count = len(value["dexes"])
-            if liquidity < min_liquidity or volume < min_volume or dex_count < min_dexes:
+            is_hot = address in hotlist
+            # Hotlist mints bypass broad-market liquidity/volume filters so a
+            # proven token is not dropped merely because its current aggregate
+            # metrics temporarily fall below global screening thresholds.
+            if not is_hot and (liquidity < min_liquidity or volume < min_volume or dex_count < min_dexes):
                 continue
-            tier = "A" if liquidity >= 250_000 and volume >= 1_000_000 and dex_count >= 2 else "B"
+            tier = "HOT" if is_hot else ("A" if liquidity >= 250_000 and volume >= 1_000_000 and dex_count >= 2 else "B")
             score = volume * max(liquidity, 1.0) ** 0.25 * max(dex_count, 1) ** 0.75
             candidates.append(HuntCandidate(
                 address, str(value["symbol"]), str(value["name"]), liquidity,
-                volume, dex_count, score, tier,
+                volume, dex_count, score, tier, is_hot,
             ))
 
         candidates.sort(key=lambda candidate: (
-            candidate.tier == "A", candidate.score, candidate.dex_count
+            candidate.hotlist, candidate.tier == "A", candidate.score, candidate.dex_count
         ), reverse=True)
         final = tuple(candidates[:max_candidates])
         self.last_stats = HuntStats(
@@ -254,6 +268,7 @@ class DexScreenerCandidateSource:
             liquidity_qualified=liquidity_qualified,
             volume_qualified=volume_qualified,
             venue_qualified=venue_qualified,
+            hotlist_candidates=sum(1 for candidate in candidates if candidate.hotlist),
             final_candidates=len(final),
         )
         return final
