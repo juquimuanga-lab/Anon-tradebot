@@ -59,7 +59,13 @@ class ContinuousHuntStatus:
     hotlist_mints: tuple[str, ...] = ()
     hotlist_scans: int = 0
     global_scans: int = 0
-    last_result: HuntResult | None = None
+    last_hotlist_result: HuntResult | None = None
+    last_global_result: HuntResult | None = None
+
+    @property
+    def last_result(self) -> HuntResult | None:
+        """Compatibility alias for callers that previously read last_result."""
+        return self.last_global_result or self.last_hotlist_result
 
 
 class ContinuousArbitrageHunt:
@@ -71,7 +77,8 @@ class ContinuousArbitrageHunt:
         self._cycles = 0
         self._hotlist_scans = 0
         self._global_scans = 0
-        self._last_result: HuntResult | None = None
+        self._last_hotlist_result: HuntResult | None = None
+        self._last_global_result: HuntResult | None = None
         self._lock = asyncio.Lock()
         self._alerted: set[tuple[str, float, str, str]] = set()
 
@@ -83,7 +90,8 @@ class ContinuousArbitrageHunt:
             configured_hotlist_mints(),
             self._hotlist_scans,
             self._global_scans,
-            self._last_result,
+            self._last_hotlist_result,
+            self._last_global_result,
         )
 
     @property
@@ -102,7 +110,8 @@ class ContinuousArbitrageHunt:
             self._cycles = 0
             self._hotlist_scans = 0
             self._global_scans = 0
-            self._last_result = None
+            self._last_hotlist_result = None
+            self._last_global_result = None
             self._alerted.clear()
             self._task = asyncio.create_task(self._run(limit, on_profitable))
             return True
@@ -132,27 +141,29 @@ class ContinuousArbitrageHunt:
             # Hotlist pass: every known productive mint is checked directly
             # and frequently, independent of broad DexScreener filters.
             hotlist_result = await self._scan_hotlist(limit, on_profitable)
-            self._last_result = hotlist_result
+            self._last_hotlist_result = hotlist_result
 
             # Keep global discovery as a secondary source so the bot can still
             # discover new opportunities without starving the proven hotlist.
             if not self._stop_event.is_set():
+                hunter: ArbitrageHunter | None = None
                 try:
                     hunter = ArbitrageHunter()
                     self._global_scans += 1
                     global_result = await hunter.hunt(limit)
                     await self._notify_new_opportunities(global_result, on_profitable)
-                    self._last_result = global_result
+                    self._last_global_result = global_result
                 except asyncio.CancelledError:
                     raise
                 except Exception:
                     # A failed global cycle must not kill the 24/7 watcher.
                     pass
                 finally:
-                    try:
-                        await hunter.close()
-                    except (UnboundLocalError, Exception):
-                        pass
+                    if hunter is not None:
+                        try:
+                            await hunter.close()
+                        except Exception:
+                            pass
 
             try:
                 await asyncio.wait_for(self._stop_event.wait(), timeout=_interval_seconds())
@@ -228,9 +239,6 @@ class ContinuousArbitrageHunt:
             key = (candidate.token_mint, discovery.amount_sol, buy_route, sell_route)
             if key in self._alerted:
                 continue
-            # Do not mark the opportunity as consumed until the callback has
-            # returned. A stale re-quote or safe execution refusal should allow
-            # a later cycle to retry the same market when it becomes profitable again.
             try:
                 await on_profitable(HuntResult((candidate,), ((candidate, discovery),)))
             except asyncio.CancelledError:
