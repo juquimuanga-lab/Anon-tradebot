@@ -23,17 +23,29 @@ SENDER_ENDPOINT = os.getenv(
     "https://sender.helius-rpc.com/fast",
 )
 
-# Sender Max currently uses a 0.001 SOL minimum tip for its priority tip
-# buffer. Keep it configurable so the deployment can tune cost vs landing.
+# Sender Max currently requires a 0.001 SOL minimum tip for the priority
+# tip buffer. Keep it configurable so the deployment can tune cost vs landing.
 DEFAULT_TIP_LAMPORTS = 1_000_000
+MIN_TIP_LAMPORTS = 1_000_000
+
+try:
+    _configured_tip_lamports = int(
+        os.getenv("HELIUS_SENDER_TIP_LAMPORTS", DEFAULT_TIP_LAMPORTS)
+    )
+except (TypeError, ValueError):
+    _configured_tip_lamports = DEFAULT_TIP_LAMPORTS
+
 SENDER_TIP_LAMPORTS = max(
-    200_000,
-    int(os.getenv("HELIUS_SENDER_TIP_LAMPORTS", DEFAULT_TIP_LAMPORTS)),
+    MIN_TIP_LAMPORTS,
+    _configured_tip_lamports,
 )
 
-SENDER_TIMEOUT_SECONDS = float(
-    os.getenv("HELIUS_SENDER_TIMEOUT_SECONDS", "2.5")
-)
+try:
+    SENDER_TIMEOUT_SECONDS = float(
+        os.getenv("HELIUS_SENDER_TIMEOUT_SECONDS", "2.5")
+    )
+except (TypeError, ValueError):
+    SENDER_TIMEOUT_SECONDS = 2.5
 
 
 def enabled() -> bool:
