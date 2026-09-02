@@ -154,7 +154,7 @@ async def arbitrage_live_hunt_start_cmd(update: Update, context: ContextTypes.DE
     if started:
         await update.message.reply_text(
             "🚀 *LIVE GLOBAL ARBITRAGE HUNTER STARTED*\n\n"
-            "The bot will globally screen candidates, discover unrestricted Jupiter routes, and automatically attempt qualifying positive-net opportunities.\n\n"
+            "The bot will prioritize the configured arbitrage hotlist, then run global candidate discovery for new opportunities.\n\n"
             "Every live opportunity is re-quoted before signing. Existing wallet, balance, trade-size, simulation, Jito bundle and settlement checks remain active.\n\n"
             "Use `/arbstop` to stop it immediately or `/arbstatus` to check it.",
             parse_mode="Markdown",
@@ -175,18 +175,38 @@ async def arbitrage_hunt_stop_cmd(update: Update, context: ContextTypes.DEFAULT_
 @admin_required
 async def arbitrage_hunt_status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     status = continuous_hunt.status
-    last = status.last_result
-    if not status.running and last is None:
+    hotlist = status.last_hotlist_result
+    global_result = status.last_global_result
+    if not status.running and hotlist is None and global_result is None:
         await update.message.reply_text("ℹ️ Arbitrage hunter is not running and has no scan history.")
         return
-    stats = last.stats if last else None
+
+    hotlist_candidates = len(hotlist.candidates) if hotlist else 0
+    hotlist_round_trips = (
+        sum(1 for _, discovery in hotlist.discoveries if discovery.opportunity is not None)
+        if hotlist else 0
+    )
+    hotlist_429s = (
+        sum(1 for _, discovery in hotlist.discoveries if discovery.error and "HTTP 429" in discovery.error)
+        if hotlist else 0
+    )
+    global_stats = global_result.stats if global_result else None
+
     await update.message.reply_text(
         "🛰️ *Arbitrage hunter status*\n\n"
         f"Running: `{'YES' if status.running else 'NO'}`\n"
-        f"Cycles: `{status.cycles}`\n"
-        f"Last candidates: `{stats.final_candidates if stats else 0}`\n"
-        f"Last Jupiter round-trips: `{stats.jupiter_round_trips if stats else 0}`\n"
-        f"Last Jupiter 429s: `{stats.jupiter_429s if stats else 0}`\n\n"
-        "Global discovery is observe-only until `/arblive` arms live execution. ",
+        f"Cycles: `{status.cycles}`\n\n"
+        "🔥 *Hotlist*\n"
+        f"Mints configured: `{len(status.hotlist_mints)}`\n"
+        f"Last hotlist candidates: `{hotlist_candidates}`\n"
+        f"Last hotlist Jupiter round-trips: `{hotlist_round_trips}`\n"
+        f"Last hotlist Jupiter 429s: `{hotlist_429s}`\n"
+        f"Hotlist scans: `{status.hotlist_scans}`\n\n"
+        "🌎 *Global discovery*\n"
+        f"Last global candidates: `{global_stats.final_candidates if global_stats else 0}`\n"
+        f"Last global Jupiter round-trips: `{global_stats.jupiter_round_trips if global_stats else 0}`\n"
+        f"Last global Jupiter 429s: `{global_stats.jupiter_429s if global_stats else 0}`\n"
+        f"Global scans: `{status.global_scans}`\n\n"
+        "The hunter prioritizes the hotlist, then checks global discovery for new opportunities.",
         parse_mode="Markdown",
     )
