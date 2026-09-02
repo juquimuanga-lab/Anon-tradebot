@@ -12,6 +12,7 @@ import os
 import time
 from collections import deque
 from typing import Optional
+from urllib.parse import urlencode
 
 import websockets
 from solders.transaction import VersionedTransaction
@@ -60,7 +61,14 @@ def _preconf_ws_url() -> Optional[str]:
     api_key = getattr(settings, "helius_api_key", None) or os.getenv("HELIUS_API_KEY")
     if not api_key:
         return None
-    return f"{PRECONF_WS_ENDPOINT}/?api-key={api_key}"
+
+    # Keep the documented Gatekeeper endpoint explicit. A region can optionally
+    # be selected for lower latency (e.g. FRA for a Namibia-hosted service).
+    params = {"api-key": str(api_key)}
+    region = os.getenv("HELIUS_PRECONF_REGION", "").strip()
+    if region:
+        params["region"] = region
+    return f"{PRECONF_WS_ENDPOINT}/?{urlencode(params)}"
 
 
 def _raw_data(ix) -> bytes:
@@ -180,10 +188,6 @@ def _classify_transaction(raw_tx: bytes, signature: str):
             buyer = next((wallet for wallet in signers if wallet in _watched_wallets), None)
             if buyer:
                 mint = None
-                # Legacy Pump.fun buy has mint at instruction account index 2.
-                # V2 layouts can differ, so leave mint unresolved and let the
-                # resolver fetch full transaction metadata without delaying the
-                # preconfirmation transport.
                 if len(account_indices) > 2:
                     try:
                         mint = str(keys[account_indices[2]])
@@ -209,10 +213,6 @@ async def _resolve_buy(candidate: dict) -> None:
         _queue_nowait(_smart_money_queue, candidate)
         return
 
-    # Preconf is the trigger. Full RPC metadata is used only to resolve
-    # router/v2 account layouts and token direction; this does not replace the
-    # preconf transport. Retry briefly because the transaction may not yet be
-    # visible through RPC when the preconf arrives.
     try:
         from app.scanners import onchain_watcher
         for delay in (0.0, 0.025, 0.05, 0.10, 0.20, 0.40):
@@ -255,13 +255,19 @@ async def _worker() -> None:
             logger.warning("helius_preconf_disabled reason=missing_HELIUS_API_KEY")
             return
         try:
+            # websockets 15 automatically honors HTTP(S)_PROXY environment
+            # variables. Railway/proxy environments can otherwise terminate a
+            # long-lived binary WebSocket. Preconf is a direct Helius transport,
+            # so bypass ambient proxies unless a future explicit proxy is added.
             async with websockets.connect(
                 url,
+                proxy=None,
                 open_timeout=10,
                 ping_interval=20,
                 ping_timeout=20,
                 close_timeout=5,
                 max_size=4 * 1024 * 1024,
+                compression=None,
             ) as ws:
                 request = {
                     "jsonrpc": "2.0",
@@ -278,16 +284,27 @@ async def _worker() -> None:
                     raise RuntimeError("preconfSubscribe returned binary ack unexpectedly")
                 response = json.loads(ack)
                 if response.get("error") or "result" not in response:
-                    raise RuntimeError(f"preconfSubscribe failed: {response}")
+                    error = response.get("error") or response
+                    raise RuntimeError(f"preconfSubscribe rejected: {error}")
                 logger.info(
-                    "helius_preconf_connected",
-                    extra={"subscription_id": response.get("result")},
+                    "helius_preconf_connected subscription_id=%s endpoint=%s",
+                    response.get("result"),
+                    PRECONF_WS_ENDPOINT,
                 )
                 backoff = 1.0
 
                 while not _stop.is_set():
                     frame = await ws.recv()
                     if isinstance(frame, str):
+                        # Ignore text notifications but surface unexpected JSON
+                        # protocol errors instead of silently treating them as
+                        # a normal stream event.
+                        try:
+                            message = json.loads(frame)
+                        except Exception:
+                            message = None
+                        if isinstance(message, dict) and message.get("error"):
+                            raise RuntimeError(f"preconf stream error: {message['error']}")
                         continue
                     raw_tx = _decode_preconf_frame(frame)
                     if not raw_tx:
@@ -311,11 +328,9 @@ async def _worker() -> None:
             raise
         except Exception as exc:
             logger.warning(
-                "helius_preconf_disconnected",
-                extra={
-                    "error": f"{type(exc).__name__}: {exc}",
-                    "retry_seconds": backoff,
-                },
+                "helius_preconf_disconnected error=%s retry_seconds=%s",
+                f"{type(exc).__name__}: {exc}",
+                backoff,
             )
             try:
                 await asyncio.wait_for(_stop.wait(), timeout=backoff)
