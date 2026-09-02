@@ -1,6 +1,7 @@
 import asyncio
 
 from app.arbitrage.hunt import DexScreenerCandidateSource
+from app.arbitrage.hotlist import DEFAULT_HOTLIST_MINTS, configured_hotlist_mints
 
 
 class FakeResponse:
@@ -46,6 +47,9 @@ class FakeClient:
                     "volume": {"h24": 600_000},
                 },
             ])
+        for mint in DEFAULT_HOTLIST_MINTS:
+            if path == f"/token-pairs/v1/solana/{mint}":
+                return FakeResponse([])
         raise AssertionError(path)
 
     async def aclose(self):
@@ -56,18 +60,20 @@ def test_candidate_source_filters_to_solana_and_requires_multiple_venues():
     client = FakeClient()
     source = DexScreenerCandidateSource(client)
 
-    candidates = asyncio.run(source.discover_candidates(limit=5))
+    candidates = asyncio.run(source.discover_candidates(limit=10))
 
-    assert len(candidates) == 1
-    candidate = candidates[0]
-    assert candidate.token_mint == "TOKEN_A"
+    # The six configured hotlist mints are always included, while the ordinary
+    # candidate retains the original global screening behaviour.
+    assert len(candidates) == 7
+    candidate = next(item for item in candidates if item.token_mint == "TOKEN_A")
     assert candidate.symbol == "TEST"
     assert candidate.dex_count == 2
     assert candidate.liquidity_usd == 400_000
     assert candidate.volume_24h_usd == 1_300_000
+    assert all(item.hotlist for item in candidates if item.token_mint in DEFAULT_HOTLIST_MINTS)
 
 
-def test_candidate_source_returns_empty_when_filters_are_not_met():
+def test_candidate_source_returns_empty_when_filters_are_not_met_for_non_hotlist():
     client = FakeClient()
     original = client.get
 
@@ -83,6 +89,11 @@ def test_candidate_source_returns_empty_when_filters_are_not_met():
     client.get = low_volume
     source = DexScreenerCandidateSource(client)
 
-    candidates = asyncio.run(source.discover_candidates(limit=5))
+    candidates = asyncio.run(source.discover_candidates(limit=10))
 
-    assert candidates == ()
+    assert all(candidate.token_mint != "TOKEN_A" for candidate in candidates)
+    assert len(candidates) == len(DEFAULT_HOTLIST_MINTS)
+
+
+def test_default_hotlist_is_stable():
+    assert configured_hotlist_mints() == DEFAULT_HOTLIST_MINTS
