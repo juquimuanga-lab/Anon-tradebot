@@ -38,22 +38,8 @@ class DummyBot:
         self.messages.append(kwargs)
 
 
-@pytest.mark.asyncio
-async def test_profitable_arb_fans_out_to_each_live_admin(monkeypatch):
-    monkeypatch.setattr(module.settings, "telegram_admin_ids", [101, 202], raising=False)
-
-    async def get_state(admin_id):
-        return DummyState("live", True)
-
-    async def get_key(admin_id):
-        return f"key-{admin_id}"
-
-    monkeypatch.setattr(module.repo, "get_or_create_bot_state", get_state)
-    monkeypatch.setattr(module.secrets_manager, "get_wallet_private_key", get_key)
-
-    executor = DummyExecutor()
-    monkeypatch.setattr(module, "live_executor", executor)
-
+@pytest.fixture
+def profitable_result():
     candidate = types.SimpleNamespace(
         symbol="TEST",
         tier="A",
@@ -73,10 +59,27 @@ async def test_profitable_arb_fans_out_to_each_live_admin(monkeypatch):
         buy_quote=types.SimpleNamespace(route_id="buy-route"),
         sell_quote=types.SimpleNamespace(route_id="sell-route"),
     )
-    result = types.SimpleNamespace(discoveries=((candidate, discovery),))
-    bot = DummyBot()
+    return types.SimpleNamespace(discoveries=((candidate, discovery),))
 
-    await module._on_profitable(result, bot)
+
+@pytest.mark.asyncio
+async def test_profitable_arb_fans_out_to_each_live_admin(monkeypatch, profitable_result):
+    monkeypatch.setattr(module.settings, "telegram_admin_ids", [101, 202], raising=False)
+
+    async def get_state(admin_id):
+        return DummyState("live", True)
+
+    async def get_key(admin_id):
+        return f"key-{admin_id}"
+
+    monkeypatch.setattr(module.repo, "get_or_create_bot_state", get_state)
+    monkeypatch.setattr(module.secrets_manager, "get_wallet_private_key", get_key)
+
+    executor = DummyExecutor()
+    monkeypatch.setattr(module, "live_executor", executor)
+
+    bot = DummyBot()
+    await module._on_profitable(profitable_result, bot)
 
     assert executor.calls == [
         (101, "Mint111", 0.02),
@@ -86,7 +89,7 @@ async def test_profitable_arb_fans_out_to_each_live_admin(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_non_live_admin_is_skipped(monkeypatch):
+async def test_non_live_admin_is_skipped(monkeypatch, profitable_result):
     monkeypatch.setattr(module.settings, "telegram_admin_ids", [101, 202], raising=False)
 
     async def get_state(admin_id):
@@ -101,32 +104,15 @@ async def test_non_live_admin_is_skipped(monkeypatch):
     executor = DummyExecutor()
     monkeypatch.setattr(module, "live_executor", executor)
 
-    candidate = types.SimpleNamespace(symbol="TEST", tier="A", token_mint="Mint111")
-    opportunity = types.SimpleNamespace(
-        executable=True,
-        gross_profit_bps=10.0,
-        execution_cost_bps=1.0,
-        required_gross_profit_bps=1.0,
-        net_profit_bps=9.0,
-        net_profit_atomic=1_800_000,
-    )
-    discovery = types.SimpleNamespace(
-        opportunity=opportunity,
-        amount_sol=0.02,
-        buy_quote=types.SimpleNamespace(route_id="buy-route"),
-        sell_quote=types.SimpleNamespace(route_id="sell-route"),
-    )
-    result = types.SimpleNamespace(discoveries=((candidate, discovery),))
     bot = DummyBot()
-
-    await module._on_profitable(result, bot)
+    await module._on_profitable(profitable_result, bot)
 
     assert executor.calls == [(101, "Mint111", 0.02)]
     assert [m["chat_id"] for m in bot.messages] == [101]
 
 
 @pytest.mark.asyncio
-async def test_admin_without_wallet_is_skipped(monkeypatch):
+async def test_admin_without_wallet_is_skipped(monkeypatch, profitable_result):
     monkeypatch.setattr(module.settings, "telegram_admin_ids", [101, 202], raising=False)
 
     async def get_state(admin_id):
@@ -141,25 +127,8 @@ async def test_admin_without_wallet_is_skipped(monkeypatch):
     executor = DummyExecutor()
     monkeypatch.setattr(module, "live_executor", executor)
 
-    candidate = types.SimpleNamespace(symbol="TEST", tier="A", token_mint="Mint111")
-    opportunity = types.SimpleNamespace(
-        executable=True,
-        gross_profit_bps=10.0,
-        execution_cost_bps=1.0,
-        required_gross_profit_bps=1.0,
-        net_profit_bps=9.0,
-        net_profit_atomic=1_800_000,
-    )
-    discovery = types.SimpleNamespace(
-        opportunity=opportunity,
-        amount_sol=0.02,
-        buy_quote=types.SimpleNamespace(route_id="buy-route"),
-        sell_quote=types.SimpleNamespace(route_id="sell-route"),
-    )
-    result = types.SimpleNamespace(discoveries=((candidate, discovery),))
     bot = DummyBot()
-
-    await module._on_profitable(result, bot)
+    await module._on_profitable(profitable_result, bot)
 
     assert executor.calls == [(101, "Mint111", 0.02)]
     assert [m["chat_id"] for m in bot.messages] == [101]
