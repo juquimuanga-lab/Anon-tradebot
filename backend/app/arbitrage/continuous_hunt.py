@@ -244,6 +244,10 @@ class ContinuousArbitrageHunt:
             except asyncio.CancelledError:
                 raise
             except Exception:
+                # Leave the key unmarked when the callback fails so the next
+                # discovery cycle can retry it. This is especially important
+                # for live execution, where a stale quote, temporary RPC issue,
+                # or per-admin wallet refusal may safely reject one attempt.
                 continue
             self._alerted.add(key)
 
