@@ -12,7 +12,7 @@ async def test_live_wallet_balance_uses_shared_rpc_helper(monkeypatch):
 
     async def fake_rpc_request(rpc_url, method, params):
         calls.append((rpc_url, method, params))
-        return {"value": {"lamports": 123456}}
+        return {"context": {"slot": 1}, "value": 123456}
 
     monkeypatch.setattr("app.arbitrage.live_executor._rpc_request", fake_rpc_request)
     executor = ArbitrageLiveExecutor()
