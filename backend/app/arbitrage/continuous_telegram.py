@@ -1,16 +1,38 @@
 """Telegram controls for the persistent arbitrage hunter."""
 from __future__ import annotations
 
+import asyncio
+import logging
+
 from telegram import Update
 from telegram.ext import ContextTypes
 
 from app.arbitrage.continuous_hunt import continuous_hunt
 from app.arbitrage.hunt import HuntResult
 from app.arbitrage.live_executor import ArbitrageLiveExecutor
+from app.config.settings import settings
 from app.security.allowlist import admin_required
+from app.security.secrets_manager import secrets_manager
+from app.storage import repository as repo
 
+
+logger = logging.getLogger("app.arbitrage.telegram")
 
 live_executor = ArbitrageLiveExecutor()
+
+# A shared discovery result can fan out to multiple independent admin wallets.
+# Keep concurrency bounded so a single hot opportunity cannot create an
+# unbounded number of simultaneous bundle submissions.
+_LIVE_EXECUTION_SEMAPHORE = asyncio.Semaphore(4)
+_ADMIN_EXECUTION_LOCKS: dict[int, asyncio.Lock] = {}
+
+
+def _admin_execution_lock(admin_id: int) -> asyncio.Lock:
+    lock = _ADMIN_EXECUTION_LOCKS.get(admin_id)
+    if lock is None:
+        lock = asyncio.Lock()
+        _ADMIN_EXECUTION_LOCKS[admin_id] = lock
+    return lock
 
 
 def _format_alert(result: HuntResult) -> str:
@@ -42,53 +64,133 @@ async def _notify_observe(result: HuntResult, update: Update) -> None:
         )
 
 
-async def _on_profitable(result: HuntResult, update: Update) -> None:
-    message = _format_alert(result)
-    if not message or not update.effective_chat:
-        return
+async def _live_admin_ids() -> list[int]:
+    """Return admins that are independently armed for live arbitrage.
 
-    candidate, discovery = result.discoveries[0]
-    opportunity = discovery.opportunity
-    if opportunity is None or not opportunity.executable:
-        return
+    Each admin must have its own persistent BotState in live mode, trading
+    enabled, and its own Solana wallet secret. No admin is selected based on
+    who originally started `/arblive`.
+    """
+    eligible: list[int] = []
+    for raw_admin_id in settings.telegram_admin_ids:
+        admin_id = int(raw_admin_id)
+        try:
+            state = await repo.get_or_create_bot_state(admin_id)
+            if state.mode != "live" or not state.trading_enabled:
+                continue
+            private_key = await secrets_manager.get_wallet_private_key(admin_id)
+            if not private_key:
+                continue
+            eligible.append(admin_id)
+        except Exception:
+            logger.exception("arb_admin_eligibility_check_failed", extra={"admin_id": admin_id})
+    return eligible
 
-    await update.effective_chat.send_message(
-        message + "\n\n⚠️ *Live mode: re-quoting before execution…*",
-        parse_mode="Markdown",
+
+async def _execute_for_admin(
+    *,
+    bot,
+    admin_id: int,
+    candidate,
+    discovery,
+) -> None:
+    """Execute one discovered opportunity using exactly one admin wallet."""
+    message = (
+        _format_alert(HuntResult((candidate,), ((candidate, discovery),)))
+        if candidate is not None and discovery is not None
+        else ""
     )
-
-    try:
-        execution = await live_executor.execute_unrestricted(
-            owner_user_id=int(update.effective_user.id),
-            token_mint=candidate.token_mint,
-            amount_sol=discovery.amount_sol,
-        )
-    except Exception as exc:
-        await update.effective_chat.send_message(
-            f"🛑 *Arbitrage execution refused safely*\n\n`{type(exc).__name__}: {exc}`",
-            parse_mode="Markdown",
-        )
+    if not message:
         return
 
-    if not execution.success:
-        await update.effective_chat.send_message(
-            "🛑 *Arbitrage not executed/settled*\n\n"
-            f"Reason: `{execution.reason}`\n"
-            f"Net after priority: `{execution.estimated_net_profit_lamports / 1_000_000_000:.9f} SOL`\n"
-            f"Bundle: `{execution.bundle_id or 'none'}`",
-            parse_mode="Markdown",
-        )
+    lock = _admin_execution_lock(admin_id)
+    async with lock:
+        async with _LIVE_EXECUTION_SEMAPHORE:
+            try:
+                await bot.send_message(
+                    chat_id=admin_id,
+                    text=message + "\n\n⚠️ *Live mode: re-quoting before execution…*",
+                    parse_mode="Markdown",
+                )
+
+                execution = await live_executor.execute_unrestricted(
+                    owner_user_id=admin_id,
+                    token_mint=candidate.token_mint,
+                    amount_sol=discovery.amount_sol,
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                logger.exception(
+                    "arb_live_execution_failed",
+                    extra={"admin_id": admin_id, "token_mint": candidate.token_mint},
+                )
+                await bot.send_message(
+                    chat_id=admin_id,
+                    text=(
+                        "🛑 *Arbitrage execution refused safely*\n\n"
+                        f"`{type(exc).__name__}: {exc}`"
+                    ),
+                    parse_mode="Markdown",
+                )
+                return
+
+            if not execution.success:
+                await bot.send_message(
+                    chat_id=admin_id,
+                    text=(
+                        "🛑 *Arbitrage not executed/settled*\n\n"
+                        f"Reason: `{execution.reason}`\n"
+                        f"Net after priority: `{execution.estimated_net_profit_lamports / 1_000_000_000:.9f} SOL`\n"
+                        f"Bundle: `{execution.bundle_id or 'none'}`"
+                    ),
+                    parse_mode="Markdown",
+                )
+                return
+
+            signatures = "\n".join(f"`{sig}`" for sig in execution.transaction_signatures) or "none"
+            await bot.send_message(
+                chat_id=admin_id,
+                text=(
+                    "✅ *LIVE ARBITRAGE BUNDLE SETTLED*\n\n"
+                    f"Token: `{candidate.symbol}`\n"
+                    f"Input: `{execution.input_lamports / 1_000_000_000:.9f} SOL`\n"
+                    f"Net: `+{execution.estimated_net_profit_lamports / 1_000_000_000:.9f} SOL`\n"
+                    f"Bundle: `{execution.bundle_id}`\n"
+                    f"Transactions:\n{signatures}"
+                ),
+                parse_mode="Markdown",
+            )
+
+
+async def _on_profitable(result: HuntResult, bot) -> None:
+    """Fan one shared discovery out to every independently armed admin."""
+    candidate = None
+    discovery = None
+    for candidate_item, discovery_item in result.discoveries:
+        opportunity = discovery_item.opportunity
+        if opportunity is not None and opportunity.executable:
+            candidate = candidate_item
+            discovery = discovery_item
+            break
+    if candidate is None or discovery is None:
         return
 
-    signatures = "\n".join(f"`{sig}`" for sig in execution.transaction_signatures) or "none"
-    await update.effective_chat.send_message(
-        "✅ *LIVE ARBITRAGE BUNDLE SETTLED*\n\n"
-        f"Token: `{candidate.symbol}`\n"
-        f"Input: `{execution.input_lamports / 1_000_000_000:.9f} SOL`\n"
-        f"Net: `+{execution.estimated_net_profit_lamports / 1_000_000_000:.9f} SOL`\n"
-        f"Bundle: `{execution.bundle_id}`\n"
-        f"Transactions:\n{signatures}",
-        parse_mode="Markdown",
+    admin_ids = await _live_admin_ids()
+    if not admin_ids:
+        logger.info("arb_no_eligible_live_admins", extra={"token_mint": candidate.token_mint})
+        return
+
+    await asyncio.gather(
+        *(
+            _execute_for_admin(
+                bot=bot,
+                admin_id=admin_id,
+                candidate=candidate,
+                discovery=discovery,
+            )
+            for admin_id in admin_ids
+        )
     )
 
 
@@ -149,13 +251,13 @@ async def arbitrage_live_hunt_start_cmd(update: Update, context: ContextTypes.DE
 
     started = await continuous_hunt.start(
         limit,
-        on_profitable=lambda result: _on_profitable(result, update),
+        on_profitable=lambda result: _on_profitable(result, context.bot),
     )
     if started:
         await update.message.reply_text(
             "🚀 *LIVE GLOBAL ARBITRAGE HUNTER STARTED*\n\n"
-            "The bot will prioritize the configured arbitrage hotlist, then run global candidate discovery for new opportunities.\n\n"
-            "Every live opportunity is re-quoted before signing. Existing wallet, balance, trade-size, simulation, Jito bundle and settlement checks remain active.\n\n"
+            "Discovery is shared across the deployment. Every admin participates only when that admin's own BotState is LIVE + Trading ON and that admin has a connected wallet.\n\n"
+            "Each qualifying opportunity is re-quoted and executed separately against each eligible admin wallet. Existing wallet, balance, trade-size, simulation, Jito bundle and settlement checks remain active per admin.\n\n"
             "Use `/arbstop` to stop it immediately or `/arbstatus` to check it.",
             parse_mode="Markdown",
         )
@@ -191,11 +293,26 @@ async def arbitrage_hunt_status_cmd(update: Update, context: ContextTypes.DEFAUL
         if hotlist else 0
     )
     global_stats = global_result.stats if global_result else None
+    live_admins = await _live_admin_ids()
+    admin_status_lines = []
+    for raw_admin_id in settings.telegram_admin_ids:
+        admin_id = int(raw_admin_id)
+        try:
+            state = await repo.get_or_create_bot_state(admin_id)
+            has_wallet = bool(await secrets_manager.get_wallet_private_key(admin_id))
+            state_label = f"{state.mode.upper()} / Trading {'ON' if state.trading_enabled else 'OFF'} / Wallet {'CONNECTED' if has_wallet else 'NOT CONNECTED'}"
+        except Exception:
+            state_label = "STATUS ERROR"
+        admin_status_lines.append(f"`{admin_id}` — {state_label}")
 
     await update.effective_chat.send_message(
         "🛰️ *Arbitrage hunter status*\n\n"
         f"Running: `{'YES' if status.running else 'NO'}`\n"
         f"Cycles: `{status.cycles}`\n\n"
+        "👥 *Per-admin live participation*\n"
+        f"Eligible live admins: `{len(live_admins)}`\n"
+        + ("\n".join(admin_status_lines) if admin_status_lines else "None configured")
+        + "\n\n"
         "🔥 *Hotlist*\n"
         f"Mints configured: `{len(status.hotlist_mints)}`\n"
         f"Last hotlist candidates: `{hotlist_candidates}`\n"
@@ -207,6 +324,6 @@ async def arbitrage_hunt_status_cmd(update: Update, context: ContextTypes.DEFAUL
         f"Last global Jupiter round-trips: `{global_stats.jupiter_round_trips if global_stats else 0}`\n"
         f"Last global Jupiter 429s: `{global_stats.jupiter_429s if global_stats else 0}`\n"
         f"Global scans: `{status.global_scans}`\n\n"
-        "The hunter prioritizes the hotlist, then checks global discovery for new opportunities.",
+        "Discovery is shared; live execution is isolated per eligible admin wallet.",
         parse_mode="Markdown",
     )
