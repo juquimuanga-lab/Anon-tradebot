@@ -4,6 +4,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 
+DEFAULT_BASE_FEE_LAMPORTS_PER_SIGNATURE = 5_000
 MIN_JITO_TIP_LAMPORTS = 1_000
 
 
@@ -15,6 +16,7 @@ class ProfitabilityBreakdown:
     final_output_atomic: int
     gross_profit_atomic: int
     venue_cost_atomic: int
+    base_fee_atomic: int
     priority_fee_atomic: int
     jito_tip_atomic: int
 
@@ -22,6 +24,7 @@ class ProfitabilityBreakdown:
     def total_cost_atomic(self) -> int:
         return (
             max(self.venue_cost_atomic, 0)
+            + max(self.base_fee_atomic, 0)
             + max(self.priority_fee_atomic, 0)
             + max(self.jito_tip_atomic, 0)
         )
@@ -39,25 +42,12 @@ class ProfitabilityBreakdown:
         )
 
 
-def venue_cost_atomic(
-    input_atomic: int,
-    guaranteed_output_atomic: int,
-    buy_fee_bps: float,
-    sell_fee_bps: float,
-) -> int:
-    """Estimate explicit venue fees from the amounts actually exchanged."""
-    buy_cost = int(max(input_atomic, 0) * max(buy_fee_bps, 0.0) / 10_000)
-    sell_cost = int(
-        max(guaranteed_output_atomic, 0) * max(sell_fee_bps, 0.0) / 10_000
-    )
-    return buy_cost + sell_cost
-
-
 def calculate_profitability(
     *,
     input_atomic: int,
     final_output_atomic: int,
     venue_cost_atomic_value: int,
+    base_fee_atomic: int = 0,
     priority_fee_atomic: int = 0,
     jito_tip_atomic: int = 0,
 ) -> ProfitabilityBreakdown:
@@ -67,6 +57,7 @@ def calculate_profitability(
         final_output_atomic=max(final_output_atomic, 0),
         gross_profit_atomic=final_output_atomic - input_atomic,
         venue_cost_atomic=max(venue_cost_atomic_value, 0),
+        base_fee_atomic=max(base_fee_atomic, 0),
         priority_fee_atomic=max(priority_fee_atomic, 0),
         jito_tip_atomic=max(jito_tip_atomic, 0),
     )
@@ -76,17 +67,15 @@ def max_affordable_jito_tip(
     *,
     gross_profit_atomic: int,
     venue_cost_atomic_value: int,
+    base_fee_atomic: int,
     priority_fee_atomic: int,
 ) -> int:
-    """Return the largest tip that still leaves strictly positive net profit.
-
-    This is an economic cap, not a minimum-profit requirement. The final live
-    gate still requires net profit > 0 after the actual built transaction fees.
-    """
+    """Largest tip that still leaves strictly positive final net profit."""
     return max(
         0,
         gross_profit_atomic
         - max(venue_cost_atomic_value, 0)
+        - max(base_fee_atomic, 0)
         - max(priority_fee_atomic, 0)
         - 1,
     )

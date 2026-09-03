@@ -29,6 +29,7 @@ class ArbitrageOpportunity:
     total_cost_atomic: int
     net_profit_atomic: int
     net_profit_bps: float
+    estimated_base_fee_atomic: int = 0
     estimated_priority_fee_atomic: int = 0
     estimated_jito_tip_atomic: int = 0
     gross_profit_bps: float = 0.0

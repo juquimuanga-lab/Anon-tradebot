@@ -1,7 +1,5 @@
 import asyncio
 
-import pytest
-
 from app.arbitrage.fee_model import (
     MIN_JITO_TIP_LAMPORTS,
     calculate_profitability,
@@ -20,26 +18,28 @@ class FailingJito:
         raise RuntimeError("tip service unavailable")
 
 
-def test_profitability_breakdown_accounts_for_tip_and_priority():
+def test_profitability_breakdown_accounts_for_base_fee_tip_and_priority():
     result = calculate_profitability(
         input_atomic=40_000_000,
         final_output_atomic=40_300_000,
         venue_cost_atomic_value=0,
+        base_fee_atomic=10_000,
         priority_fee_atomic=100_000,
         jito_tip_atomic=75_000,
     )
     assert result.gross_profit_atomic == 300_000
-    assert result.total_cost_atomic == 175_000
-    assert result.net_profit_atomic == 125_000
+    assert result.total_cost_atomic == 185_000
+    assert result.net_profit_atomic == 115_000
 
 
 def test_max_affordable_tip_leaves_strictly_positive_net():
     max_tip = max_affordable_jito_tip(
         gross_profit_atomic=300_000,
         venue_cost_atomic_value=0,
+        base_fee_atomic=10_000,
         priority_fee_atomic=100_000,
     )
-    assert max_tip == 199_999
+    assert max_tip == 189_999
     assert max_tip >= MIN_JITO_TIP_LAMPORTS
 
 

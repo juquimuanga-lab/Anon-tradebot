@@ -2,8 +2,8 @@
 
 Jupiter quote output amounts are treated as quoted executable outputs. DEX
 fees and price impact are not subtracted a second time. Price impact remains
-a safety gate, while priority fees and Jito tips remain explicit external
-execution costs.
+a safety gate, while Solana base fees, priority fees and Jito tips remain
+explicit external execution costs.
 
 Profitability policy: any strictly positive final net profit is eligible.
 There is intentionally no minimum profit-bps floor, absolute-profit floor, or
@@ -23,6 +23,7 @@ DEFAULT_MIN_PROFIT_BPS = 0.0
 DEFAULT_MIN_PROFIT_LAMPORTS = 0
 DEFAULT_MAX_PRICE_IMPACT_BPS = 80.0
 DEFAULT_MAX_SLIPPAGE_BPS = 50.0
+DEFAULT_ESTIMATED_BASE_FEE_LAMPORTS = 10_000  # 5,000 per signature x 2 legs
 DEFAULT_ESTIMATED_PRIORITY_FEE_LAMPORTS = 50_000
 DEFAULT_ESTIMATED_JITO_TIP_LAMPORTS = 100_000
 DEFAULT_EXECUTION_SAFETY_BPS = 0.0
@@ -34,6 +35,7 @@ class ArbitrageConfig:
     min_profit_atomic: int = DEFAULT_MIN_PROFIT_LAMPORTS
     max_price_impact_bps: float = DEFAULT_MAX_PRICE_IMPACT_BPS
     max_slippage_bps: float = DEFAULT_MAX_SLIPPAGE_BPS
+    estimated_base_fee_atomic: int = DEFAULT_ESTIMATED_BASE_FEE_LAMPORTS
     estimated_priority_fee_atomic: int = DEFAULT_ESTIMATED_PRIORITY_FEE_LAMPORTS
     estimated_jito_tip_atomic: int = DEFAULT_ESTIMATED_JITO_TIP_LAMPORTS
     execution_safety_bps: float = DEFAULT_EXECUTION_SAFETY_BPS
@@ -52,6 +54,7 @@ class ArbitrageConfig:
             min_profit_atomic=0,
             max_price_impact_bps=max(number("ARBITRAGE_MAX_PRICE_IMPACT_BPS", DEFAULT_MAX_PRICE_IMPACT_BPS), 0.0),
             max_slippage_bps=max(number("ARBITRAGE_MAX_SLIPPAGE_BPS", DEFAULT_MAX_SLIPPAGE_BPS), 0.0),
+            estimated_base_fee_atomic=max(int(number("ARBITRAGE_ESTIMATED_BASE_FEE_LAMPORTS", DEFAULT_ESTIMATED_BASE_FEE_LAMPORTS)), 0),
             estimated_priority_fee_atomic=max(int(number("ARBITRAGE_ESTIMATED_PRIORITY_FEE_LAMPORTS", DEFAULT_ESTIMATED_PRIORITY_FEE_LAMPORTS)), 0),
             estimated_jito_tip_atomic=max(int(number("ARBITRAGE_ESTIMATED_JITO_TIP_LAMPORTS", DEFAULT_ESTIMATED_JITO_TIP_LAMPORTS)), 0),
             execution_safety_bps=0.0,
@@ -59,8 +62,10 @@ class ArbitrageConfig:
 
     @property
     def external_execution_cost_atomic(self) -> int:
-        return max(self.estimated_priority_fee_atomic, 0) + max(
-            self.estimated_jito_tip_atomic, 0
+        return (
+            max(self.estimated_base_fee_atomic, 0)
+            + max(self.estimated_priority_fee_atomic, 0)
+            + max(self.estimated_jito_tip_atomic, 0)
         )
 
 
@@ -91,6 +96,7 @@ def find_two_venue_opportunity(
         input_atomic=input_atomic,
         final_output_atomic=sell_quote.output_amount_atomic,
         venue_cost_atomic_value=0,
+        base_fee_atomic=config.estimated_base_fee_atomic,
         priority_fee_atomic=config.estimated_priority_fee_atomic,
         jito_tip_atomic=config.estimated_jito_tip_atomic,
     )
@@ -160,6 +166,7 @@ def _build(
         total_cost_atomic=execution_costs,
         net_profit_atomic=net_profit,
         net_profit_bps=net_profit_bps,
+        estimated_base_fee_atomic=max(config.estimated_base_fee_atomic, 0),
         estimated_priority_fee_atomic=max(config.estimated_priority_fee_atomic, 0),
         estimated_jito_tip_atomic=max(config.estimated_jito_tip_atomic, 0),
         gross_profit_bps=gross_profit_bps,
