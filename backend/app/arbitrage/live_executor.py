@@ -11,7 +11,6 @@ from decimal import Decimal, InvalidOperation
 from typing import Any
 
 import httpx
-from solana.rpc.async_api import AsyncClient
 from solders.keypair import Keypair
 
 from app.arbitrage.fee_model import (
@@ -29,7 +28,7 @@ from app.arbitrage.jupiter_quotes import VenueConfig
 from app.arbitrage.jito import JitoClient
 from app.arbitrage.service import ArbitrageService
 from app.execution.onchain.jupiter import SOL_MINT
-from app.execution.onchain.solana_rpc import get_transaction_details
+from app.execution.onchain.solana_rpc import _rpc_request, get_transaction_details
 from app.security.secrets_manager import secrets_manager
 from app.execution.onchain.wallet_keys import load_keypair
 from app.config.settings import settings
@@ -126,10 +125,19 @@ class ArbitrageLiveExecutor:
             raise ArbitrageLiveExecutionError("stored Solana wallet key is invalid") from exc
 
     async def _wallet_balance(self, rpc_url: str, owner: Keypair) -> int:
+        """Read SOL balance through the shared RPC helper with provider failover."""
         try:
-            async with AsyncClient(rpc_url) as rpc:
-                result = await rpc.get_balance(owner.pubkey(), commitment="confirmed")
-            return int(result.value)
+            result = await _rpc_request(
+                rpc_url,
+                "getBalance",
+                [str(owner.pubkey()), {"commitment": "confirmed"}],
+            )
+            value = (result or {}).get("value")
+            if not isinstance(value, dict) or value.get("value") is None:
+                raise ArbitrageLiveExecutionError("getBalance returned no lamport value")
+            return int(value["value"])
+        except ArbitrageLiveExecutionError:
+            raise
         except Exception as exc:
             raise ArbitrageLiveExecutionError("unable to verify wallet SOL balance") from exc
 
@@ -182,7 +190,6 @@ class ArbitrageLiveExecutor:
             raw_value = values.get(field)
             if raw_value is None:
                 raise ArbitrageLiveExecutionError(f"Jito tip floor missing {field}")
-            # Jito's REST response reports tip amounts in SOL.
             market_tip = int(float(raw_value) * LAMPORTS_PER_SOL)
             market_tip = max(MIN_JITO_TIP_LAMPORTS, market_tip)
             market_tip = int(market_tip * self._tip_multiplier)
@@ -202,12 +209,7 @@ class ArbitrageLiveExecutor:
         token_mint: str,
         amount_sol: float,
     ) -> LiveExecutionResult:
-        """Execute a freshly re-quoted unrestricted Jupiter round-trip.
-
-        Used by the global arbitrage hunter. Discovery chooses the candidate
-        and size; this method re-quotes both legs without restricting Jupiter
-        to the configured venue list before any transaction is signed.
-        """
+        """Execute a freshly re-quoted unrestricted Jupiter round-trip."""
         unrestricted = VenueConfig("jupiter_best_route", "", 0.0)
         return await self.execute(
             owner_user_id=owner_user_id,
@@ -366,9 +368,6 @@ class ArbitrageLiveExecutor:
             base_fee_atomic=DEFAULT_BUNDLE_BASE_FEE_LAMPORTS,
         )
 
-        # Build both legs without a tip first. This gives us actual Jupiter
-        # priority-fee estimates before deciding how much auction budget the
-        # opportunity can afford.
         try:
             tip_accounts = await self._jito.get_tip_accounts()
             if not tip_accounts:
