@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import base64
+import os
 from typing import Any
 
 import httpx
@@ -80,6 +81,32 @@ async def _load_lookup_tables(
     return lookup_tables
 
 
+def _priority_fee_config() -> dict[str, Any]:
+    """Return an economical Jupiter priority-fee policy for small arb trades.
+
+    Jito bundle selection is driven by the Jito tip, while Solana priority fees
+    are still paid by the transactions. A veryHigh 1 SOL cap per leg can make
+    small positive spreads uneconomic, so use a lower default and expose both
+    controls as environment variables.
+    """
+    level = os.getenv("ARBITRAGE_LIVE_PRIORITY_LEVEL", "low").strip()
+    if level not in {"low", "medium", "high", "veryHigh"}:
+        level = "low"
+    try:
+        max_lamports = int(
+            os.getenv("ARBITRAGE_LIVE_MAX_PRIORITY_FEE_LAMPORTS", "100000")
+        )
+    except ValueError:
+        max_lamports = 100000
+    max_lamports = max(1000, min(max_lamports, 1_000_000))
+    return {
+        "priorityLevelWithMaxLamports": {
+            "priorityLevel": level,
+            "maxLamports": max_lamports,
+        }
+    }
+
+
 async def _build(
     *,
     base_url: str,
@@ -101,12 +128,7 @@ async def _build(
         "wrapAndUnwrapSol": True,
         "useSharedAccounts": True,
         "dynamicComputeUnitLimit": True,
-        "prioritizationFeeLamports": {
-            "priorityLevelWithMaxLamports": {
-                "priorityLevel": "veryHigh",
-                "maxLamports": 1_000_000,
-            }
-        },
+        "prioritizationFeeLamports": _priority_fee_config(),
     }
     async with httpx.AsyncClient(base_url=base_url.rstrip("/"), timeout=timeout_seconds) as client:
         response = await client.post("/swap-instructions", json=body, headers=headers)
