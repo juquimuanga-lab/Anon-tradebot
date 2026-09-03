@@ -5,8 +5,7 @@ import base64
 from typing import Any
 
 import httpx
-from solana.rpc.async_api import AsyncClient
-from solders.address_lookup_table_account import AddressLookupTableAccount
+from solders.address_lookup_table_account import AddressLookupTable, AddressLookupTableAccount
 from solders.hash import Hash
 from solders.instruction import AccountMeta, Instruction
 from solders.keypair import Keypair
@@ -14,6 +13,8 @@ from solders.message import MessageV0
 from solders.pubkey import Pubkey
 from solders.system_program import TransferParams, transfer
 from solders.transaction import VersionedTransaction
+
+from app.execution.onchain.solana_rpc import _rpc_request
 
 
 class JupiterInstructionBuildError(RuntimeError):
@@ -37,6 +38,46 @@ def _instruction(raw: dict[str, Any]) -> Instruction:
         )
     except Exception as exc:
         raise JupiterInstructionBuildError(f"invalid Jupiter instruction: {exc}") from exc
+
+
+async def _load_lookup_tables(
+    rpc_url: str,
+    addresses: list[str],
+) -> list[AddressLookupTableAccount]:
+    """Load Jupiter address lookup tables without relying on solana-py helpers."""
+    lookup_tables: list[AddressLookupTableAccount] = []
+    for address in addresses:
+        try:
+            result = await _rpc_request(
+                rpc_url,
+                "getAccountInfo",
+                [address, {"encoding": "base64", "commitment": "processed"}],
+            )
+            value = (result or {}).get("value")
+            if not value:
+                raise JupiterInstructionBuildError(
+                    f"missing address lookup table: {address}"
+                )
+            data = value.get("data")
+            if not isinstance(data, list) or len(data) < 1:
+                raise JupiterInstructionBuildError(
+                    f"address lookup table has no binary data: {address}"
+                )
+            raw_data = base64.b64decode(data[0])
+            table = AddressLookupTable.deserialize(raw_data)
+            lookup_tables.append(
+                AddressLookupTableAccount(
+                    key=Pubkey.from_string(address),
+                    addresses=table.addresses,
+                )
+            )
+        except JupiterInstructionBuildError:
+            raise
+        except Exception as exc:
+            raise JupiterInstructionBuildError(
+                f"failed to load address lookup table {address}: {exc}"
+            ) from exc
+    return lookup_tables
 
 
 async def _build(
@@ -103,23 +144,29 @@ async def _build(
             )
         )
 
-    async with AsyncClient(rpc_url) as rpc:
-        latest = await rpc.get_latest_blockhash(commitment="processed")
-        lookup_tables: list[AddressLookupTableAccount] = []
-        for address in payload.get("addressLookupTableAddresses") or []:
-            result = await rpc.get_address_lookup_table(Pubkey.from_string(str(address)))
-            if result.value is None:
-                raise JupiterInstructionBuildError(f"missing address lookup table: {address}")
-            lookup_tables.append(result.value)
+    lookup_tables = await _load_lookup_tables(
+        rpc_url,
+        [str(address) for address in (payload.get("addressLookupTableAddresses") or [])],
+    )
 
     try:
+        latest = await _rpc_request(
+            rpc_url,
+            "getLatestBlockhash",
+            [{"commitment": "processed"}],
+        )
+        blockhash = ((latest or {}).get("value") or {}).get("blockhash")
+        if not blockhash:
+            raise JupiterInstructionBuildError("RPC returned no recent blockhash")
         message = MessageV0.try_compile(
             payer=keypair.pubkey(),
             instructions=instructions,
             address_lookup_table_accounts=lookup_tables,
-            recent_blockhash=Hash.from_string(str(latest.value.blockhash)),
+            recent_blockhash=Hash.from_string(str(blockhash)),
         )
         signed = VersionedTransaction(message, [keypair])
+    except JupiterInstructionBuildError:
+        raise
     except Exception as exc:
         raise JupiterInstructionBuildError(f"failed to compile Jupiter transaction: {exc}") from exc
 
