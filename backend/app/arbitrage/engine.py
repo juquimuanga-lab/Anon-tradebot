@@ -16,6 +16,7 @@ import os
 from dataclasses import dataclass
 from typing import Iterable
 
+from app.arbitrage.fee_model import calculate_profitability
 from app.arbitrage.models import ArbitrageOpportunity, Quote
 
 DEFAULT_MIN_PROFIT_BPS = 0.0
@@ -83,15 +84,23 @@ def find_two_venue_opportunity(
     gross_profit = sell_quote.output_amount_atomic - input_atomic
     gross_profit_bps = gross_profit / input_atomic * 10_000 if input_atomic else 0.0
 
-    execution_costs = config.external_execution_cost_atomic
+    # Jupiter's quoted output already reflects the route's DEX economics, so
+    # do not subtract Quote.fee_bps a second time. Only external execution
+    # costs are estimated here and re-checked with actual built transactions.
+    breakdown = calculate_profitability(
+        input_atomic=input_atomic,
+        final_output_atomic=sell_quote.output_amount_atomic,
+        venue_cost_atomic_value=0,
+        priority_fee_atomic=config.estimated_priority_fee_atomic,
+        jito_tip_atomic=config.estimated_jito_tip_atomic,
+    )
+    execution_costs = breakdown.total_cost_atomic
     execution_cost_bps = (
         execution_costs / input_atomic * 10_000 if input_atomic else float("inf")
     )
-
-    # Profitability has no artificial safety buffer: positive net profit is enough.
+    net_profit = breakdown.net_profit_atomic
+    net_profit_bps = breakdown.net_profit_bps
     required_gross_profit_bps = execution_cost_bps
-    net_profit = gross_profit - execution_costs
-    net_profit_bps = net_profit / input_atomic * 10_000 if input_atomic else 0.0
 
     max_impact = max(buy_quote.price_impact_bps, sell_quote.price_impact_bps)
     if max_impact > config.max_price_impact_bps:

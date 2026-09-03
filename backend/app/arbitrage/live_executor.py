@@ -5,6 +5,7 @@ import base64
 import logging
 import os
 import random
+import time
 from dataclasses import dataclass, field
 from decimal import Decimal, InvalidOperation
 from typing import Any
@@ -13,6 +14,11 @@ import httpx
 from solana.rpc.async_api import AsyncClient
 from solders.keypair import Keypair
 
+from app.arbitrage.fee_model import (
+    MIN_JITO_TIP_LAMPORTS,
+    calculate_profitability,
+    max_affordable_jito_tip,
+)
 from app.arbitrage.jupiter_bundle import (
     JupiterInstructionBuildError,
     build_signed_swap_with_tip,
@@ -29,6 +35,7 @@ from app.config.settings import settings
 
 logger = logging.getLogger("app.arbitrage.live_executor")
 LAMPORTS_PER_SOL = 1_000_000_000
+DEFAULT_JITO_TIP_FLOOR_URL = "https://bundles.jito.wtf/api/v1/bundles/tip_floor"
 
 
 class ArbitrageLiveExecutionError(RuntimeError):
@@ -47,6 +54,8 @@ class LiveExecutionResult:
     reason: str = ""
     settlement_status: str | None = None
     transaction_signatures: tuple[str, ...] = field(default_factory=tuple)
+    priority_fee_lamports: int = 0
+    jito_tip_lamports: int = 0
 
 
 class ArbitrageLiveExecutor:
@@ -69,9 +78,28 @@ class ArbitrageLiveExecutor:
         self._slippage_bps = max(
             1, min(int(os.getenv("ARBITRAGE_LIVE_SLIPPAGE_BPS", "30")), 300)
         )
-        self._tip_lamports = max(
-            1000, int(os.getenv("ARBITRAGE_LIVE_JITO_TIP_LAMPORTS", "2000000"))
+        self._fallback_tip_lamports = max(
+            MIN_JITO_TIP_LAMPORTS,
+            int(os.getenv("ARBITRAGE_LIVE_JITO_FALLBACK_TIP_LAMPORTS", "100000")),
         )
+        try:
+            percentile = int(os.getenv("ARBITRAGE_LIVE_JITO_TIP_PERCENTILE", "50"))
+        except ValueError:
+            percentile = 50
+        self._tip_percentile = min(99, max(25, percentile))
+        try:
+            multiplier = float(os.getenv("ARBITRAGE_LIVE_JITO_TIP_MULTIPLIER", "1.0"))
+        except ValueError:
+            multiplier = 1.0
+        self._tip_multiplier = max(0.1, min(multiplier, 3.0))
+        self._tip_floor_url = os.getenv(
+            "ARBITRAGE_LIVE_JITO_TIP_FLOOR_URL", DEFAULT_JITO_TIP_FLOOR_URL
+        )
+        self._tip_cache_ttl_seconds = max(
+            1.0, float(os.getenv("ARBITRAGE_LIVE_JITO_TIP_CACHE_SECONDS", "5"))
+        )
+        self._cached_tip_lamports = 0
+        self._cached_tip_at = 0.0
         self._settlement_timeout_seconds = max(
             3.0,
             float(os.getenv("ARBITRAGE_LIVE_SETTLEMENT_TIMEOUT_SECONDS", "20")),
@@ -136,6 +164,34 @@ class ArbitrageLiveExecutor:
                 f"Jupiter returned no executable quote for {venue.name}"
             )
         return payload
+
+    async def _dynamic_jito_tip_lamports(self) -> int:
+        """Read a recent Jito landed-tip percentile, with a safe local fallback."""
+        now = time.monotonic()
+        if self._cached_tip_lamports >= MIN_JITO_TIP_LAMPORTS and (
+            now - self._cached_tip_at < self._tip_cache_ttl_seconds
+        ):
+            return self._cached_tip_lamports
+
+        try:
+            values = await self._jito.get_tip_floor(self._tip_floor_url)
+            field = f"landed_tips_{self._tip_percentile}th_percentile"
+            raw_value = values.get(field)
+            if raw_value is None:
+                raise ArbitrageLiveExecutionError(f"Jito tip floor missing {field}")
+            # Jito's REST response reports tip amounts in SOL.
+            market_tip = int(float(raw_value) * LAMPORTS_PER_SOL)
+            market_tip = max(MIN_JITO_TIP_LAMPORTS, market_tip)
+            market_tip = int(market_tip * self._tip_multiplier)
+            self._cached_tip_lamports = market_tip
+            self._cached_tip_at = now
+            return market_tip
+        except Exception as exc:
+            logger.warning(
+                "jito_tip_floor_unavailable_using_fallback",
+                extra={"error": str(exc), "fallback_lamports": self._fallback_tip_lamports},
+            )
+            return self._fallback_tip_lamports
 
     async def execute_unrestricted(
         self,
@@ -277,7 +333,7 @@ class ArbitrageLiveExecutor:
             raise ArbitrageLiveExecutionError("SOLANA_RPC_URL/Helius RPC is not configured")
 
         balance_lamports = await self._wallet_balance(rpc_url, keypair)
-        required_balance = input_lamports + self._tip_lamports + self._reserve_lamports
+        required_balance = input_lamports + self._fallback_tip_lamports + self._reserve_lamports
         if balance_lamports < required_balance:
             return LiveExecutionResult(
                 False,
@@ -305,22 +361,15 @@ class ArbitrageLiveExecutor:
         if guaranteed_sol > sell_out:
             raise ArbitrageLiveExecutionError("sell quote minimum output exceeds quoted output")
 
-        gross = guaranteed_sol - input_lamports
-        estimated_cost = int(input_lamports * buy_venue.fee_bps / 10_000)
-        estimated_cost += int(guaranteed_sol * sell_venue.fee_bps / 10_000)
-        estimated_cost += self._tip_lamports
-        net_before_priority = gross - estimated_cost
-        if net_before_priority <= 0:
-            return LiveExecutionResult(
-                False,
-                buy_venue=buy_venue.name,
-                sell_venue=sell_venue.name,
-                input_lamports=input_lamports,
-                guaranteed_token_amount=guaranteed_tokens,
-                estimated_net_profit_lamports=net_before_priority,
-                reason="live_profit_gate_failed",
-            )
+        base_profit = calculate_profitability(
+            input_atomic=input_lamports,
+            final_output_atomic=guaranteed_sol,
+            venue_cost_atomic_value=0,
+        )
 
+        # Build both legs without a tip first. This gives us actual Jupiter
+        # priority-fee estimates before deciding how much auction budget the
+        # opportunity can afford.
         try:
             tip_accounts = await self._jito.get_tip_accounts()
             if not tip_accounts:
@@ -334,6 +383,66 @@ class ArbitrageLiveExecutor:
                 rpc_url=rpc_url,
                 api_key=os.getenv("JUPITER_API_KEY"),
             )
+            _, sell_priority_estimate = await build_signed_swap_without_tip(
+                base_url=settings.jupiter_base_url,
+                quote_response=sell_quote,
+                user_pubkey=user_pubkey,
+                keypair=keypair,
+                rpc_url=rpc_url,
+                api_key=os.getenv("JUPITER_API_KEY"),
+            )
+        except JupiterInstructionBuildError as exc:
+            raise ArbitrageLiveExecutionError(str(exc)) from exc
+
+        priority_estimate = buy_priority + sell_priority_estimate
+        max_tip = max_affordable_jito_tip(
+            gross_profit_atomic=base_profit.gross_profit_atomic,
+            venue_cost_atomic_value=base_profit.venue_cost_atomic,
+            priority_fee_atomic=priority_estimate,
+        )
+        if max_tip < MIN_JITO_TIP_LAMPORTS:
+            return LiveExecutionResult(
+                False,
+                buy_venue=buy_venue.name,
+                sell_venue=sell_venue.name,
+                input_lamports=input_lamports,
+                guaranteed_token_amount=guaranteed_tokens,
+                estimated_net_profit_lamports=base_profit.gross_profit_atomic - priority_estimate,
+                reason="jito_tip_profit_gate_failed",
+                priority_fee_lamports=priority_estimate,
+                jito_tip_lamports=0,
+            )
+
+        market_tip = await self._dynamic_jito_tip_lamports()
+        selected_tip = min(market_tip, max_tip)
+        if selected_tip < MIN_JITO_TIP_LAMPORTS:
+            return LiveExecutionResult(
+                False,
+                buy_venue=buy_venue.name,
+                sell_venue=sell_venue.name,
+                input_lamports=input_lamports,
+                guaranteed_token_amount=guaranteed_tokens,
+                estimated_net_profit_lamports=base_profit.gross_profit_atomic - priority_estimate,
+                reason="jito_tip_market_too_expensive",
+                priority_fee_lamports=priority_estimate,
+                jito_tip_lamports=market_tip,
+            )
+
+        required_balance = input_lamports + selected_tip + self._reserve_lamports
+        if balance_lamports < required_balance:
+            return LiveExecutionResult(
+                False,
+                buy_venue=buy_venue.name,
+                sell_venue=sell_venue.name,
+                input_lamports=input_lamports,
+                guaranteed_token_amount=guaranteed_tokens,
+                estimated_net_profit_lamports=base_profit.gross_profit_atomic - priority_estimate - selected_tip,
+                reason="insufficient_dynamic_tip_reserve",
+                priority_fee_lamports=priority_estimate,
+                jito_tip_lamports=selected_tip,
+            )
+
+        try:
             sell_signed, sell_priority = await build_signed_swap_with_tip(
                 base_url=settings.jupiter_base_url,
                 quote_response=sell_quote,
@@ -341,22 +450,30 @@ class ArbitrageLiveExecutor:
                 keypair=keypair,
                 rpc_url=rpc_url,
                 tip_account=tip_account,
-                tip_lamports=self._tip_lamports,
+                tip_lamports=selected_tip,
                 api_key=os.getenv("JUPITER_API_KEY"),
             )
         except JupiterInstructionBuildError as exc:
             raise ArbitrageLiveExecutionError(str(exc)) from exc
 
-        net_after_priority = net_before_priority - buy_priority - sell_priority
-        if net_after_priority <= 0:
+        final_profit = calculate_profitability(
+            input_atomic=input_lamports,
+            final_output_atomic=guaranteed_sol,
+            venue_cost_atomic_value=0,
+            priority_fee_atomic=buy_priority + sell_priority,
+            jito_tip_atomic=selected_tip,
+        )
+        if final_profit.net_profit_atomic <= 0:
             return LiveExecutionResult(
                 False,
                 buy_venue=buy_venue.name,
                 sell_venue=sell_venue.name,
                 input_lamports=input_lamports,
                 guaranteed_token_amount=guaranteed_tokens,
-                estimated_net_profit_lamports=net_after_priority,
-                reason="actual_priority_fee_profit_gate_failed",
+                estimated_net_profit_lamports=final_profit.net_profit_atomic,
+                reason="final_profit_gate_failed",
+                priority_fee_lamports=buy_priority + sell_priority,
+                jito_tip_lamports=selected_tip,
             )
 
         await self._simulate(rpc_url, buy_signed)
@@ -377,7 +494,9 @@ class ArbitrageLiveExecutor:
                 "input_lamports": input_lamports,
                 "guaranteed_tokens": guaranteed_tokens,
                 "guaranteed_sol_output": guaranteed_sol,
-                "estimated_net_profit_lamports": net_after_priority,
+                "estimated_net_profit_lamports": final_profit.net_profit_atomic,
+                "priority_fee_lamports": buy_priority + sell_priority,
+                "jito_tip_lamports": selected_tip,
             },
         )
 
@@ -395,12 +514,14 @@ class ArbitrageLiveExecutor:
                 sell_venue=sell_venue.name,
                 input_lamports=input_lamports,
                 guaranteed_token_amount=guaranteed_tokens,
-                estimated_net_profit_lamports=net_after_priority,
+                estimated_net_profit_lamports=final_profit.net_profit_atomic,
                 reason=f"bundle_{settlement_state.lower()}",
                 settlement_status=settlement_state,
                 transaction_signatures=tuple(
                     str(sig) for sig in (settlement.get("transactions") or [])
                 ),
+                priority_fee_lamports=buy_priority + sell_priority,
+                jito_tip_lamports=selected_tip,
             )
 
         reconciled, reason, signatures = await self._reconcile_landed_bundle(
@@ -414,10 +535,12 @@ class ArbitrageLiveExecutor:
                 sell_venue=sell_venue.name,
                 input_lamports=input_lamports,
                 guaranteed_token_amount=guaranteed_tokens,
-                estimated_net_profit_lamports=net_after_priority,
+                estimated_net_profit_lamports=final_profit.net_profit_atomic,
                 reason=reason,
                 settlement_status=settlement_state,
                 transaction_signatures=signatures,
+                priority_fee_lamports=buy_priority + sell_priority,
+                jito_tip_lamports=selected_tip,
             )
 
         return LiveExecutionResult(
@@ -427,8 +550,10 @@ class ArbitrageLiveExecutor:
             sell_venue=sell_venue.name,
             input_lamports=input_lamports,
             guaranteed_token_amount=guaranteed_tokens,
-            estimated_net_profit_lamports=net_after_priority,
+            estimated_net_profit_lamports=final_profit.net_profit_atomic,
             reason="settled",
             settlement_status=settlement_state,
             transaction_signatures=signatures,
+            priority_fee_lamports=buy_priority + sell_priority,
+            jito_tip_lamports=selected_tip,
         )

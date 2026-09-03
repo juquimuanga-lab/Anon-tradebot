@@ -30,6 +30,23 @@ class JitoClient:
     async def get_tip_accounts(self) -> list[str]:
         return list(await self._rpc("/api/v1/getTipAccounts", "getTipAccounts", []))
 
+    async def get_tip_floor(self, url: str) -> dict[str, float]:
+        """Return the latest Jito landed-tip percentile data."""
+        async with httpx.AsyncClient(timeout=self._timeout) as client:
+            response = await client.get(url)
+        if response.status_code != 200:
+            raise JitoError(f"Jito tip floor HTTP {response.status_code}: {response.text[:300]}")
+        payload = response.json()
+        if not isinstance(payload, list) or not payload or not isinstance(payload[0], dict):
+            raise JitoError("Jito tip floor returned an unexpected payload")
+        values: dict[str, float] = {}
+        for key, value in payload[0].items():
+            try:
+                values[str(key)] = float(value)
+            except (TypeError, ValueError):
+                continue
+        return values
+
     async def send_bundle(self, signed_transactions_b64: list[str]) -> str:
         if not signed_transactions_b64:
             raise ValueError("bundle must contain at least one transaction")
