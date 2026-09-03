@@ -26,26 +26,33 @@ async def test_live_wallet_balance_uses_shared_rpc_helper(monkeypatch):
     assert calls[0][1] == "getBalance"
 
 
-def test_jupiter_bundle_uses_economical_priority_defaults(monkeypatch):
+def test_jupiter_bundle_uses_supported_economical_priority_defaults(monkeypatch):
     monkeypatch.delenv("ARBITRAGE_LIVE_PRIORITY_LEVEL", raising=False)
     monkeypatch.delenv("ARBITRAGE_LIVE_MAX_PRIORITY_FEE_LAMPORTS", raising=False)
     from app.arbitrage.jupiter_bundle import _priority_fee_config
 
     assert _priority_fee_config() == {
         "priorityLevelWithMaxLamports": {
-            "priorityLevel": "low",
+            "priorityLevel": "medium",
             "maxLamports": 100000,
         }
     }
 
 
+def test_jupiter_bundle_rejects_unsupported_low_priority_level(monkeypatch):
+    monkeypatch.setenv("ARBITRAGE_LIVE_PRIORITY_LEVEL", "low")
+    from app.arbitrage.jupiter_bundle import _priority_fee_config
+
+    assert _priority_fee_config()["priorityLevelWithMaxLamports"]["priorityLevel"] == "medium"
+
+
 def test_jupiter_bundle_priority_policy_is_overridable(monkeypatch):
-    monkeypatch.setenv("ARBITRAGE_LIVE_PRIORITY_LEVEL", "medium")
+    monkeypatch.setenv("ARBITRAGE_LIVE_PRIORITY_LEVEL", "high")
     monkeypatch.setenv("ARBITRAGE_LIVE_MAX_PRIORITY_FEE_LAMPORTS", "50000")
     from app.arbitrage.jupiter_bundle import _priority_fee_config
 
     assert _priority_fee_config()["priorityLevelWithMaxLamports"] == {
-        "priorityLevel": "medium",
+        "priorityLevel": "high",
         "maxLamports": 50000,
     }
 

@@ -82,16 +82,15 @@ async def _load_lookup_tables(
 
 
 def _priority_fee_config() -> dict[str, Any]:
-    """Return an economical Jupiter priority-fee policy for small arb trades.
+    """Return a Jupiter-supported economical priority-fee policy.
 
-    Jito bundle selection is driven by the Jito tip, while Solana priority fees
-    are still paid by the transactions. A veryHigh 1 SOL cap per leg can make
-    small positive spreads uneconomic, so use a lower default and expose both
-    controls as environment variables.
+    Jupiter's Swap V1 API accepts medium, high, or veryHigh for
+    priorityLevelWithMaxLamports. There is no "low" level, so any invalid
+    configured value falls back to medium, the lowest supported level.
     """
-    level = os.getenv("ARBITRAGE_LIVE_PRIORITY_LEVEL", "low").strip()
-    if level not in {"low", "medium", "high", "veryHigh"}:
-        level = "low"
+    level = os.getenv("ARBITRAGE_LIVE_PRIORITY_LEVEL", "medium").strip()
+    if level not in {"medium", "high", "veryHigh"}:
+        level = "medium"
     try:
         max_lamports = int(
             os.getenv("ARBITRAGE_LIVE_MAX_PRIORITY_FEE_LAMPORTS", "100000")
@@ -133,8 +132,12 @@ async def _build(
     async with httpx.AsyncClient(base_url=base_url.rstrip("/"), timeout=timeout_seconds) as client:
         response = await client.post("/swap-instructions", json=body, headers=headers)
     if response.status_code != 200:
+        detail = response.text.strip().replace("\n", " ")
+        if len(detail) > 500:
+            detail = detail[:500] + "..."
+        suffix = f": {detail}" if detail else ""
         raise JupiterInstructionBuildError(
-            f"Jupiter swap-instructions failed: HTTP {response.status_code}"
+            f"Jupiter swap-instructions failed: HTTP {response.status_code}{suffix}"
         )
     payload = response.json()
     if payload.get("error"):
