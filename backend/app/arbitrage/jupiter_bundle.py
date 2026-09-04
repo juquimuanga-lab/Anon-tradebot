@@ -81,23 +81,23 @@ async def _load_lookup_tables(
     return lookup_tables
 
 
-def _priority_fee_config() -> dict[str, Any]:
-    """Return a Jupiter-supported economical priority-fee policy.
+def _priority_fee_config(max_lamports: int | None = None) -> dict[str, Any]:
+    """Return a Jupiter-supported priority-fee policy with an optional cap.
 
-    Jupiter's Swap V1 API accepts medium, high, or veryHigh for
-    priorityLevelWithMaxLamports. There is no "low" level, so any invalid
-    configured value falls back to medium, the lowest supported level.
+    The live executor can provide an opportunity-specific cap so a small spread
+    cannot be consumed by priority fees before the Jito tip is considered.
     """
     level = os.getenv("ARBITRAGE_LIVE_PRIORITY_LEVEL", "medium").strip()
     if level not in {"medium", "high", "veryHigh"}:
         level = "medium"
-    try:
-        max_lamports = int(
-            os.getenv("ARBITRAGE_LIVE_MAX_PRIORITY_FEE_LAMPORTS", "100000")
-        )
-    except ValueError:
-        max_lamports = 100000
-    max_lamports = max(1000, min(max_lamports, 1_000_000))
+    if max_lamports is None:
+        try:
+            max_lamports = int(
+                os.getenv("ARBITRAGE_LIVE_MAX_PRIORITY_FEE_LAMPORTS", "100000")
+            )
+        except ValueError:
+            max_lamports = 100000
+    max_lamports = max(1000, min(int(max_lamports), 1_000_000))
     return {
         "priorityLevelWithMaxLamports": {
             "priorityLevel": level,
@@ -117,6 +117,7 @@ async def _build(
     tip_account: str | None,
     tip_lamports: int,
     timeout_seconds: float,
+    max_priority_fee_lamports: int | None = None,
 ) -> tuple[bytes, int]:
     headers = {"Content-Type": "application/json"}
     if api_key:
@@ -127,7 +128,7 @@ async def _build(
         "wrapAndUnwrapSol": True,
         "useSharedAccounts": True,
         "dynamicComputeUnitLimit": True,
-        "prioritizationFeeLamports": _priority_fee_config(),
+        "prioritizationFeeLamports": _priority_fee_config(max_priority_fee_lamports),
     }
     async with httpx.AsyncClient(base_url=base_url.rstrip("/"), timeout=timeout_seconds) as client:
         response = await client.post("/swap-instructions", json=body, headers=headers)
@@ -207,6 +208,7 @@ async def build_signed_swap_without_tip(
     rpc_url: str,
     api_key: str | None = None,
     timeout_seconds: float = 10.0,
+    max_priority_fee_lamports: int | None = None,
 ) -> tuple[bytes, int]:
     return await _build(
         base_url=base_url,
@@ -218,6 +220,7 @@ async def build_signed_swap_without_tip(
         tip_account=None,
         tip_lamports=0,
         timeout_seconds=timeout_seconds,
+        max_priority_fee_lamports=max_priority_fee_lamports,
     )
 
 
@@ -232,6 +235,7 @@ async def build_signed_swap_with_tip(
     tip_lamports: int,
     api_key: str | None = None,
     timeout_seconds: float = 10.0,
+    max_priority_fee_lamports: int | None = None,
 ) -> tuple[bytes, int]:
     if tip_lamports < 1000:
         raise JupiterInstructionBuildError("Jito tip must be at least 1000 lamports")
@@ -245,4 +249,5 @@ async def build_signed_swap_with_tip(
         tip_account=tip_account,
         tip_lamports=tip_lamports,
         timeout_seconds=timeout_seconds,
+        max_priority_fee_lamports=max_priority_fee_lamports,
     )

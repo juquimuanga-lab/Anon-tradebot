@@ -79,3 +79,26 @@ def max_affordable_jito_tip(
         - max(priority_fee_atomic, 0)
         - 1,
     )
+
+
+def max_affordable_priority_budget(
+    *,
+    gross_profit_atomic: int,
+    venue_cost_atomic_value: int,
+    base_fee_atomic: int,
+    jito_tip_atomic: int = MIN_JITO_TIP_LAMPORTS,
+) -> int:
+    """Return total priority-fee budget while preserving a positive net.
+
+    This is an execution-budget calculation, not a new profitability floor.
+    It simply prevents Jupiter from being asked to spend more priority fee than
+    the opportunity can afford after real base fees and the minimum Jito tip.
+    """
+    return max(
+        0,
+        gross_profit_atomic
+        - max(venue_cost_atomic_value, 0)
+        - max(base_fee_atomic, 0)
+        - max(jito_tip_atomic, MIN_JITO_TIP_LAMPORTS)
+        - 1,
+    )
