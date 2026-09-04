@@ -1,10 +1,15 @@
-"""Minimal Jito Block Engine client for atomic arbitrage bundles."""
+"""Jito Block Engine client with optional regional failover."""
 from __future__ import annotations
 
 import asyncio
+import os
 from typing import Any
 
 import httpx
+
+
+DEFAULT_JITO_BLOCK_ENGINE_URL = "https://mainnet.block-engine.jito.wtf"
+RETRYABLE_HTTP_STATUS_CODES = {429, 502, 503, 504}
 
 
 class JitoError(RuntimeError):
@@ -12,20 +17,67 @@ class JitoError(RuntimeError):
 
 
 class JitoClient:
-    def __init__(self, base_url: str, timeout_seconds: float = 8.0) -> None:
-        self._base_url = base_url.rstrip("/")
+    def __init__(
+        self,
+        base_url: str,
+        timeout_seconds: float = 8.0,
+        fallback_urls: list[str] | None = None,
+    ) -> None:
+        """Create a Jito client with primary-first regional failover.
+
+        ``JITO_BLOCK_ENGINE_URLS`` may contain a comma-separated ordered list
+        of regional endpoints. The primary ``base_url`` is always tried first;
+        fallback regions are only used for transport failures and retryable
+        HTTP responses. This keeps the normal path unchanged while making a
+        regional outage/rate-limit less likely to strand a live opportunity.
+        """
+        configured = os.getenv("JITO_BLOCK_ENGINE_URLS", "").strip()
+        configured_urls = [item.strip().rstrip("/") for item in configured.split(",") if item.strip()]
+        primary = base_url.rstrip("/") if base_url else DEFAULT_JITO_BLOCK_ENGINE_URL
+        candidates = [primary]
+        candidates.extend(configured_urls)
+        candidates.extend(item.rstrip("/") for item in (fallback_urls or []) if item)
+        self._base_urls = tuple(dict.fromkeys(candidates))
+        self._base_url = self._base_urls[0]
         self._timeout = timeout_seconds
+
+    @property
+    def base_urls(self) -> tuple[str, ...]:
+        return self._base_urls
 
     async def _rpc(self, path: str, method: str, params: list[Any]) -> Any:
         payload = {"jsonrpc": "2.0", "id": 1, "method": method, "params": params}
-        async with httpx.AsyncClient(timeout=self._timeout) as client:
-            response = await client.post(f"{self._base_url}{path}", json=payload)
-        if response.status_code != 200:
-            raise JitoError(f"Jito HTTP {response.status_code}: {response.text[:500]}")
-        body = response.json()
-        if body.get("error"):
-            raise JitoError(f"Jito {method} error: {body['error']}")
-        return body.get("result")
+        failures: list[str] = []
+
+        for index, base_url in enumerate(self._base_urls):
+            try:
+                async with httpx.AsyncClient(timeout=self._timeout) as client:
+                    response = await client.post(f"{base_url}{path}", json=payload)
+            except (httpx.TimeoutException, httpx.NetworkError, httpx.RemoteProtocolError) as exc:
+                failures.append(f"{base_url}: {type(exc).__name__}: {exc}")
+                if index + 1 < len(self._base_urls):
+                    continue
+                raise JitoError("Jito transport failure: " + " | ".join(failures)) from exc
+
+            if response.status_code in RETRYABLE_HTTP_STATUS_CODES and index + 1 < len(self._base_urls):
+                failures.append(f"{base_url}: HTTP {response.status_code}")
+                continue
+            if response.status_code != 200:
+                detail = response.text[:500].replace("\n", " ")
+                raise JitoError(
+                    f"Jito HTTP {response.status_code}"
+                    + (f": {detail}" if detail else "")
+                )
+
+            body = response.json()
+            if body.get("error"):
+                # JSON-RPC errors are normally request-specific rather than a
+                # regional transport failure, so do not silently duplicate a
+                # potentially valid bundle submission.
+                raise JitoError(f"Jito {method} error: {body['error']}")
+            return body.get("result")
+
+        raise JitoError("Jito request failed: " + " | ".join(failures))
 
     async def get_tip_accounts(self) -> list[str]:
         return list(await self._rpc("/api/v1/getTipAccounts", "getTipAccounts", []))
