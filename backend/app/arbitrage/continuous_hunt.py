@@ -15,6 +15,7 @@ from typing import Awaitable, Callable
 from app.arbitrage.discovery import ArbitrageDiscovery, DiscoveryResult
 from app.arbitrage.hunt import ArbitrageHunter, HuntCandidate, HuntResult
 from app.arbitrage.hotlist import configured_hotlist_mints
+from app.arbitrage.telemetry import telemetry, timed
 
 DEFAULT_INTERVAL_SECONDS = 10.0
 DEFAULT_HOTLIST_INTERVAL_SECONDS = 1.5
@@ -136,7 +137,9 @@ class ContinuousArbitrageHunt:
         on_profitable: Callable[[HuntResult], Awaitable[None]] | None,
     ) -> None:
         while not self._stop_event.is_set():
+            cycle_started = asyncio.get_running_loop().time()
             self._cycles += 1
+            telemetry.increment("hunt_cycles")
 
             # Hotlist pass: every known productive mint is checked directly
             # and frequently, independent of broad DexScreener filters.
@@ -150,12 +153,15 @@ class ContinuousArbitrageHunt:
                 try:
                     hunter = ArbitrageHunter()
                     self._global_scans += 1
-                    global_result = await hunter.hunt(limit)
+                    with timed(telemetry, "global_hunt_ms"):
+                        global_result = await hunter.hunt(limit)
                     await self._notify_new_opportunities(global_result, on_profitable)
                     self._last_global_result = global_result
+                    telemetry.increment("global_hunt_successes")
                 except asyncio.CancelledError:
                     raise
                 except Exception:
+                    telemetry.increment("global_hunt_errors")
                     # A failed global cycle must not kill the 24/7 watcher.
                     pass
                 finally:
@@ -165,6 +171,10 @@ class ContinuousArbitrageHunt:
                         except Exception:
                             pass
 
+            telemetry.observe(
+                "hunt_cycle_ms",
+                (asyncio.get_running_loop().time() - cycle_started) * 1000.0,
+            )
             try:
                 await asyncio.wait_for(self._stop_event.wait(), timeout=_interval_seconds())
             except asyncio.TimeoutError:
@@ -184,6 +194,7 @@ class ContinuousArbitrageHunt:
         candidates: list[HuntCandidate] = []
         discovery = ArbitrageDiscovery()
         self._hotlist_scans += 1
+        telemetry.increment("hotlist_scans")
         try:
             for mint in mints:
                 candidate = HuntCandidate(
@@ -199,14 +210,17 @@ class ContinuousArbitrageHunt:
                 )
                 candidates.append(candidate)
                 try:
-                    result = await discovery.discover(mint, sizes_sol=_hunt_sizes())
+                    with timed(telemetry, "hotlist_discovery_ms"):
+                        result = await discovery.discover(mint, sizes_sol=_hunt_sizes())
                     discoveries.append((candidate, result))
+                    telemetry.increment("hotlist_discoveries")
                     await self._notify_new_opportunities(
                         HuntResult((candidate,), ((candidate, result),)), on_profitable
                     )
                 except asyncio.CancelledError:
                     raise
                 except Exception as exc:
+                    telemetry.increment("hotlist_discovery_errors")
                     errors.append(f"{mint[:8]}: {exc}")
                 if not self._stop_event.is_set():
                     try:
@@ -241,9 +255,11 @@ class ContinuousArbitrageHunt:
                 continue
             try:
                 await on_profitable(HuntResult((candidate,), ((candidate, discovery),)))
+                telemetry.increment("profitable_opportunity_callbacks")
             except asyncio.CancelledError:
                 raise
             except Exception:
+                telemetry.increment("profitable_opportunity_callback_errors")
                 # Leave the key unmarked when the callback fails so the next
                 # discovery cycle can retry it. This is especially important
                 # for live execution, where a stale quote, temporary RPC issue,
