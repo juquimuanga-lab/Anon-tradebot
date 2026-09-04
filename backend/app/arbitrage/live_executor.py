@@ -18,6 +18,7 @@ from app.arbitrage.fee_model import (
     MIN_JITO_TIP_LAMPORTS,
     calculate_profitability,
     max_affordable_jito_tip,
+    max_affordable_priority_budget,
 )
 from app.arbitrage.jupiter_bundle import (
     JupiterInstructionBuildError,
@@ -387,6 +388,21 @@ class ArbitrageLiveExecutor:
                 base_fee_atomic=DEFAULT_BUNDLE_BASE_FEE_LAMPORTS,
             )
 
+            market_tip = await self._dynamic_jito_tip_lamports()
+            priority_budget = max_affordable_priority_budget(
+                gross_profit_atomic=base_profit.gross_profit_atomic,
+                venue_cost_atomic_value=base_profit.venue_cost_atomic,
+                base_fee_atomic=base_profit.base_fee_atomic,
+                jito_tip_atomic=market_tip,
+            )
+            configured_priority_cap = max(1000, min(int(os.getenv("ARBITRAGE_LIVE_MAX_PRIORITY_FEE_LAMPORTS", "100000")), 1_000_000))
+            per_leg_priority_cap = min(
+                configured_priority_cap,
+                max(1000, priority_budget // 2),
+            )
+            telemetry.observe("live_priority_budget_lamports", float(priority_budget))
+            telemetry.observe("live_priority_per_leg_cap_lamports", float(per_leg_priority_cap))
+
             try:
                 tip_accounts = await self._jito.get_tip_accounts()
                 if not tip_accounts:
@@ -400,6 +416,7 @@ class ArbitrageLiveExecutor:
                         keypair=keypair,
                         rpc_url=rpc_url,
                         api_key=os.getenv("JUPITER_API_KEY"),
+                        max_priority_fee_lamports=per_leg_priority_cap,
                     )
                     _, sell_priority_estimate = await build_signed_swap_without_tip(
                         base_url=settings.jupiter_base_url,
@@ -408,6 +425,7 @@ class ArbitrageLiveExecutor:
                         keypair=keypair,
                         rpc_url=rpc_url,
                         api_key=os.getenv("JUPITER_API_KEY"),
+                        max_priority_fee_lamports=per_leg_priority_cap,
                     )
             except JupiterInstructionBuildError as exc:
                 raise ArbitrageLiveExecutionError(str(exc)) from exc
@@ -434,7 +452,6 @@ class ArbitrageLiveExecutor:
                     jito_tip_lamports=0,
                 )
 
-            market_tip = await self._dynamic_jito_tip_lamports()
             selected_tip = min(market_tip, max_tip)
             if selected_tip < MIN_JITO_TIP_LAMPORTS:
                 telemetry.increment("live_tip_market_rejections")
@@ -483,6 +500,7 @@ class ArbitrageLiveExecutor:
                         tip_account=tip_account,
                         tip_lamports=selected_tip,
                         api_key=os.getenv("JUPITER_API_KEY"),
+                        max_priority_fee_lamports=per_leg_priority_cap,
                     )
             except JupiterInstructionBuildError as exc:
                 raise ArbitrageLiveExecutionError(str(exc)) from exc
@@ -532,8 +550,6 @@ class ArbitrageLiveExecutor:
                     jito_tip_lamports=selected_tip,
                 )
 
-            # Simulate both legs. The second leg contains the exact selected Jito
-            # tip, so a successful buy-only simulation is not sufficient.
             await self._simulate(rpc_url, buy_signed)
             await self._simulate(rpc_url, sell_signed)
 
