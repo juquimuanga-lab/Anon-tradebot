@@ -33,5 +33,24 @@ def test_positive_int_rejects_missing_or_non_positive_values():
 
 def test_positive_int_accepts_jupiter_atomic_amount():
     assert ArbitrageLiveExecutor._positive_int(
-        {"otherAmountThreshold": "123456"}, "otherAmountThreshold", "quote"
-    ) == 123456
+        {"otherAmountThreshold": "12345"}, "otherAmountThreshold", "quote"
+    ) == 12345
+
+
+def test_bundle_reconciliation_rejects_bundle_error():
+    import asyncio
+
+    async def run():
+        ok, reason, signatures = await ArbitrageLiveExecutor()._reconcile_landed_bundle(
+            "https://rpc.example",
+            {
+                "confirmationStatus": "confirmed",
+                "err": {"InstructionError": [0, "Custom"]},
+                "transactions": ["sig1", "sig2"],
+            },
+        )
+        assert ok is False
+        assert reason.startswith("bundle_error:")
+        assert signatures == ("sig1", "sig2")
+
+    asyncio.run(run())
