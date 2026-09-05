@@ -39,9 +39,12 @@ def _hotlist_interval_seconds() -> float:
 
 
 def _hunt_sizes() -> tuple[float, ...]:
-    raw = os.getenv("ARBITRAGE_HUNT_DISCOVERY_SIZES_SOL", "").strip()
+    raw = os.getenv(
+        "ARBITRAGE_HUNT_DISCOVERY_SIZES_SOL",
+        "0.02,0.04,0.10,0.50,1.00",
+    ).strip()
     if not raw:
-        return (0.02, 0.10, 0.50)
+        return (0.02, 0.04, 0.10, 0.50, 1.00)
     values: list[float] = []
     for item in raw.split(","):
         try:
@@ -50,7 +53,7 @@ def _hunt_sizes() -> tuple[float, ...]:
             continue
         if value > 0:
             values.append(value)
-    return tuple(dict.fromkeys(values)) or (0.02, 0.10, 0.50)
+    return tuple(dict.fromkeys(values)) or (0.02, 0.04, 0.10, 0.50, 1.00)
 
 
 @dataclass(frozen=True)
@@ -80,41 +83,34 @@ class ContinuousArbitrageHunt:
         self._global_scans = 0
         self._last_hotlist_result: HuntResult | None = None
         self._last_global_result: HuntResult | None = None
+        self._last_notified_keys: set[str] = set()
         self._lock = asyncio.Lock()
-        self._alerted: set[tuple[str, float, str, str]] = set()
-
-    @property
-    def status(self) -> ContinuousHuntStatus:
-        return ContinuousHuntStatus(
-            self.running,
-            self._cycles,
-            configured_hotlist_mints(),
-            self._hotlist_scans,
-            self._global_scans,
-            self._last_hotlist_result,
-            self._last_global_result,
-        )
 
     @property
     def running(self) -> bool:
         return self._task is not None and not self._task.done()
 
+    def status(self) -> ContinuousHuntStatus:
+        return ContinuousHuntStatus(
+            running=self.running,
+            cycles=self._cycles,
+            hotlist_mints=tuple(configured_hotlist_mints()),
+            hotlist_scans=self._hotlist_scans,
+            global_scans=self._global_scans,
+            last_hotlist_result=self._last_hotlist_result,
+            last_global_result=self._last_global_result,
+        )
+
     async def start(
         self,
-        limit: int | None = None,
+        bot,
         on_profitable: Callable[[HuntResult], Awaitable[None]] | None = None,
     ) -> bool:
         async with self._lock:
             if self.running:
                 return False
             self._stop_event = asyncio.Event()
-            self._cycles = 0
-            self._hotlist_scans = 0
-            self._global_scans = 0
-            self._last_hotlist_result = None
-            self._last_global_result = None
-            self._alerted.clear()
-            self._task = asyncio.create_task(self._run(limit, on_profitable))
+            self._task = asyncio.create_task(self._run(bot, on_profitable))
             return True
 
     async def stop(self) -> bool:
@@ -123,119 +119,11 @@ class ContinuousArbitrageHunt:
                 return False
             self._stop_event.set()
             task = self._task
-            self._task = None
-        task.cancel()
         try:
             await task
         except asyncio.CancelledError:
             pass
         return True
-
-    async def _run(
-        self,
-        limit: int | None,
-        on_profitable: Callable[[HuntResult], Awaitable[None]] | None,
-    ) -> None:
-        while not self._stop_event.is_set():
-            cycle_started = asyncio.get_running_loop().time()
-            self._cycles += 1
-            telemetry.increment("hunt_cycles")
-
-            # Hotlist pass: every known productive mint is checked directly
-            # and frequently, independent of broad DexScreener filters.
-            hotlist_result = await self._scan_hotlist(limit, on_profitable)
-            self._last_hotlist_result = hotlist_result
-
-            # Keep global discovery as a secondary source so the bot can still
-            # discover new opportunities without starving the proven hotlist.
-            if not self._stop_event.is_set():
-                hunter: ArbitrageHunter | None = None
-                try:
-                    hunter = ArbitrageHunter()
-                    self._global_scans += 1
-                    with timed(telemetry, "global_hunt_ms"):
-                        global_result = await hunter.hunt(limit)
-                    await self._notify_new_opportunities(global_result, on_profitable)
-                    self._last_global_result = global_result
-                    telemetry.increment("global_hunt_successes")
-                except asyncio.CancelledError:
-                    raise
-                except Exception:
-                    telemetry.increment("global_hunt_errors")
-                    # A failed global cycle must not kill the 24/7 watcher.
-                    pass
-                finally:
-                    if hunter is not None:
-                        try:
-                            await hunter.close()
-                        except Exception:
-                            pass
-
-            telemetry.observe(
-                "hunt_cycle_ms",
-                (asyncio.get_running_loop().time() - cycle_started) * 1000.0,
-            )
-            try:
-                await asyncio.wait_for(self._stop_event.wait(), timeout=_interval_seconds())
-            except asyncio.TimeoutError:
-                continue
-
-    async def _scan_hotlist(
-        self,
-        limit: int | None,
-        on_profitable: Callable[[HuntResult], Awaitable[None]] | None,
-    ) -> HuntResult:
-        mints = configured_hotlist_mints()
-        if limit is not None:
-            mints = mints[:limit]
-
-        discoveries: list[tuple[HuntCandidate, DiscoveryResult]] = []
-        errors: list[str] = []
-        candidates: list[HuntCandidate] = []
-        discovery = ArbitrageDiscovery()
-        self._hotlist_scans += 1
-        telemetry.increment("hotlist_scans")
-        try:
-            for mint in mints:
-                candidate = HuntCandidate(
-                    token_mint=mint,
-                    symbol=mint[:8],
-                    name="Hotlist token",
-                    liquidity_usd=0.0,
-                    volume_24h_usd=0.0,
-                    dex_count=0,
-                    score=0.0,
-                    tier="HOT",
-                    hotlist=True,
-                )
-                candidates.append(candidate)
-                try:
-                    with timed(telemetry, "hotlist_discovery_ms"):
-                        result = await discovery.discover(mint, sizes_sol=_hunt_sizes())
-                    discoveries.append((candidate, result))
-                    telemetry.increment("hotlist_discoveries")
-                    await self._notify_new_opportunities(
-                        HuntResult((candidate,), ((candidate, result),)), on_profitable
-                    )
-                except asyncio.CancelledError:
-                    raise
-                except Exception as exc:
-                    telemetry.increment("hotlist_discovery_errors")
-                    errors.append(f"{mint[:8]}: {exc}")
-                if not self._stop_event.is_set():
-                    try:
-                        await asyncio.wait_for(self._stop_event.wait(), timeout=_hotlist_interval_seconds())
-                    except asyncio.TimeoutError:
-                        pass
-        finally:
-            await discovery.close()
-
-        discoveries.sort(key=lambda item: (
-            bool(item[1].opportunity and item[1].opportunity.executable),
-            item[1].opportunity.net_profit_atomic if item[1].opportunity else -1,
-            item[1].opportunity.net_profit_bps if item[1].opportunity else float("-inf"),
-        ), reverse=True)
-        return HuntResult(tuple(candidates), tuple(discoveries), tuple(errors))
 
     async def _notify_new_opportunities(
         self,
@@ -244,35 +132,67 @@ class ContinuousArbitrageHunt:
     ) -> None:
         if on_profitable is None:
             return
-        for candidate, discovery in result.discoveries:
-            opportunity = discovery.opportunity
-            if opportunity is None or not opportunity.executable:
-                continue
-            buy_route = discovery.buy_quote.route_id if discovery.buy_quote else "unknown"
-            sell_route = discovery.sell_quote.route_id if discovery.sell_quote else "unknown"
-            key = (candidate.token_mint, discovery.amount_sol, buy_route, sell_route)
-            if key in self._alerted:
-                continue
-            try:
-                await on_profitable(HuntResult((candidate,), ((candidate, discovery),)))
-                telemetry.increment("profitable_opportunity_callbacks")
-            except asyncio.CancelledError:
-                raise
-            except Exception:
-                telemetry.increment("profitable_opportunity_callback_errors")
-                # Leave the key unmarked when the callback fails so the next
-                # discovery cycle can retry it. This is especially important
-                # for live execution, where a stale quote, temporary RPC issue,
-                # or per-admin wallet refusal may safely reject one attempt.
-                continue
-            self._alerted.add(key)
+        profitable = [candidate for candidate in result.candidates if candidate.executable]
+        if not profitable:
+            return
+        fresh = [
+            candidate
+            for candidate in profitable
+            if candidate.key not in self._last_notified_keys
+        ]
+        if not fresh:
+            return
+        try:
+            await on_profitable(
+                HuntResult(
+                    candidates=tuple(fresh),
+                    scanned_mints=result.scanned_mints,
+                    duration_ms=result.duration_ms,
+                )
+            )
+        except Exception:
+            telemetry.increment("continuous_hunt_callback_errors")
+            raise
+        for candidate in fresh:
+            self._last_notified_keys.add(candidate.key)
 
+    async def _run(
+        self,
+        bot,
+        on_profitable: Callable[[HuntResult], Awaitable[None]] | None,
+    ) -> None:
+        hunter = ArbitrageHunter()
+        discovery = ArbitrageDiscovery()
+        last_hotlist_at = 0.0
+        try:
+            while not self._stop_event.is_set():
+                self._cycles += 1
+                now = asyncio.get_running_loop().time()
+                hotlist = configured_hotlist_mints()
+                if hotlist and now - last_hotlist_at >= _hotlist_interval_seconds():
+                    with timed(telemetry, "continuous_hotlist_scan_ms"):
+                        result = await hunter.scan(
+                            sizes_sol=_hunt_sizes(),
+                            mints=hotlist,
+                        )
+                    self._hotlist_scans += 1
+                    self._last_hotlist_result = result
+                    last_hotlist_at = now
+                    await self._notify_new_opportunities(result, on_profitable)
 
-def _has_executable(result: HuntResult) -> bool:
-    return any(
-        discovery.opportunity is not None and discovery.opportunity.executable
-        for _, discovery in result.discoveries
-    )
+                with timed(telemetry, "continuous_global_scan_ms"):
+                    result = await hunter.scan(
+                        sizes_sol=_hunt_sizes(),
+                    )
+                self._global_scans += 1
+                self._last_global_result = result
+                await self._notify_new_opportunities(result, on_profitable)
 
-
-continuous_hunt = ContinuousArbitrageHunt()
+                try:
+                    await asyncio.wait_for(
+                        self._stop_event.wait(), timeout=_interval_seconds()
+                    )
+                except asyncio.TimeoutError:
+                    continue
+        finally:
+            self._task = None
