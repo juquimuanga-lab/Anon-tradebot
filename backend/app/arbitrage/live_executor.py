@@ -74,7 +74,7 @@ class ArbitrageLiveExecutor:
             os.getenv("ARBITRAGE_LIVE_TRADING_ENABLED", "false").lower() == "true"
         )
         self._max_trade_lamports = int(
-            Decimal(os.getenv("ARBITRAGE_LIVE_MAX_SOL", "0.10")) * LAMPORTS_PER_SOL
+            Decimal(os.getenv("ARBITRAGE_LIVE_MAX_SOL", "1.00")) * LAMPORTS_PER_SOL
         )
         self._reserve_lamports = int(
             Decimal(os.getenv("ARBITRAGE_LIVE_RESERVE_SOL", "0.02")) * LAMPORTS_PER_SOL
@@ -84,12 +84,12 @@ class ArbitrageLiveExecutor:
         )
         self._fallback_tip_lamports = max(
             MIN_JITO_TIP_LAMPORTS,
-            int(os.getenv("ARBITRAGE_LIVE_JITO_FALLBACK_TIP_LAMPORTS", "100000")),
+            int(os.getenv("ARBITRAGE_LIVE_JITO_FALLBACK_TIP_LAMPORTS", "1000")),
         )
         try:
-            percentile = int(os.getenv("ARBITRAGE_LIVE_JITO_TIP_PERCENTILE", "50"))
+            percentile = int(os.getenv("ARBITRAGE_LIVE_JITO_TIP_PERCENTILE", "25"))
         except ValueError:
-            percentile = 50
+            percentile = 25
         self._tip_percentile = min(99, max(25, percentile))
         try:
             multiplier = float(os.getenv("ARBITRAGE_LIVE_JITO_TIP_MULTIPLIER", "1.0"))

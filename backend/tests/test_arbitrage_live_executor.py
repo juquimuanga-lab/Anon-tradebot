@@ -15,11 +15,11 @@ def test_live_execution_can_only_be_armed_explicitly(monkeypatch):
     assert executor.live_enabled is True
 
 
-def test_default_trade_size_limit_is_small(monkeypatch):
+def test_default_trade_size_limit_is_one_sol(monkeypatch):
     monkeypatch.setenv("ARBITRAGE_LIVE_TRADING_ENABLED", "true")
     monkeypatch.delenv("ARBITRAGE_LIVE_MAX_SOL", raising=False)
     executor = ArbitrageLiveExecutor()
-    assert executor._max_trade_lamports == 100_000_000
+    assert executor._max_trade_lamports == 1_000_000_000
 
 
 def test_positive_int_rejects_missing_or_non_positive_values():

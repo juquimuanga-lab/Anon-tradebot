@@ -39,9 +39,12 @@ def _hotlist_interval_seconds() -> float:
 
 
 def _hunt_sizes() -> tuple[float, ...]:
-    raw = os.getenv("ARBITRAGE_HUNT_DISCOVERY_SIZES_SOL", "").strip()
+    raw = os.getenv(
+        "ARBITRAGE_HUNT_DISCOVERY_SIZES_SOL",
+        "0.02,0.04,0.10,0.50,1.00",
+    ).strip()
     if not raw:
-        return (0.02, 0.10, 0.50)
+        return (0.02, 0.04, 0.10, 0.50, 1.00)
     values: list[float] = []
     for item in raw.split(","):
         try:
@@ -50,7 +53,7 @@ def _hunt_sizes() -> tuple[float, ...]:
             continue
         if value > 0:
             values.append(value)
-    return tuple(dict.fromkeys(values)) or (0.02, 0.10, 0.50)
+    return tuple(dict.fromkeys(values)) or (0.02, 0.04, 0.10, 0.50, 1.00)
 
 
 @dataclass(frozen=True)
