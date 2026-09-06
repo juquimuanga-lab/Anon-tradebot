@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 
 from telegram import Update
 from telegram.ext import ContextTypes
@@ -20,11 +21,14 @@ logger = logging.getLogger("app.arbitrage.telegram")
 
 live_executor = ArbitrageLiveExecutor()
 
-# A shared discovery result can fan out to multiple independent admin wallets.
-# Keep concurrency bounded so a single hot opportunity cannot create an
-# unbounded number of simultaneous bundle submissions.
 _LIVE_EXECUTION_SEMAPHORE = asyncio.Semaphore(4)
 _ADMIN_EXECUTION_LOCKS: dict[int, asyncio.Lock] = {}
+_LIVE_REQUOTE_RETRY_DELAY_SECONDS = max(
+    0.05, float(os.getenv("ARBITRAGE_LIVE_REQUOTE_RETRY_DELAY_SECONDS", "0.25"))
+)
+_LIVE_REQUOTE_MAX_ATTEMPTS = max(
+    1, min(int(os.getenv("ARBITRAGE_LIVE_REQUOTE_MAX_ATTEMPTS", "2")), 3)
+)
 
 
 def _admin_execution_lock(admin_id: int) -> asyncio.Lock:
@@ -93,6 +97,23 @@ def _format_execution_diagnostics(execution, executor=None) -> str:
     )
 
 
+def _is_retryable_live_requote_failure(execution) -> bool:
+    """Retry only when the fresh quote itself is negative before any Jito tip."""
+    return (
+        not execution.success
+        and execution.reason == "jito_tip_profit_gate_failed"
+        and int(execution.estimated_net_profit_lamports or 0) < 0
+        and int(execution.jito_tip_lamports or 0) == 0
+    )
+
+
+def _display_execution_reason(execution) -> str:
+    """Avoid blaming Jito when the live re-quote is already unprofitable."""
+    if _is_retryable_live_requote_failure(execution):
+        return "live_requote_profitability_failed"
+    return execution.reason
+
+
 async def _notify_observe(result: HuntResult, update: Update) -> None:
     message = _format_alert(result)
     if message and update.effective_chat:
@@ -103,12 +124,7 @@ async def _notify_observe(result: HuntResult, update: Update) -> None:
 
 
 async def _live_admin_ids() -> list[int]:
-    """Return admins that are independently armed for live arbitrage.
-
-    Each admin must have its own persistent BotState in live mode, trading
-    enabled, and its own Solana wallet secret. No admin is selected based on
-    who originally started `/arblive`.
-    """
+    """Return admins that are independently armed for live arbitrage."""
     eligible: list[int] = []
     for raw_admin_id in settings.telegram_admin_ids:
         admin_id = int(raw_admin_id)
@@ -125,13 +141,7 @@ async def _live_admin_ids() -> list[int]:
     return eligible
 
 
-async def _execute_for_admin(
-    *,
-    bot,
-    admin_id: int,
-    candidate,
-    discovery,
-) -> None:
+async def _execute_for_admin(*, bot, admin_id: int, candidate, discovery) -> None:
     """Execute one discovered opportunity using exactly one admin wallet."""
     message = (
         _format_alert(HuntResult((candidate,), ((candidate, discovery),)))
@@ -151,11 +161,29 @@ async def _execute_for_admin(
                     parse_mode="Markdown",
                 )
 
-                execution = await live_executor.execute_unrestricted(
-                    owner_user_id=admin_id,
-                    token_mint=candidate.token_mint,
-                    amount_sol=discovery.amount_sol,
-                )
+                execution = None
+                for attempt in range(1, _LIVE_REQUOTE_MAX_ATTEMPTS + 1):
+                    execution = await live_executor.execute_unrestricted(
+                        owner_user_id=admin_id,
+                        token_mint=candidate.token_mint,
+                        amount_sol=discovery.amount_sol,
+                    )
+                    if not _is_retryable_live_requote_failure(execution):
+                        break
+                    if attempt < _LIVE_REQUOTE_MAX_ATTEMPTS:
+                        logger.info(
+                            "arb_live_requote_retry",
+                            extra={
+                                "admin_id": admin_id,
+                                "token_mint": candidate.token_mint,
+                                "attempt": attempt,
+                                "max_attempts": _LIVE_REQUOTE_MAX_ATTEMPTS,
+                                "net_lamports": execution.estimated_net_profit_lamports,
+                            },
+                        )
+                        await asyncio.sleep(_LIVE_REQUOTE_RETRY_DELAY_SECONDS)
+
+                assert execution is not None
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
@@ -178,7 +206,7 @@ async def _execute_for_admin(
                     chat_id=admin_id,
                     text=(
                         "🛑 *Arbitrage not executed/settled*\n\n"
-                        f"Reason: `{execution.reason}`\n"
+                        f"Reason: `{_display_execution_reason(execution)}`\n"
                         f"{_format_execution_diagnostics(execution, live_executor)}\n"
                         f"Bundle: `{execution.bundle_id or 'none'}`"
                     ),
