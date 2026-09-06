@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import time
 from dataclasses import dataclass
 from typing import Optional
 
@@ -170,6 +171,8 @@ class JupiterArbitrageQuoteProvider:
             price_impact_bps=price_impact_bps,
             route_id=">".join(labels) if labels else None,
             minimum_output_amount_atomic=minimum_output_amount,
+            raw_response=payload,
+            quoted_at_monotonic=time.monotonic(),
         )
 
 
