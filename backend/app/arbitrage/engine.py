@@ -22,7 +22,9 @@ from app.arbitrage.models import ArbitrageOpportunity, Quote
 DEFAULT_MIN_PROFIT_BPS = 0.0
 DEFAULT_MIN_PROFIT_LAMPORTS = 0
 DEFAULT_MAX_PRICE_IMPACT_BPS = 80.0
-DEFAULT_MAX_SLIPPAGE_BPS = 50.0
+# Match the live executor's default slippage so discovery profitability is
+# based on the same Jupiter execution threshold that live execution uses.
+DEFAULT_MAX_SLIPPAGE_BPS = 30.0
 DEFAULT_ESTIMATED_BASE_FEE_LAMPORTS = 10_000  # 5,000 per signature x 2 legs
 DEFAULT_ESTIMATED_PRIORITY_FEE_LAMPORTS = 50_000
 DEFAULT_ESTIMATED_JITO_TIP_LAMPORTS = 100_000
@@ -69,6 +71,14 @@ class ArbitrageConfig:
         )
 
 
+def _executable_output(quote: Quote) -> int:
+    """Return the slippage-protected output that live Jupiter execution enforces."""
+    minimum = quote.minimum_output_amount_atomic
+    if minimum is not None and minimum > 0:
+        return minimum
+    return quote.output_amount_atomic
+
+
 def find_two_venue_opportunity(
     token_mint: str,
     buy_quote: Quote,
@@ -78,23 +88,25 @@ def find_two_venue_opportunity(
     """Evaluate a buy quote followed by a sell quote."""
     config = config or ArbitrageConfig.from_env()
 
-    if buy_quote.output_amount_atomic <= 0:
+    buy_output_atomic = _executable_output(buy_quote)
+    sell_output_atomic = _executable_output(sell_quote)
+
+    if buy_output_atomic <= 0:
         return _rejected(token_mint, buy_quote, sell_quote, "buy_quote_zero_output")
-    if sell_quote.output_amount_atomic <= 0:
+    if sell_output_atomic <= 0:
         return _rejected(token_mint, buy_quote, sell_quote, "sell_quote_zero_output")
-    if sell_quote.input_amount_atomic != buy_quote.output_amount_atomic:
+    if sell_quote.input_amount_atomic != buy_output_atomic:
         return _rejected(token_mint, buy_quote, sell_quote, "quote_size_mismatch")
 
     input_atomic = buy_quote.input_amount_atomic
-    gross_profit = sell_quote.output_amount_atomic - input_atomic
+    gross_profit = sell_output_atomic - input_atomic
     gross_profit_bps = gross_profit / input_atomic * 10_000 if input_atomic else 0.0
 
-    # Jupiter's quoted output already reflects the route's DEX economics, so
-    # do not subtract Quote.fee_bps a second time. Only external execution
-    # costs are estimated here and re-checked with actual built transactions.
+    # Jupiter's slippage-protected output already represents the executable
+    # minimum for the route. Do not subtract DEX fees a second time.
     breakdown = calculate_profitability(
         input_atomic=input_atomic,
-        final_output_atomic=sell_quote.output_amount_atomic,
+        final_output_atomic=sell_output_atomic,
         venue_cost_atomic_value=0,
         base_fee_atomic=config.estimated_base_fee_atomic,
         priority_fee_atomic=config.estimated_priority_fee_atomic,
@@ -111,18 +123,18 @@ def find_two_venue_opportunity(
     max_impact = max(buy_quote.price_impact_bps, sell_quote.price_impact_bps)
     if max_impact > config.max_price_impact_bps:
         return _build(
-            token_mint, buy_quote, sell_quote, gross_profit, execution_costs,
-            net_profit, net_profit_bps, gross_profit_bps, execution_cost_bps,
-            required_gross_profit_bps, config, False, "price_impact_too_high",
+            token_mint, buy_quote, sell_quote, buy_output_atomic, sell_output_atomic,
+            gross_profit, execution_costs, net_profit, net_profit_bps, gross_profit_bps,
+            execution_cost_bps, required_gross_profit_bps, config, False, "price_impact_too_high",
         )
 
     executable = net_profit > 0
     reason = "profit_threshold_met" if executable else "profit_threshold_not_met"
 
     return _build(
-        token_mint, buy_quote, sell_quote, gross_profit, execution_costs,
-        net_profit, net_profit_bps, gross_profit_bps, execution_cost_bps,
-        required_gross_profit_bps, config, executable, reason,
+        token_mint, buy_quote, sell_quote, buy_output_atomic, sell_output_atomic,
+        gross_profit, execution_costs, net_profit, net_profit_bps, gross_profit_bps,
+        execution_cost_bps, required_gross_profit_bps, config, executable, reason,
     )
 
 
@@ -144,6 +156,8 @@ def _build(
     token_mint: str,
     buy_quote: Quote,
     sell_quote: Quote,
+    buy_output_atomic: int,
+    sell_output_atomic: int,
     gross_profit: int,
     execution_costs: int,
     net_profit: int,
@@ -160,8 +174,8 @@ def _build(
         buy_venue=buy_quote.venue,
         sell_venue=sell_quote.venue,
         input_amount_atomic=buy_quote.input_amount_atomic,
-        buy_output_atomic=buy_quote.output_amount_atomic,
-        final_output_atomic=sell_quote.output_amount_atomic,
+        buy_output_atomic=buy_output_atomic,
+        final_output_atomic=sell_output_atomic,
         gross_profit_atomic=gross_profit,
         total_cost_atomic=execution_costs,
         net_profit_atomic=net_profit,
@@ -188,8 +202,8 @@ def _rejected(
         buy_venue=buy_quote.venue,
         sell_venue=sell_quote.venue,
         input_amount_atomic=buy_quote.input_amount_atomic,
-        buy_output_atomic=buy_quote.output_amount_atomic,
-        final_output_atomic=sell_quote.output_amount_atomic,
+        buy_output_atomic=_executable_output(buy_quote),
+        final_output_atomic=_executable_output(sell_quote),
         gross_profit_atomic=0,
         total_cost_atomic=0,
         net_profit_atomic=0,

@@ -143,6 +143,14 @@ class JupiterArbitrageQuoteProvider:
         if output_amount <= 0:
             return None
         try:
+            minimum_output_amount = int(payload.get("otherAmountThreshold") or 0)
+        except (TypeError, ValueError):
+            minimum_output_amount = 0
+        if minimum_output_amount <= 0:
+            raise JupiterArbitrageError(
+                f"Jupiter quote failed for {venue_name}: missing otherAmountThreshold"
+            )
+        try:
             price_impact_bps = float(payload.get("priceImpactPct") or 0.0) * 100.0
         except (TypeError, ValueError):
             price_impact_bps = 0.0
@@ -161,6 +169,7 @@ class JupiterArbitrageQuoteProvider:
             fee_bps=fee_bps,
             price_impact_bps=price_impact_bps,
             route_id=">".join(labels) if labels else None,
+            minimum_output_amount_atomic=minimum_output_amount,
         )
 
 

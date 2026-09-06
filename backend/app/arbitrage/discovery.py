@@ -125,8 +125,16 @@ class ArbitrageDiscovery:
             if buy is None:
                 return DiscoveryCandidate(amount_sol, None, None, None, "no buy route")
 
+            # Live execution feeds Jupiter's slippage-protected minimum token
+            # amount into the sell quote. Discovery must use that same amount,
+            # otherwise it can advertise a profit on the optimistic buy output
+            # that disappears as soon as live execution applies the threshold.
+            executable_buy_output = buy.minimum_output_amount_atomic or buy.output_amount_atomic
+            if executable_buy_output <= 0:
+                return DiscoveryCandidate(amount_sol, buy, None, None, "buy route has no executable minimum output")
+
             sell = await self.provider.unrestricted_quote(
-                token_mint, SOL_MINT, buy.output_amount_atomic, slippage_bps=int(config.max_slippage_bps)
+                token_mint, SOL_MINT, executable_buy_output, slippage_bps=int(config.max_slippage_bps)
             )
             if sell is None:
                 return DiscoveryCandidate(amount_sol, buy, None, None, "no sell route")
