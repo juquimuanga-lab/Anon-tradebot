@@ -25,6 +25,48 @@ class DiscoveryAwareLiveExecutor(ArbitrageLiveExecutor):
         self._discovery_quotes: contextvars.ContextVar[tuple[Quote, Quote] | None] = contextvars.ContextVar(
             "arbitrage_discovery_quotes", default=None
         )
+        self._pending_discoveries: dict[tuple[str, float], tuple[Quote, Quote, float]] = {}
+
+    def remember_discovery(
+        self,
+        *,
+        token_mint: str,
+        amount_sol: float,
+        buy_quote: Quote,
+        sell_quote: Quote,
+    ) -> None:
+        """Make a just-discovered route available to the existing Telegram executor."""
+        if buy_quote.raw_response is None or sell_quote.raw_response is None:
+            return
+        self._pending_discoveries[(token_mint, float(amount_sol))] = (
+            buy_quote,
+            sell_quote,
+            time.monotonic(),
+        )
+
+    async def execute_unrestricted(
+        self,
+        owner_user_id: int,
+        token_mint: str,
+        amount_sol: float,
+    ) -> LiveExecutionResult:
+        """Prefer the matching discovery route before falling back to fresh quotes."""
+        key = (token_mint, float(amount_sol))
+        pending = self._pending_discoveries.get(key)
+        if pending:
+            buy_quote, sell_quote, stored_at = pending
+            if time.monotonic() - stored_at <= self._discovery_quote_max_age_seconds:
+                self._pending_discoveries.pop(key, None)
+                return await self.execute_discovery(
+                    owner_user_id=owner_user_id,
+                    token_mint=token_mint,
+                    amount_sol=amount_sol,
+                    buy_quote=buy_quote,
+                    sell_quote=sell_quote,
+                )
+            self._pending_discoveries.pop(key, None)
+            telemetry.increment("live_discovery_quote_cache_expired")
+        return await super().execute_unrestricted(owner_user_id, token_mint, amount_sol)
 
     async def execute_discovery(
         self,
@@ -38,7 +80,7 @@ class DiscoveryAwareLiveExecutor(ArbitrageLiveExecutor):
         """Execute directly from discovery quotes when they are still fresh."""
         if buy_quote.raw_response is None or sell_quote.raw_response is None:
             telemetry.increment("live_discovery_quote_missing_payload")
-            return await self.execute_unrestricted(owner_user_id, token_mint, amount_sol)
+            return await super().execute_unrestricted(owner_user_id, token_mint, amount_sol)
 
         token = self._discovery_quotes.set((buy_quote, sell_quote))
         try:
@@ -50,7 +92,7 @@ class DiscoveryAwareLiveExecutor(ArbitrageLiveExecutor):
                 "live_discovery_sell_quote_age_ms",
                 max(0.0, time.monotonic() - sell_quote.quoted_at_monotonic) * 1000.0,
             )
-            return await self.execute_unrestricted(owner_user_id, token_mint, amount_sol)
+            return await super().execute_unrestricted(owner_user_id, token_mint, amount_sol)
         finally:
             self._discovery_quotes.reset(token)
 
