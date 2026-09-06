@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Optional
+from typing import Any, Optional
 
 
 @dataclass(frozen=True)
@@ -20,6 +20,11 @@ class Quote:
     # lets discovery distinguish the optimistic quote from the executable
     # slippage-protected amount.
     minimum_output_amount_atomic: Optional[int] = None
+    # Preserve the exact Jupiter response used during discovery so the live
+    # executor can build from the discovered route instead of immediately
+    # throwing the route away and paying for a second quote round-trip.
+    raw_response: Optional[dict[str, Any]] = None
+    quoted_at_monotonic: float = 0.0
 
 
 @dataclass(frozen=True)
