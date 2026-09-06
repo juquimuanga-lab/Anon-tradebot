@@ -1,6 +1,7 @@
 """Gated live Solana arbitrage execution with transaction-level safety checks."""
 from __future__ import annotations
 
+import asyncio
 import base64
 import logging
 import os
@@ -145,13 +146,7 @@ class ArbitrageLiveExecutor:
         except Exception as exc:
             raise ArbitrageLiveExecutionError("unable to verify wallet SOL balance") from exc
 
-    async def _quote(
-        self,
-        input_mint: str,
-        output_mint: str,
-        amount: int,
-        venue: VenueConfig,
-    ) -> dict[str, Any]:
+    async def _quote(self, input_mint: str, output_mint: str, amount: int, venue: VenueConfig) -> dict[str, Any]:
         started = time.perf_counter()
         params = {
             "inputMint": input_mint,
@@ -167,26 +162,18 @@ class ArbitrageLiveExecutor:
         if api_key:
             headers["x-api-key"] = api_key
         try:
-            async with httpx.AsyncClient(
-                base_url=settings.jupiter_base_url.rstrip("/"), timeout=8.0
-            ) as client:
+            async with httpx.AsyncClient(base_url=settings.jupiter_base_url.rstrip("/"), timeout=8.0) as client:
                 response = await client.get("/quote", params=params, headers=headers)
             if response.status_code != 200:
                 telemetry.increment("jupiter_quote_errors")
-                raise ArbitrageLiveExecutionError(
-                    f"Jupiter quote failed: HTTP {response.status_code}"
-                )
+                raise ArbitrageLiveExecutionError(f"Jupiter quote failed: HTTP {response.status_code}")
             payload = response.json()
             if payload.get("error") or int(payload.get("outAmount") or 0) <= 0:
                 telemetry.increment("jupiter_quote_errors")
-                raise ArbitrageLiveExecutionError(
-                    f"Jupiter returned no executable quote for {venue.name}"
-                )
+                raise ArbitrageLiveExecutionError(f"Jupiter returned no executable quote for {venue.name}")
             if int(payload.get("otherAmountThreshold") or 0) <= 0:
                 telemetry.increment("jupiter_quote_errors")
-                raise ArbitrageLiveExecutionError(
-                    f"Jupiter returned no executable threshold for {venue.name}"
-                )
+                raise ArbitrageLiveExecutionError(f"Jupiter returned no executable threshold for {venue.name}")
             telemetry.increment("jupiter_quotes")
             return payload
         finally:
@@ -195,20 +182,16 @@ class ArbitrageLiveExecutor:
     async def _dynamic_jito_tip_lamports(self) -> int:
         """Read a recent Jito landed-tip percentile, with a safe local fallback."""
         now = time.monotonic()
-        if self._cached_tip_lamports >= MIN_JITO_TIP_LAMPORTS and (
-            now - self._cached_tip_at < self._tip_cache_ttl_seconds
-        ):
+        if self._cached_tip_lamports >= MIN_JITO_TIP_LAMPORTS and now - self._cached_tip_at < self._tip_cache_ttl_seconds:
             telemetry.increment("jito_tip_cache_hits")
             return self._cached_tip_lamports
-
         try:
             values = await self._jito.get_tip_floor(self._tip_floor_url)
             field = f"landed_tips_{self._tip_percentile}th_percentile"
             raw_value = values.get(field)
             if raw_value is None:
                 raise ArbitrageLiveExecutionError(f"Jito tip floor missing {field}")
-            market_tip = int(float(raw_value) * LAMPORTS_PER_SOL)
-            market_tip = max(MIN_JITO_TIP_LAMPORTS, market_tip)
+            market_tip = max(MIN_JITO_TIP_LAMPORTS, int(float(raw_value) * LAMPORTS_PER_SOL))
             market_tip = int(market_tip * self._tip_multiplier)
             self._cached_tip_lamports = market_tip
             self._cached_tip_at = now
@@ -218,27 +201,13 @@ class ArbitrageLiveExecutor:
             telemetry.increment("jito_tip_floor_fallbacks")
             self._cached_tip_lamports = self._fallback_tip_lamports
             self._cached_tip_at = now
-            logger.warning(
-                "jito_tip_floor_unavailable_using_fallback",
-                extra={"error": str(exc), "fallback_lamports": self._fallback_tip_lamports},
-            )
+            logger.warning("jito_tip_floor_unavailable_using_fallback", extra={"error": str(exc), "fallback_lamports": self._fallback_tip_lamports})
             return self._fallback_tip_lamports
 
-    async def execute_unrestricted(
-        self,
-        owner_user_id: int,
-        token_mint: str,
-        amount_sol: float,
-    ) -> LiveExecutionResult:
+    async def execute_unrestricted(self, owner_user_id: int, token_mint: str, amount_sol: float) -> LiveExecutionResult:
         """Execute a freshly re-quoted unrestricted Jupiter round-trip."""
         unrestricted = VenueConfig("jupiter_best_route", "", 0.0)
-        return await self.execute(
-            owner_user_id=owner_user_id,
-            token_mint=token_mint,
-            amount_sol=amount_sol,
-            buy_venue=unrestricted,
-            sell_venue=unrestricted,
-        )
+        return await self.execute(owner_user_id=owner_user_id, token_mint=token_mint, amount_sol=amount_sol, buy_venue=unrestricted, sell_venue=unrestricted)
 
     @staticmethod
     def _positive_int(payload: dict[str, Any], field: str, label: str) -> int:
@@ -253,60 +222,32 @@ class ArbitrageLiveExecutor:
     async def _simulate(self, rpc_url: str, signed_tx: bytes) -> None:
         """Simulate a signed leg through the shared failover-aware RPC path."""
         encoded = base64.b64encode(signed_tx).decode("ascii")
-        payload = {
-            "jsonrpc": "2.0",
-            "id": 1,
-            "method": "simulateTransaction",
-            "params": [
-                encoded,
-                {
-                    "encoding": "base64",
-                    "sigVerify": True,
-                    "replaceRecentBlockhash": False,
-                },
-            ],
-        }
+        params = [encoded, {"encoding": "base64", "sigVerify": True, "replaceRecentBlockhash": False}]
         started = time.perf_counter()
         try:
             try:
-                result = await _rpc_request(rpc_url, "simulateTransaction", payload["params"])
+                result = await _rpc_request(rpc_url, "simulateTransaction", params)
             except Exception as exc:
                 telemetry.increment("simulation_errors")
                 raise ArbitrageLiveExecutionError(f"RPC simulation failed: {exc}") from exc
             value = ((result or {}).get("value") or {})
             if value.get("err") is not None:
                 telemetry.increment("simulation_rejections")
-                raise ArbitrageLiveExecutionError(
-                    f"transaction simulation failed: {value['err']}"
-                )
+                raise ArbitrageLiveExecutionError(f"transaction simulation failed: {value['err']}")
             telemetry.increment("simulation_successes")
         finally:
             telemetry.observe("live_simulation_ms", (time.perf_counter() - started) * 1000.0)
 
-    async def _reconcile_landed_bundle(
-        self,
-        rpc_url: str,
-        bundle_status: dict[str, Any],
-    ) -> tuple[bool, str, tuple[str, ...]]:
+    async def _reconcile_landed_bundle(self, rpc_url: str, bundle_status: dict[str, Any]) -> tuple[bool, str, tuple[str, ...]]:
         bundle_error = bundle_status.get("err")
         if bundle_error not in (None, {"Ok": None}):
-            return False, f"bundle_error:{bundle_error}", tuple(
-                str(sig) for sig in (bundle_status.get("transactions") or [])
-            )
-
-        confirmation = str(
-            bundle_status.get("confirmation_status")
-            or bundle_status.get("confirmationStatus")
-            or ""
-        ).lower()
-        signatures = tuple(
-            str(sig) for sig in (bundle_status.get("transactions") or [])
-        )
+            return False, f"bundle_error:{bundle_error}", tuple(str(sig) for sig in (bundle_status.get("transactions") or []))
+        confirmation = str(bundle_status.get("confirmation_status") or bundle_status.get("confirmationStatus") or "").lower()
+        signatures = tuple(str(sig) for sig in (bundle_status.get("transactions") or []))
         if confirmation not in {"processed", "confirmed", "finalized"}:
             return False, f"bundle_not_confirmed:{confirmation or 'unknown'}", signatures
         if len(signatures) != 2 or any(not sig for sig in signatures):
             return False, f"unexpected_bundle_transaction_count:{len(signatures)}", signatures
-
         for signature in signatures:
             transaction = await get_transaction_details(rpc_url, signature)
             if not transaction:
@@ -316,25 +257,13 @@ class ArbitrageLiveExecutor:
                 return False, f"transaction_failed:{signature}:{meta.get('err')}", signatures
         return True, "settled", signatures
 
-    async def execute(
-        self,
-        owner_user_id: int,
-        token_mint: str,
-        amount_sol: float,
-        buy_venue: VenueConfig,
-        sell_venue: VenueConfig,
-    ) -> LiveExecutionResult:
+    async def execute(self, owner_user_id: int, token_mint: str, amount_sol: float, buy_venue: VenueConfig, sell_venue: VenueConfig) -> LiveExecutionResult:
         started = time.perf_counter()
         telemetry.increment("live_execution_attempts")
         try:
             if not self._live_enabled:
                 telemetry.increment("live_execution_disabled")
-                return LiveExecutionResult(
-                    False,
-                    buy_venue=buy_venue.name,
-                    sell_venue=sell_venue.name,
-                    reason="live_arbitrage_disabled",
-                )
+                return LiveExecutionResult(False, buy_venue=buy_venue.name, sell_venue=sell_venue.name, reason="live_arbitrage_disabled")
             if amount_sol <= 0:
                 return LiveExecutionResult(False, reason="amount_must_be_positive")
             try:
@@ -345,68 +274,33 @@ class ArbitrageLiveExecutor:
             if input_lamports <= 0:
                 return LiveExecutionResult(False, reason="amount_too_small")
             if input_lamports > self._max_trade_lamports:
-                return LiveExecutionResult(
-                    False,
-                    buy_venue=buy_venue.name,
-                    sell_venue=sell_venue.name,
-                    input_lamports=input_lamports,
-                    reason="live_trade_size_limit_exceeded",
-                )
-
+                return LiveExecutionResult(False, buy_venue=buy_venue.name, sell_venue=sell_venue.name, input_lamports=input_lamports, reason="live_trade_size_limit_exceeded")
             keypair = await self._wallet(owner_user_id)
             user_pubkey = str(keypair.pubkey())
             rpc_url = settings.solana_rpc_url
             if not rpc_url:
                 raise ArbitrageLiveExecutionError("SOLANA_RPC_URL/Helius RPC is not configured")
-
             balance_lamports = await self._wallet_balance(rpc_url, keypair)
             required_balance = input_lamports + self._fallback_tip_lamports + self._reserve_lamports
             if balance_lamports < required_balance:
-                return LiveExecutionResult(
-                    False,
-                    buy_venue=buy_venue.name,
-                    sell_venue=sell_venue.name,
-                    input_lamports=input_lamports,
-                    reason="insufficient_wallet_reserve",
-                )
+                return LiveExecutionResult(False, buy_venue=buy_venue.name, sell_venue=sell_venue.name, input_lamports=input_lamports, reason="insufficient_wallet_reserve")
 
             buy_quote = await self._quote(SOL_MINT, token_mint, input_lamports, buy_venue)
             buy_out = self._positive_int(buy_quote, "outAmount", "buy quote")
-            guaranteed_tokens = self._positive_int(
-                buy_quote, "otherAmountThreshold", "buy quote"
-            )
+            guaranteed_tokens = self._positive_int(buy_quote, "otherAmountThreshold", "buy quote")
             if guaranteed_tokens > buy_out:
                 raise ArbitrageLiveExecutionError("buy quote minimum output exceeds quoted output")
-
-            sell_quote = await self._quote(
-                token_mint, SOL_MINT, guaranteed_tokens, sell_venue
-            )
+            sell_quote = await self._quote(token_mint, SOL_MINT, guaranteed_tokens, sell_venue)
             sell_out = self._positive_int(sell_quote, "outAmount", "sell quote")
-            guaranteed_sol = self._positive_int(
-                sell_quote, "otherAmountThreshold", "sell quote"
-            )
+            guaranteed_sol = self._positive_int(sell_quote, "otherAmountThreshold", "sell quote")
             if guaranteed_sol > sell_out:
                 raise ArbitrageLiveExecutionError("sell quote minimum output exceeds quoted output")
 
-            base_profit = calculate_profitability(
-                input_atomic=input_lamports,
-                final_output_atomic=guaranteed_sol,
-                venue_cost_atomic_value=0,
-                base_fee_atomic=DEFAULT_BUNDLE_BASE_FEE_LAMPORTS,
-            )
-
+            base_profit = calculate_profitability(input_atomic=input_lamports, final_output_atomic=guaranteed_sol, venue_cost_atomic_value=0, base_fee_atomic=DEFAULT_BUNDLE_BASE_FEE_LAMPORTS)
             market_tip = await self._dynamic_jito_tip_lamports()
-            priority_budget = max_affordable_priority_budget(
-                gross_profit_atomic=base_profit.gross_profit_atomic,
-                venue_cost_atomic_value=base_profit.venue_cost_atomic,
-                base_fee_atomic=base_profit.base_fee_atomic,
-                jito_tip_atomic=market_tip,
-            )
+            priority_budget = max_affordable_priority_budget(gross_profit_atomic=base_profit.gross_profit_atomic, venue_cost_atomic_value=base_profit.venue_cost_atomic, base_fee_atomic=base_profit.base_fee_atomic, jito_tip_atomic=market_tip)
             configured_priority_cap = max(1000, min(int(os.getenv("ARBITRAGE_LIVE_MAX_PRIORITY_FEE_LAMPORTS", "100000")), 1_000_000))
-            per_leg_priority_cap = min(
-                configured_priority_cap,
-                max(1000, priority_budget // 2),
-            )
+            per_leg_priority_cap = min(configured_priority_cap, max(1000, priority_budget // 2))
             telemetry.observe("live_priority_budget_lamports", float(priority_budget))
             telemetry.observe("live_priority_per_leg_cap_lamports", float(per_leg_priority_cap))
 
@@ -416,263 +310,64 @@ class ArbitrageLiveExecutor:
                     raise ArbitrageLiveExecutionError("Jito returned no tip accounts")
                 tip_account = random.choice(tip_accounts)
                 with timed(telemetry, "live_build_without_tip_ms"):
-                    buy_signed, buy_priority = await build_signed_swap_without_tip(
-                        base_url=settings.jupiter_base_url,
-                        quote_response=buy_quote,
-                        user_pubkey=user_pubkey,
-                        keypair=keypair,
-                        rpc_url=rpc_url,
-                        api_key=os.getenv("JUPITER_API_KEY"),
-                        max_priority_fee_lamports=per_leg_priority_cap,
-                    )
-                    _, sell_priority_estimate = await build_signed_swap_without_tip(
-                        base_url=settings.jupiter_base_url,
-                        quote_response=sell_quote,
-                        user_pubkey=user_pubkey,
-                        keypair=keypair,
-                        rpc_url=rpc_url,
-                        api_key=os.getenv("JUPITER_API_KEY"),
-                        max_priority_fee_lamports=per_leg_priority_cap,
-                    )
+                    buy_signed, buy_priority = await build_signed_swap_without_tip(base_url=settings.jupiter_base_url, quote_response=buy_quote, user_pubkey=user_pubkey, keypair=keypair, rpc_url=rpc_url, api_key=os.getenv("JUPITER_API_KEY"), max_priority_fee_lamports=per_leg_priority_cap)
+                    _, sell_priority_estimate = await build_signed_swap_without_tip(base_url=settings.jupiter_base_url, quote_response=sell_quote, user_pubkey=user_pubkey, keypair=keypair, rpc_url=rpc_url, api_key=os.getenv("JUPITER_API_KEY"), max_priority_fee_lamports=per_leg_priority_cap)
             except JupiterInstructionBuildError as exc:
                 raise ArbitrageLiveExecutionError(str(exc)) from exc
 
             priority_estimate = buy_priority + sell_priority_estimate
-            max_tip = max_affordable_jito_tip(
-                gross_profit_atomic=base_profit.gross_profit_atomic,
-                venue_cost_atomic_value=base_profit.venue_cost_atomic,
-                base_fee_atomic=base_profit.base_fee_atomic,
-                priority_fee_atomic=priority_estimate,
-            )
+            max_tip = max_affordable_jito_tip(gross_profit_atomic=base_profit.gross_profit_atomic, venue_cost_atomic_value=base_profit.venue_cost_atomic, base_fee_atomic=base_profit.base_fee_atomic, priority_fee_atomic=priority_estimate)
             pre_tip_net = base_profit.gross_profit_atomic - base_profit.base_fee_atomic - priority_estimate
             if max_tip < MIN_JITO_TIP_LAMPORTS:
                 telemetry.increment("live_profit_gate_rejections")
-                reason = (
-                    "live_requote_profit_gate_failed"
-                    if pre_tip_net <= 0
-                    else "jito_tip_profit_gate_failed"
-                )
-                return LiveExecutionResult(
-                    False,
-                    buy_venue=buy_venue.name,
-                    sell_venue=sell_venue.name,
-                    input_lamports=input_lamports,
-                    guaranteed_token_amount=guaranteed_tokens,
-                    gross_profit_lamports=base_profit.gross_profit_atomic,
-                    estimated_net_profit_lamports=pre_tip_net,
-                    reason=reason,
-                    priority_fee_lamports=priority_estimate,
-                    base_fee_lamports=DEFAULT_BUNDLE_BASE_FEE_LAMPORTS,
-                    jito_tip_lamports=0,
-                    market_tip_lamports=market_tip,
-                )
+                reason = "live_requote_profit_gate_failed" if pre_tip_net <= 0 else "jito_tip_profit_gate_failed"
+                return LiveExecutionResult(False, buy_venue=buy_venue.name, sell_venue=sell_venue.name, input_lamports=input_lamports, guaranteed_token_amount=guaranteed_tokens, gross_profit_lamports=base_profit.gross_profit_atomic, estimated_net_profit_lamports=pre_tip_net, reason=reason, priority_fee_lamports=priority_estimate, base_fee_lamports=DEFAULT_BUNDLE_BASE_FEE_LAMPORTS, jito_tip_lamports=0, market_tip_lamports=market_tip)
 
             selected_tip = min(market_tip, max_tip)
             if selected_tip < MIN_JITO_TIP_LAMPORTS:
                 telemetry.increment("live_tip_market_rejections")
-                return LiveExecutionResult(
-                    False,
-                    buy_venue=buy_venue.name,
-                    sell_venue=sell_venue.name,
-                    input_lamports=input_lamports,
-                    guaranteed_token_amount=guaranteed_tokens,
-                    gross_profit_lamports=base_profit.gross_profit_atomic,
-                    estimated_net_profit_lamports=pre_tip_net,
-                    reason="jito_tip_market_too_expensive",
-                    priority_fee_lamports=priority_estimate,
-                    base_fee_lamports=DEFAULT_BUNDLE_BASE_FEE_LAMPORTS,
-                    jito_tip_lamports=market_tip,
-                    market_tip_lamports=market_tip,
-                )
+                return LiveExecutionResult(False, buy_venue=buy_venue.name, sell_venue=sell_venue.name, input_lamports=input_lamports, guaranteed_token_amount=guaranteed_tokens, gross_profit_lamports=base_profit.gross_profit_atomic, estimated_net_profit_lamports=pre_tip_net, reason="jito_tip_market_too_expensive", priority_fee_lamports=priority_estimate, base_fee_lamports=DEFAULT_BUNDLE_BASE_FEE_LAMPORTS, jito_tip_lamports=market_tip, market_tip_lamports=market_tip)
 
-            required_balance = (
-                input_lamports
-                + selected_tip
-                + priority_estimate
-                + DEFAULT_BUNDLE_BASE_FEE_LAMPORTS
-                + self._reserve_lamports
-            )
+            required_balance = input_lamports + selected_tip + priority_estimate + DEFAULT_BUNDLE_BASE_FEE_LAMPORTS + self._reserve_lamports
             if balance_lamports < required_balance:
-                return LiveExecutionResult(
-                    False,
-                    buy_venue=buy_venue.name,
-                    sell_venue=sell_venue.name,
-                    input_lamports=input_lamports,
-                    guaranteed_token_amount=guaranteed_tokens,
-                    gross_profit_lamports=base_profit.gross_profit_atomic,
-                    estimated_net_profit_lamports=pre_tip_net - selected_tip,
-                    reason="insufficient_dynamic_tip_reserve",
-                    priority_fee_lamports=priority_estimate,
-                    base_fee_lamports=DEFAULT_BUNDLE_BASE_FEE_LAMPORTS,
-                    jito_tip_lamports=selected_tip,
-                    market_tip_lamports=market_tip,
-                )
+                return LiveExecutionResult(False, buy_venue=buy_venue.name, sell_venue=sell_venue.name, input_lamports=input_lamports, guaranteed_token_amount=guaranteed_tokens, gross_profit_lamports=base_profit.gross_profit_atomic, estimated_net_profit_lamports=pre_tip_net - selected_tip, reason="insufficient_dynamic_tip_reserve", priority_fee_lamports=priority_estimate, base_fee_lamports=DEFAULT_BUNDLE_BASE_FEE_LAMPORTS, jito_tip_lamports=selected_tip, market_tip_lamports=market_tip)
 
             try:
                 with timed(telemetry, "live_build_final_ms"):
-                    sell_signed, sell_priority = await build_signed_swap_with_tip(
-                        base_url=settings.jupiter_base_url,
-                        quote_response=sell_quote,
-                        user_pubkey=user_pubkey,
-                        keypair=keypair,
-                        rpc_url=rpc_url,
-                        tip_account=tip_account,
-                        tip_lamports=selected_tip,
-                        api_key=os.getenv("JUPITER_API_KEY"),
-                        max_priority_fee_lamports=per_leg_priority_cap,
-                    )
+                    sell_signed, sell_priority = await build_signed_swap_with_tip(base_url=settings.jupiter_base_url, quote_response=sell_quote, user_pubkey=user_pubkey, keypair=keypair, rpc_url=rpc_url, tip_account=tip_account, tip_lamports=selected_tip, api_key=os.getenv("JUPITER_API_KEY"), max_priority_fee_lamports=per_leg_priority_cap)
             except JupiterInstructionBuildError as exc:
                 raise ArbitrageLiveExecutionError(str(exc)) from exc
 
             final_priority = buy_priority + sell_priority
-            final_profit = calculate_profitability(
-                input_atomic=input_lamports,
-                final_output_atomic=guaranteed_sol,
-                venue_cost_atomic_value=0,
-                base_fee_atomic=DEFAULT_BUNDLE_BASE_FEE_LAMPORTS,
-                priority_fee_atomic=final_priority,
-                jito_tip_atomic=selected_tip,
-            )
+            final_profit = calculate_profitability(input_atomic=input_lamports, final_output_atomic=guaranteed_sol, venue_cost_atomic_value=0, base_fee_atomic=DEFAULT_BUNDLE_BASE_FEE_LAMPORTS, priority_fee_atomic=final_priority, jito_tip_atomic=selected_tip)
             if final_profit.net_profit_atomic <= 0:
                 telemetry.increment("live_profit_gate_rejections")
-                return LiveExecutionResult(
-                    False,
-                    buy_venue=buy_venue.name,
-                    sell_venue=sell_venue.name,
-                    input_lamports=input_lamports,
-                    guaranteed_token_amount=guaranteed_tokens,
-                    gross_profit_lamports=final_profit.gross_profit_atomic,
-                    estimated_net_profit_lamports=final_profit.net_profit_atomic,
-                    reason="final_profit_gate_failed",
-                    priority_fee_lamports=final_priority,
-                    base_fee_lamports=DEFAULT_BUNDLE_BASE_FEE_LAMPORTS,
-                    jito_tip_lamports=selected_tip,
-                    market_tip_lamports=market_tip,
-                )
+                return LiveExecutionResult(False, buy_venue=buy_venue.name, sell_venue=sell_venue.name, input_lamports=input_lamports, guaranteed_token_amount=guaranteed_tokens, gross_profit_lamports=final_profit.gross_profit_atomic, estimated_net_profit_lamports=final_profit.net_profit_atomic, reason="final_profit_gate_failed", priority_fee_lamports=final_priority, base_fee_lamports=DEFAULT_BUNDLE_BASE_FEE_LAMPORTS, jito_tip_lamports=selected_tip, market_tip_lamports=market_tip)
 
-            required_balance = (
-                input_lamports
-                + selected_tip
-                + final_priority
-                + DEFAULT_BUNDLE_BASE_FEE_LAMPORTS
-                + self._reserve_lamports
-            )
+            required_balance = input_lamports + selected_tip + final_priority + DEFAULT_BUNDLE_BASE_FEE_LAMPORTS + self._reserve_lamports
             if balance_lamports < required_balance:
-                return LiveExecutionResult(
-                    False,
-                    buy_venue=buy_venue.name,
-                    sell_venue=sell_venue.name,
-                    input_lamports=input_lamports,
-                    guaranteed_token_amount=guaranteed_tokens,
-                    gross_profit_lamports=final_profit.gross_profit_atomic,
-                    estimated_net_profit_lamports=final_profit.net_profit_atomic,
-                    reason="insufficient_final_fee_reserve",
-                    priority_fee_lamports=final_priority,
-                    base_fee_lamports=DEFAULT_BUNDLE_BASE_FEE_LAMPORTS,
-                    jito_tip_lamports=selected_tip,
-                    market_tip_lamports=market_tip,
-                )
+                return LiveExecutionResult(False, buy_venue=buy_venue.name, sell_venue=sell_venue.name, input_lamports=input_lamports, guaranteed_token_amount=guaranteed_tokens, gross_profit_lamports=final_profit.gross_profit_atomic, estimated_net_profit_lamports=final_profit.net_profit_atomic, reason="insufficient_final_fee_reserve", priority_fee_lamports=final_priority, base_fee_lamports=DEFAULT_BUNDLE_BASE_FEE_LAMPORTS, jito_tip_lamports=selected_tip, market_tip_lamports=market_tip)
 
             await self._simulate(rpc_url, buy_signed)
             await self._simulate(rpc_url, sell_signed)
-
             submit_started = time.perf_counter()
-            bundle_id = await self._jito.send_bundle(
-                [
-                    base64.b64encode(buy_signed).decode("ascii"),
-                    base64.b64encode(sell_signed).decode("ascii"),
-                ]
-            )
+            bundle_id = await self._jito.send_bundle([base64.b64encode(buy_signed).decode("ascii"), base64.b64encode(sell_signed).decode("ascii")])
             telemetry.observe("live_bundle_submission_ms", (time.perf_counter() - submit_started) * 1000.0)
             telemetry.increment("live_bundle_submissions")
-            logger.warning(
-                "arbitrage_live_bundle_submitted",
-                extra={
-                    "bundle_id": bundle_id,
-                    "mint": token_mint,
-                    "buy_venue": buy_venue.name,
-                    "sell_venue": sell_venue.name,
-                    "input_lamports": input_lamports,
-                    "guaranteed_tokens": guaranteed_tokens,
-                    "guaranteed_sol_output": guaranteed_sol,
-                    "estimated_net_profit_lamports": final_profit.net_profit_atomic,
-                    "base_fee_lamports": DEFAULT_BUNDLE_BASE_FEE_LAMPORTS,
-                    "priority_fee_lamports": final_priority,
-                    "jito_tip_lamports": selected_tip,
-                },
-            )
-
+            logger.warning("arbitrage_live_bundle_submitted", extra={"bundle_id": bundle_id, "mint": token_mint, "buy_venue": buy_venue.name, "sell_venue": sell_venue.name, "input_lamports": input_lamports, "guaranteed_tokens": guaranteed_tokens, "guaranteed_sol_output": guaranteed_sol, "estimated_net_profit_lamports": final_profit.net_profit_atomic, "base_fee_lamports": DEFAULT_BUNDLE_BASE_FEE_LAMPORTS, "priority_fee_lamports": final_priority, "jito_tip_lamports": selected_tip})
             settlement_started = time.perf_counter()
-            settlement = await self._jito.wait_for_bundle(
-                bundle_id,
-                timeout_seconds=self._settlement_timeout_seconds,
-                poll_seconds=self._settlement_poll_seconds,
-            )
+            settlement = await self._jito.wait_for_bundle(bundle_id, timeout_seconds=self._settlement_timeout_seconds, poll_seconds=self._settlement_poll_seconds)
             telemetry.observe("live_bundle_settlement_wait_ms", (time.perf_counter() - settlement_started) * 1000.0)
             settlement_state = str(settlement.get("status") or "Unknown")
             if settlement_state.lower() in {"failed", "invalid", "timeout"}:
                 telemetry.increment("live_bundle_settlement_failures")
-                return LiveExecutionResult(
-                    False,
-                    bundle_id=bundle_id,
-                    buy_venue=buy_venue.name,
-                    sell_venue=sell_venue.name,
-                    input_lamports=input_lamports,
-                    guaranteed_token_amount=guaranteed_tokens,
-                    gross_profit_lamports=final_profit.gross_profit_atomic,
-                    estimated_net_profit_lamports=final_profit.net_profit_atomic,
-                    reason=f"bundle_{settlement_state.lower()}",
-                    settlement_status=settlement_state,
-                    transaction_signatures=tuple(
-                        str(sig) for sig in (settlement.get("transactions") or [])
-                    ),
-                    priority_fee_lamports=final_priority,
-                    base_fee_lamports=DEFAULT_BUNDLE_BASE_FEE_LAMPORTS,
-                    jito_tip_lamports=selected_tip,
-                    market_tip_lamports=market_tip,
-                )
-
-            reconciled, reason, signatures = await self._reconcile_landed_bundle(
-                rpc_url, settlement
-            )
+                return LiveExecutionResult(False, bundle_id=bundle_id, buy_venue=buy_venue.name, sell_venue=sell_venue.name, input_lamports=input_lamports, guaranteed_token_amount=guaranteed_tokens, gross_profit_lamports=final_profit.gross_profit_atomic, estimated_net_profit_lamports=final_profit.net_profit_atomic, reason=f"bundle_{settlement_state.lower()}", settlement_status=settlement_state, transaction_signatures=tuple(str(sig) for sig in (settlement.get("transactions") or [])), priority_fee_lamports=final_priority, base_fee_lamports=DEFAULT_BUNDLE_BASE_FEE_LAMPORTS, jito_tip_lamports=selected_tip, market_tip_lamports=market_tip)
+            reconciled, reason, signatures = await self._reconcile_landed_bundle(rpc_url, settlement)
             if not reconciled:
                 telemetry.increment("live_bundle_reconciliation_failures")
-                return LiveExecutionResult(
-                    False,
-                    bundle_id=bundle_id,
-                    buy_venue=buy_venue.name,
-                    sell_venue=sell_venue.name,
-                    input_lamports=input_lamports,
-                    guaranteed_token_amount=guaranteed_tokens,
-                    gross_profit_lamports=final_profit.gross_profit_atomic,
-                    estimated_net_profit_lamports=final_profit.net_profit_atomic,
-                    reason=reason,
-                    settlement_status=settlement_state,
-                    transaction_signatures=signatures,
-                    priority_fee_lamports=final_priority,
-                    base_fee_lamports=DEFAULT_BUNDLE_BASE_FEE_LAMPORTS,
-                    jito_tip_lamports=selected_tip,
-                    market_tip_lamports=market_tip,
-                )
-
+                return LiveExecutionResult(False, bundle_id=bundle_id, buy_venue=buy_venue.name, sell_venue=sell_venue.name, input_lamports=input_lamports, guaranteed_token_amount=guaranteed_tokens, gross_profit_lamports=final_profit.gross_profit_atomic, estimated_net_profit_lamports=final_profit.net_profit_atomic, reason=reason, settlement_status=settlement_state, transaction_signatures=signatures, priority_fee_lamports=final_priority, base_fee_lamports=DEFAULT_BUNDLE_BASE_FEE_LAMPORTS, jito_tip_lamports=selected_tip, market_tip_lamports=market_tip)
             telemetry.increment("live_bundle_settled")
-            return LiveExecutionResult(
-                True,
-                bundle_id=bundle_id,
-                buy_venue=buy_venue.name,
-                sell_venue=sell_venue.name,
-                input_lamports=input_lamports,
-                guaranteed_token_amount=guaranteed_tokens,
-                gross_profit_lamports=final_profit.gross_profit_atomic,
-                estimated_net_profit_lamports=final_profit.net_profit_atomic,
-                reason="settled",
-                settlement_status=settlement_state,
-                transaction_signatures=signatures,
-                priority_fee_lamports=final_priority,
-                base_fee_lamports=DEFAULT_BUNDLE_BASE_FEE_LAMPORTS,
-                jito_tip_lamports=selected_tip,
-                market_tip_lamports=market_tip,
-            )
+            return LiveExecutionResult(True, bundle_id=bundle_id, buy_venue=buy_venue.name, sell_venue=sell_venue.name, input_lamports=input_lamports, guaranteed_token_amount=guaranteed_tokens, gross_profit_lamports=final_profit.gross_profit_atomic, estimated_net_profit_lamports=final_profit.net_profit_atomic, reason="settled", settlement_status=settlement_state, transaction_signatures=signatures, priority_fee_lamports=final_priority, base_fee_lamports=DEFAULT_BUNDLE_BASE_FEE_LAMPORTS, jito_tip_lamports=selected_tip, market_tip_lamports=market_tip)
         except asyncio.CancelledError:
             raise
         except ArbitrageLiveExecutionError as exc:
