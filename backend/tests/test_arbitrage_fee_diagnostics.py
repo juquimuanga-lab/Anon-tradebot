@@ -36,3 +36,23 @@ def test_execution_diagnostics_can_show_positive_net_and_tip():
     assert "Gross after re-quote (implied): `0.106294981 SOL` (`1062.95 bps`)" in message
     assert "Jito tip charged: `0.000025000 SOL` (`0.25 bps`)" in message
     assert "Final net: `+0.106159981 SOL` (`+1061.60 bps`)" in message
+
+
+def test_execution_diagnostics_reports_market_tip_policy():
+    execution = SimpleNamespace(
+        input_lamports=1_000_000_000,
+        estimated_net_profit_lamports=10_000_000,
+        base_fee_lamports=10_000,
+        priority_fee_lamports=100_000,
+        jito_tip_lamports=0,
+    )
+    executor = SimpleNamespace(
+        _cached_tip_lamports=250_000,
+        _tip_percentile=50,
+        _tip_multiplier=1.0,
+    )
+
+    message = _format_execution_diagnostics(execution, executor)
+
+    assert "Jito market tip considered: `0.000250000 SOL` (`2.50 bps`)" in message
+    assert "Jito policy: `50th percentile × 1x`" in message
