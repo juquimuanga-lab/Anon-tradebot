@@ -53,12 +53,14 @@ class LiveExecutionResult:
     sell_venue: str | None = None
     input_lamports: int = 0
     guaranteed_token_amount: int = 0
+    gross_profit_lamports: int = 0
     estimated_net_profit_lamports: int = 0
     reason: str = ""
     settlement_status: str | None = None
     transaction_signatures: tuple[str, ...] = field(default_factory=tuple)
     priority_fee_lamports: int = 0
     jito_tip_lamports: int = 0
+    market_tip_lamports: int = 0
     base_fee_lamports: int = 0
 
 
@@ -179,6 +181,11 @@ class ArbitrageLiveExecutor:
                 telemetry.increment("jupiter_quote_errors")
                 raise ArbitrageLiveExecutionError(
                     f"Jupiter returned no executable quote for {venue.name}"
+                )
+            if int(payload.get("otherAmountThreshold") or 0) <= 0:
+                telemetry.increment("jupiter_quote_errors")
+                raise ArbitrageLiveExecutionError(
+                    f"Jupiter returned no executable threshold for {venue.name}"
                 )
             telemetry.increment("jupiter_quotes")
             return payload
@@ -437,19 +444,27 @@ class ArbitrageLiveExecutor:
                 base_fee_atomic=base_profit.base_fee_atomic,
                 priority_fee_atomic=priority_estimate,
             )
+            pre_tip_net = base_profit.gross_profit_atomic - base_profit.base_fee_atomic - priority_estimate
             if max_tip < MIN_JITO_TIP_LAMPORTS:
                 telemetry.increment("live_profit_gate_rejections")
+                reason = (
+                    "live_requote_profit_gate_failed"
+                    if pre_tip_net <= 0
+                    else "jito_tip_profit_gate_failed"
+                )
                 return LiveExecutionResult(
                     False,
                     buy_venue=buy_venue.name,
                     sell_venue=sell_venue.name,
                     input_lamports=input_lamports,
                     guaranteed_token_amount=guaranteed_tokens,
-                    estimated_net_profit_lamports=base_profit.gross_profit_atomic - base_profit.base_fee_atomic - priority_estimate,
-                    reason="jito_tip_profit_gate_failed",
+                    gross_profit_lamports=base_profit.gross_profit_atomic,
+                    estimated_net_profit_lamports=pre_tip_net,
+                    reason=reason,
                     priority_fee_lamports=priority_estimate,
                     base_fee_lamports=DEFAULT_BUNDLE_BASE_FEE_LAMPORTS,
                     jito_tip_lamports=0,
+                    market_tip_lamports=market_tip,
                 )
 
             selected_tip = min(market_tip, max_tip)
@@ -461,11 +476,13 @@ class ArbitrageLiveExecutor:
                     sell_venue=sell_venue.name,
                     input_lamports=input_lamports,
                     guaranteed_token_amount=guaranteed_tokens,
-                    estimated_net_profit_lamports=base_profit.gross_profit_atomic - base_profit.base_fee_atomic - priority_estimate,
+                    gross_profit_lamports=base_profit.gross_profit_atomic,
+                    estimated_net_profit_lamports=pre_tip_net,
                     reason="jito_tip_market_too_expensive",
                     priority_fee_lamports=priority_estimate,
                     base_fee_lamports=DEFAULT_BUNDLE_BASE_FEE_LAMPORTS,
                     jito_tip_lamports=market_tip,
+                    market_tip_lamports=market_tip,
                 )
 
             required_balance = (
@@ -482,11 +499,13 @@ class ArbitrageLiveExecutor:
                     sell_venue=sell_venue.name,
                     input_lamports=input_lamports,
                     guaranteed_token_amount=guaranteed_tokens,
-                    estimated_net_profit_lamports=base_profit.gross_profit_atomic - base_profit.base_fee_atomic - priority_estimate - selected_tip,
+                    gross_profit_lamports=base_profit.gross_profit_atomic,
+                    estimated_net_profit_lamports=pre_tip_net - selected_tip,
                     reason="insufficient_dynamic_tip_reserve",
                     priority_fee_lamports=priority_estimate,
                     base_fee_lamports=DEFAULT_BUNDLE_BASE_FEE_LAMPORTS,
                     jito_tip_lamports=selected_tip,
+                    market_tip_lamports=market_tip,
                 )
 
             try:
@@ -522,11 +541,13 @@ class ArbitrageLiveExecutor:
                     sell_venue=sell_venue.name,
                     input_lamports=input_lamports,
                     guaranteed_token_amount=guaranteed_tokens,
+                    gross_profit_lamports=final_profit.gross_profit_atomic,
                     estimated_net_profit_lamports=final_profit.net_profit_atomic,
                     reason="final_profit_gate_failed",
                     priority_fee_lamports=final_priority,
                     base_fee_lamports=DEFAULT_BUNDLE_BASE_FEE_LAMPORTS,
                     jito_tip_lamports=selected_tip,
+                    market_tip_lamports=market_tip,
                 )
 
             required_balance = (
@@ -543,11 +564,13 @@ class ArbitrageLiveExecutor:
                     sell_venue=sell_venue.name,
                     input_lamports=input_lamports,
                     guaranteed_token_amount=guaranteed_tokens,
+                    gross_profit_lamports=final_profit.gross_profit_atomic,
                     estimated_net_profit_lamports=final_profit.net_profit_atomic,
                     reason="insufficient_final_fee_reserve",
                     priority_fee_lamports=final_priority,
                     base_fee_lamports=DEFAULT_BUNDLE_BASE_FEE_LAMPORTS,
                     jito_tip_lamports=selected_tip,
+                    market_tip_lamports=market_tip,
                 )
 
             await self._simulate(rpc_url, buy_signed)
@@ -596,6 +619,7 @@ class ArbitrageLiveExecutor:
                     sell_venue=sell_venue.name,
                     input_lamports=input_lamports,
                     guaranteed_token_amount=guaranteed_tokens,
+                    gross_profit_lamports=final_profit.gross_profit_atomic,
                     estimated_net_profit_lamports=final_profit.net_profit_atomic,
                     reason=f"bundle_{settlement_state.lower()}",
                     settlement_status=settlement_state,
@@ -605,6 +629,7 @@ class ArbitrageLiveExecutor:
                     priority_fee_lamports=final_priority,
                     base_fee_lamports=DEFAULT_BUNDLE_BASE_FEE_LAMPORTS,
                     jito_tip_lamports=selected_tip,
+                    market_tip_lamports=market_tip,
                 )
 
             reconciled, reason, signatures = await self._reconcile_landed_bundle(
@@ -619,6 +644,7 @@ class ArbitrageLiveExecutor:
                     sell_venue=sell_venue.name,
                     input_lamports=input_lamports,
                     guaranteed_token_amount=guaranteed_tokens,
+                    gross_profit_lamports=final_profit.gross_profit_atomic,
                     estimated_net_profit_lamports=final_profit.net_profit_atomic,
                     reason=reason,
                     settlement_status=settlement_state,
@@ -626,6 +652,7 @@ class ArbitrageLiveExecutor:
                     priority_fee_lamports=final_priority,
                     base_fee_lamports=DEFAULT_BUNDLE_BASE_FEE_LAMPORTS,
                     jito_tip_lamports=selected_tip,
+                    market_tip_lamports=market_tip,
                 )
 
             telemetry.increment("live_bundle_settled")
@@ -636,6 +663,7 @@ class ArbitrageLiveExecutor:
                 sell_venue=sell_venue.name,
                 input_lamports=input_lamports,
                 guaranteed_token_amount=guaranteed_tokens,
+                gross_profit_lamports=final_profit.gross_profit_atomic,
                 estimated_net_profit_lamports=final_profit.net_profit_atomic,
                 reason="settled",
                 settlement_status=settlement_state,
@@ -643,12 +671,13 @@ class ArbitrageLiveExecutor:
                 priority_fee_lamports=final_priority,
                 base_fee_lamports=DEFAULT_BUNDLE_BASE_FEE_LAMPORTS,
                 jito_tip_lamports=selected_tip,
+                market_tip_lamports=market_tip,
             )
-        except ArbitrageLiveExecutionError:
+        except asyncio.CancelledError:
+            raise
+        except ArbitrageLiveExecutionError as exc:
             telemetry.increment("live_execution_errors")
-            raise
-        except Exception:
-            telemetry.increment("live_execution_unexpected_errors")
-            raise
+            logger.exception("arbitrage_live_execution_error", extra={"reason": str(exc)})
+            return LiveExecutionResult(False, reason=str(exc))
         finally:
             telemetry.observe("live_execution_total_ms", (time.perf_counter() - started) * 1000.0)
