@@ -4,12 +4,12 @@ from app.arbitrage.engine import ArbitrageConfig, find_two_venue_opportunity
 from app.arbitrage.models import Quote
 
 
-def _buy(venue, amount, output, fee=30.0, impact=0.0):
-    return Quote(venue, "SOL", "TOKEN", amount, output, fee, impact)
+def _buy(venue, amount, output, fee=30.0, impact=0.0, minimum=None):
+    return Quote(venue, "SOL", "TOKEN", amount, output, fee, impact, minimum_output_amount_atomic=minimum)
 
 
-def _sell(venue, amount, output, fee=30.0, impact=0.0):
-    return Quote(venue, "TOKEN", "SOL", amount, output, fee, impact)
+def _sell(venue, amount, output, fee=30.0, impact=0.0, minimum=None):
+    return Quote(venue, "TOKEN", "SOL", amount, output, fee, impact, minimum_output_amount_atomic=minimum)
 
 
 def test_profitable_spread_is_qualified_without_double_counting_quote_costs():
@@ -109,3 +109,23 @@ def test_negative_external_costs_cannot_increase_profit():
     )
     assert result.total_cost_atomic == 0
     assert result.net_profit_atomic == 1_000_000
+
+
+def test_profitability_uses_jupiter_slippage_protected_outputs():
+    buy = _buy("raydium", 1_000_000_000, 1_100_000_000, minimum=1_000_000_000)
+    sell = _sell("orca", 1_000_000_000, 1_090_000_000, minimum=1_050_000_000)
+    result = find_two_venue_opportunity(
+        "TOKEN",
+        buy,
+        sell,
+        ArbitrageConfig(
+            estimated_base_fee_atomic=10_000,
+            estimated_priority_fee_atomic=0,
+            estimated_jito_tip_atomic=0,
+        ),
+    )
+
+    assert result.buy_output_atomic == 1_000_000_000
+    assert result.final_output_atomic == 1_050_000_000
+    assert result.gross_profit_atomic == 50_000_000
+    assert result.executable is True
