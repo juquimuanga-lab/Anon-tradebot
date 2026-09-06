@@ -60,14 +60,17 @@ def _format_alert(result: HuntResult) -> str:
 
 
 def _format_execution_diagnostics(execution, executor=None) -> str:
-    """Show every known fee and the implied gross result for a live rejection."""
+    """Show the actual live re-quote and every known execution cost."""
     input_lamports = max(int(execution.input_lamports or 0), 0)
     base_fee = max(int(execution.base_fee_lamports or 0), 0)
     priority_fee = max(int(execution.priority_fee_lamports or 0), 0)
     jito_tip = max(int(execution.jito_tip_lamports or 0), 0)
+    market_tip = max(int(getattr(execution, "market_tip_lamports", 0) or 0), 0)
     net = int(execution.estimated_net_profit_lamports or 0)
+    gross = int(getattr(execution, "gross_profit_lamports", 0) or 0)
+    if gross == 0:
+        gross = net + base_fee + priority_fee + jito_tip
     total_cost = base_fee + priority_fee + jito_tip
-    implied_gross = net + total_cost
 
     def sol(value: int) -> str:
         return f"{value / 1_000_000_000:.9f}"
@@ -75,7 +78,6 @@ def _format_execution_diagnostics(execution, executor=None) -> str:
     def bps(value: int) -> str:
         return f"{(value / input_lamports * 10_000):.2f}" if input_lamports else "0.00"
 
-    market_tip = max(int(getattr(executor, "_cached_tip_lamports", 0) or 0), 0)
     percentile = getattr(executor, "_tip_percentile", None)
     multiplier = getattr(executor, "_tip_multiplier", None)
     policy = (
@@ -86,7 +88,7 @@ def _format_execution_diagnostics(execution, executor=None) -> str:
 
     return (
         "Fee-by-fee diagnostic:\n"
-        f"Gross after re-quote (implied): `{sol(implied_gross)} SOL` (`{bps(implied_gross)} bps`)\n"
+        f"Gross after live re-quote: `{sol(gross)} SOL` (`{bps(gross)} bps`)\n"
         f"Base fees (2 signatures): `{sol(base_fee)} SOL`\n"
         f"Priority fees: `{sol(priority_fee)} SOL` (`{bps(priority_fee)} bps`)\n"
         f"Jito market tip considered: `{sol(market_tip)} SOL` (`{bps(market_tip)} bps`)\n"
@@ -98,10 +100,10 @@ def _format_execution_diagnostics(execution, executor=None) -> str:
 
 
 def _is_retryable_live_requote_failure(execution) -> bool:
-    """Retry only when the fresh quote itself is negative before any Jito tip."""
+    """Retry only when the fresh quote is negative before any Jito tip."""
     return (
         not execution.success
-        and execution.reason == "jito_tip_profit_gate_failed"
+        and execution.reason in {"jito_tip_profit_gate_failed", "live_requote_profit_gate_failed"}
         and int(execution.estimated_net_profit_lamports or 0) < 0
         and int(execution.jito_tip_lamports or 0) == 0
     )
@@ -350,14 +352,8 @@ async def arbitrage_hunt_status_cmd(update: Update, context: ContextTypes.DEFAUL
         return
 
     hotlist_candidates = len(hotlist.candidates) if hotlist else 0
-    hotlist_round_trips = (
-        sum(1 for _, discovery in hotlist.discoveries if discovery.opportunity is not None)
-        if hotlist else 0
-    )
-    hotlist_429s = (
-        sum(1 for _, discovery in hotlist.discoveries if discovery.error and "HTTP 429" in discovery.error)
-        if hotlist else 0
-    )
+    hotlist_round_trips = sum(1 for _, discovery in hotlist.discoveries if discovery.opportunity is not None) if hotlist else 0
+    hotlist_429s = sum(1 for _, discovery in hotlist.discoveries if discovery.error and "HTTP 429" in discovery.error) if hotlist else 0
     global_stats = global_result.stats if global_result else None
     live_admins = await _live_admin_ids()
     admin_status_lines = []
