@@ -55,7 +55,7 @@ def _format_alert(result: HuntResult) -> str:
     return ""
 
 
-def _format_execution_diagnostics(execution) -> str:
+def _format_execution_diagnostics(execution, executor=None) -> str:
     """Show every known fee and the implied gross result for a live rejection."""
     input_lamports = max(int(execution.input_lamports or 0), 0)
     base_fee = max(int(execution.base_fee_lamports or 0), 0)
@@ -71,11 +71,22 @@ def _format_execution_diagnostics(execution) -> str:
     def bps(value: int) -> str:
         return f"{(value / input_lamports * 10_000):.2f}" if input_lamports else "0.00"
 
+    market_tip = max(int(getattr(executor, "_cached_tip_lamports", 0) or 0), 0)
+    percentile = getattr(executor, "_tip_percentile", None)
+    multiplier = getattr(executor, "_tip_multiplier", None)
+    policy = (
+        f"{percentile}th percentile × {multiplier:g}x"
+        if percentile is not None and multiplier is not None
+        else "unknown"
+    )
+
     return (
         "Fee-by-fee diagnostic:\n"
         f"Gross after re-quote (implied): `{sol(implied_gross)} SOL` (`{bps(implied_gross)} bps`)\n"
         f"Base fees (2 signatures): `{sol(base_fee)} SOL`\n"
         f"Priority fees: `{sol(priority_fee)} SOL` (`{bps(priority_fee)} bps`)\n"
+        f"Jito market tip considered: `{sol(market_tip)} SOL` (`{bps(market_tip)} bps`)\n"
+        f"Jito policy: `{policy}`\n"
         f"Jito tip charged: `{sol(jito_tip)} SOL` (`{bps(jito_tip)} bps`)\n"
         f"Total known fees: `{sol(total_cost)} SOL` (`{bps(total_cost)} bps`)\n"
         f"Final net: `{'+' if net > 0 else ''}{sol(net)} SOL` (`{'+' if net > 0 else ''}{bps(net)} bps`)"
@@ -168,7 +179,7 @@ async def _execute_for_admin(
                     text=(
                         "🛑 *Arbitrage not executed/settled*\n\n"
                         f"Reason: `{execution.reason}`\n"
-                        f"{_format_execution_diagnostics(execution)}\n"
+                        f"{_format_execution_diagnostics(execution, live_executor)}\n"
                         f"Bundle: `{execution.bundle_id or 'none'}`"
                     ),
                     parse_mode="Markdown",
