@@ -91,6 +91,53 @@ async def test_discovery_size_sweep_selects_best_net_profit():
     assert result.opportunity.net_profit_atomic == 200_000
 
 
+class MinimumOutputProvider:
+    def __init__(self):
+        self.sell_inputs = []
+
+    async def aclose(self):
+        pass
+
+    async def unrestricted_quote(self, input_mint, output_mint, input_amount_atomic, slippage_bps=30):
+        if output_mint == "TOKEN":
+            return Quote(
+                "jupiter_best_route",
+                input_mint,
+                output_mint,
+                input_amount_atomic,
+                1_000_000,
+                0.0,
+                5.0,
+                "BuyRoute",
+                minimum_output_amount_atomic=900_000,
+            )
+        self.sell_inputs.append(input_amount_atomic)
+        return Quote(
+            "jupiter_best_route",
+            input_mint,
+            output_mint,
+            input_amount_atomic,
+            1_100_000,
+            0.0,
+            5.0,
+            "SellRoute",
+            minimum_output_amount_atomic=1_050_000,
+        )
+
+
+@pytest.mark.asyncio
+async def test_discovery_sell_quote_uses_buy_minimum_output():
+    provider = MinimumOutputProvider()
+    discovery = ArbitrageDiscovery(provider=provider, rpc_health=FakeHealth())
+    result = await discovery.discover("T" * 32, 0.01)
+    await discovery.close()
+
+    assert provider.sell_inputs == [900_000]
+    assert result.opportunity is not None
+    assert result.opportunity.buy_output_atomic == 900_000
+    assert result.opportunity.final_output_atomic == 1_050_000
+
+
 def test_discovery_sizes_can_be_overridden(monkeypatch):
     monkeypatch.setenv("ARBITRAGE_DISCOVERY_SIZES_SOL", "0.01,0.05,0.05,0.25")
     assert configured_discovery_sizes() == (0.01, 0.05, 0.25)
