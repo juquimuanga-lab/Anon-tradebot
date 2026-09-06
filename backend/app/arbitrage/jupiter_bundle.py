@@ -122,11 +122,20 @@ async def _build(
     headers = {"Content-Type": "application/json"}
     if api_key:
         headers["x-api-key"] = api_key
+
+    # Some Simple AMMs cannot be used through Jupiter shared accounts. The
+    # previous hard-coded True caused /swap-instructions to reject otherwise
+    # valid arbitrage routes with NOT_SUPPORTED. Prefer user-owned token
+    # accounts for live execution. This is slightly heavier than shared
+    # accounts, but it is the compatible/safe default for heterogeneous routes.
+    use_shared_accounts = os.getenv(
+        "ARBITRAGE_JUPITER_USE_SHARED_ACCOUNTS", "false"
+    ).strip().lower() == "true"
     body = {
         "userPublicKey": user_pubkey,
         "quoteResponse": quote_response,
         "wrapAndUnwrapSol": True,
-        "useSharedAccounts": True,
+        "useSharedAccounts": use_shared_accounts,
         "dynamicComputeUnitLimit": True,
         "prioritizationFeeLamports": _priority_fee_config(max_priority_fee_lamports),
     }
