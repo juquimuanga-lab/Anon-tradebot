@@ -56,7 +56,6 @@ class DiscoveryAwareLiveExecutor(ArbitrageLiveExecutor):
         if pending:
             buy_quote, sell_quote, stored_at = pending
             if time.monotonic() - stored_at <= self._discovery_quote_max_age_seconds:
-                self._pending_discoveries.pop(key, None)
                 return await self.execute_discovery(
                     owner_user_id=owner_user_id,
                     token_mint=token_mint,
