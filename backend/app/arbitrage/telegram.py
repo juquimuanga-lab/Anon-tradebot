@@ -8,12 +8,41 @@ from app.arbitrage.scanner import ArbitrageScanner
 from app.arbitrage.service import ArbitrageService
 from app.arbitrage.jupiter_quotes import configured_venues
 from app.arbitrage.live_executor import ArbitrageLiveExecutor
+from app.arbitrage.discovery_live_executor import DiscoveryAwareLiveExecutor
 from app.arbitrage import continuous_telegram
 from app.security.allowlist import admin_required
 
 service = ArbitrageService()
 scanner = ArbitrageScanner(service)
-live_executor = ArbitrageLiveExecutor(service)
+live_executor = DiscoveryAwareLiveExecutor(service)
+
+# continuous_telegram owns the live hunter loop. Replace its executor with the
+# discovery-aware adapter while preserving the existing wallet, simulation,
+# Jito and settlement safety gates in ArbitrageLiveExecutor.
+continuous_telegram.live_executor = live_executor
+_original_format_alert = continuous_telegram._format_alert
+
+
+def _format_alert_with_discovery_cache(result):
+    message = _original_format_alert(result)
+    for candidate, discovery in result.discoveries:
+        opportunity = discovery.opportunity
+        if (
+            opportunity is not None
+            and opportunity.executable
+            and discovery.buy_quote is not None
+            and discovery.sell_quote is not None
+        ):
+            live_executor.remember_discovery(
+                token_mint=candidate.token_mint,
+                amount_sol=discovery.amount_sol,
+                buy_quote=discovery.buy_quote,
+                sell_quote=discovery.sell_quote,
+            )
+    return message
+
+
+continuous_telegram._format_alert = _format_alert_with_discovery_cache
 
 
 @admin_required
@@ -64,7 +93,7 @@ async def arbitrage_help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE)
         "/arblive [1-10] — start/arm the global live arbitrage hunter\n"
         "/arbstop — stop the arbitrage hunter immediately\n"
         "/arbhelp — show this help\n\n"
-        "Live mode uses global candidate discovery and unrestricted Jupiter routing. Every candidate is re-quoted before signing; the final net profit must be strictly positive.",
+        "Live mode reuses a fresh discovery route when available; stale/mismatched quotes fall back to a new live quote. The final net profit must be strictly positive.",
         parse_mode="Markdown",
     )
 
@@ -126,7 +155,7 @@ async def arbitrage_live_status_cmd(update: Update, context: ContextTypes.DEFAUL
         f"Global hunter running: `{'YES' if hunt_status.running else 'NO'}`\n"
         f"Hunter cycles: `{hunt_status.cycles}`\n\n"
         "`/arblive` starts the global candidate hunter when the environment gate is ARMED. "
-        "The hunter uses unrestricted Jupiter discovery, then live execution re-quotes both legs before signing. "
+        "Fresh discovery quotes are reused when they are still within the configured age window; stale quotes are revalidated. "
         "Only strictly positive final net profit is eligible. Use `/arbstop` to stop it.",
         parse_mode="Markdown",
     )
