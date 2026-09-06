@@ -15,6 +15,11 @@ class Quote:
     fee_bps: float = 0.0
     price_impact_bps: float = 0.0
     route_id: Optional[str] = None
+    # Jupiter's exact-input quote also provides the minimum output that the
+    # swap instruction will enforce at execution time. Keeping this separate
+    # lets discovery distinguish the optimistic quote from the executable
+    # slippage-protected amount.
+    minimum_output_amount_atomic: Optional[int] = None
 
 
 @dataclass(frozen=True)
