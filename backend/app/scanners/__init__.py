@@ -20,6 +20,14 @@ try:
     _original_drain_smart_money_buys = _onchain_watcher.drain_smart_money_buys
 
     async def _preconf_aware_poll_new_pumpfun_mints(rpc_url, watermarks, limit=20):
+        # ScannerService is fully imported by the time the watcher is called.
+        # Install the entry-timing layer lazily here to avoid an import cycle.
+        try:
+            from .trader_brain import install_trader_brain
+            install_trader_brain()
+        except Exception:
+            logger.exception("trader_brain_bootstrap_failed")
+
         # One shared Pump.fun preconf firehose feeds both Fast Sniper and Smart
         # Money Copy. We deliberately do not create a second subscription per lane.
         _preconf.ensure_started(settings.smart_money_wallets)
