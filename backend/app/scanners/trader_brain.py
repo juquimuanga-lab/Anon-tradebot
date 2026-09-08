@@ -44,9 +44,8 @@ EXHAUSTION_SHORT_RUNUP_PCT = 10.0
 EXHAUSTION_FROM_LOW_PCT = 25.0
 EXHAUSTION_NEAR_PEAK_PCT = 8.0
 
-# Flow thresholds are intentionally lower than v1. Existing creator,
-# liquidity, Graduation Hunter, hard-filter and execution risk controls remain
-# authoritative outside this module.
+# Flow thresholds are lower than v1 so the brain can act on good-but-not-
+# perfect demand while existing safety/risk layers remain authoritative.
 MIN_HEALTHY_BUY_PRESSURE = 0.58
 MIN_RECLAIM_BUY_PRESSURE = 0.58
 MIN_BREAKOUT_BUY_PRESSURE = 0.60
@@ -282,7 +281,7 @@ class TraderBrain:
             }
 
         # 4. Momentum continuation. This catches a healthy trend that keeps
-        # climbing without giving the bot a textbook pullback.
+        # climbing without requiring a textbook pullback.
         trend_observations = observations[-4:]
         positive_steps = sum(
             1
@@ -298,7 +297,7 @@ class TraderBrain:
             and short_change <= MOMENTUM_MAX_SHORT_MOVE_PCT
             and from_recent_low <= MOMENTUM_MAX_FROM_RECENT_LOW_PCT
             and recent_range >= MOMENTUM_MIN_RECENT_RANGE_PCT
-            and not near_peak
+            and -from_peak < PULLBACK_MIN_PCT
         )
         if momentum:
             return {
