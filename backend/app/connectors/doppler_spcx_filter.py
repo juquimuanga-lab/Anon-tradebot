@@ -4,12 +4,10 @@ from __future__ import annotations
 import logging
 
 from app.connectors.pons import pons_client
+from app.connectors import doppler_control
 
 logger = logging.getLogger("app.connectors.doppler_spcx_filter")
-
-# Canonical Robinhood Chain SPCX stock-token contract.
-# Match the contract address, never the ticker string, to reject SPCX lookalikes.
-SPCX_TOKEN = "0x4a0e65a3eccec6dbe60ae065f2e7bb85fae35eea"
+SPCX_TOKEN = doppler_control.SPCX_TOKEN
 
 _previous_poll = pons_client.poll_new_launches
 
@@ -20,6 +18,8 @@ async def _spcx_only_poll(*args, **kwargs):
     for launch in launches:
         if launch.get("source") != "doppler":
             filtered.append(launch)
+            continue
+        if not doppler_control.is_enabled():
             continue
         numeraire = str(launch.get("numeraire", "")).lower()
         if numeraire == SPCX_TOKEN.lower():
