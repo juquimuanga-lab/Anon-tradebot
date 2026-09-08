@@ -26,8 +26,11 @@ jobs:
       - name: Install dependencies
         run: python -m pip install -r requirements.txt
 
-      - name: Compile arbitrage modules
-        run: python -m compileall -q app/arbitrage tests/test_arbitrage_engine.py tests/test_arbitrage_live_executor.py tests/test_arbitrage_jito.py tests/test_arbitrage_jupiter_bundle.py tests/test_arbitrage_rpc_health.py
+      - name: Compile arbitrage and Trader Brain modules
+        run: python -m compileall -q app/arbitrage app/scanners/trader_brain.py tests/test_arbitrage_engine.py tests/test_arbitrage_live_executor.py tests/test_arbitrage_jito.py tests/test_arbitrage_jupiter_bundle.py tests/test_arbitrage_rpc_health.py tests/test_trader_brain.py
 
       - name: Run arbitrage tests
         run: python -m pytest -q tests/test_arbitrage_engine.py tests/test_arbitrage_live_executor.py tests/test_arbitrage_jito.py tests/test_arbitrage_jupiter_bundle.py tests/test_arbitrage_rpc_health.py
+
+      - name: Run Trader Brain tests
+        run: python -m pytest -q tests/test_trader_brain.py
