@@ -1,10 +1,10 @@
 /**
- * Pump.fun Sender Max wrapper.
+ * Pump.fun Sender wrapper.
  *
  * Runs the existing Pump.fun SDK builder unchanged, then adds the Helius
  * Sender tip instruction to the unsigned transaction before Python signs it.
- * This keeps the existing builder intact while making the resulting signed
- * transaction eligible for Helius Sender's low-latency delivery path.
+ * Cost-optimized SWQoS-only delivery is the default; Sender Max can be
+ * explicitly selected with HELIUS_SENDER_MODE=max.
  */
 
 const {
@@ -29,16 +29,26 @@ const TIP_ACCOUNTS = [
   "4TQLFNWK8AovT1gFvda5jfw2oJeRMKEmw7aH6MGBJ3or",
 ];
 
-const DEFAULT_TIP_LAMPORTS = 1_000_000;
-const MIN_TIP_LAMPORTS = 1_000_000;
+const SWQOS_MIN_TIP_LAMPORTS = 5_000;
+const SENDER_MAX_MIN_TIP_LAMPORTS = 1_000_000;
+const DEFAULT_TIP_LAMPORTS = SWQOS_MIN_TIP_LAMPORTS;
+
+function senderMode() {
+  return String(process.env.HELIUS_SENDER_MODE || "swqos_only")
+    .trim()
+    .toLowerCase();
+}
 
 function tipLamports() {
   const configured = Number(
     process.env.HELIUS_SENDER_TIP_LAMPORTS || DEFAULT_TIP_LAMPORTS
   );
+  const minimum = senderMode() === "max"
+    ? SENDER_MAX_MIN_TIP_LAMPORTS
+    : SWQOS_MIN_TIP_LAMPORTS;
 
-  if (!Number.isSafeInteger(configured) || configured < MIN_TIP_LAMPORTS) {
-    return DEFAULT_TIP_LAMPORTS;
+  if (!Number.isSafeInteger(configured) || configured < minimum) {
+    return minimum;
   }
 
   return configured;
@@ -155,9 +165,10 @@ async function main() {
     ...result,
     transaction_b64: serialized.toString("base64"),
     sender_enabled: true,
+    sender_mode: senderMode(),
     sender_tip_lamports: tip,
     sender_tip_account: tipAccount.toBase58(),
-    sender_transport: "helius_sender_max",
+    sender_transport: senderMode() === "max" ? "helius_sender_max" : "helius_sender_swqos",
     instruction_count: tx.instructions.length,
   };
 
