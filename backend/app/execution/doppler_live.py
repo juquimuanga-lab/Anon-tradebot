@@ -1,18 +1,19 @@
 """Live execution for SPCX-quoted Doppler Uniswap-v4 launches on Robinhood Chain."""
 from __future__ import annotations
-import asyncio, logging, os, time
+import asyncio, logging, time
 from eth_abi import encode
 from eth_account.signers.local import LocalAccount
 from web3 import Web3
 from app.execution.base import ExecutionAdapter, OrderResult
 from app.scoring.rules import TokenSnapshot
+from app.connectors import doppler_control
 
 logger = logging.getLogger("app.execution.doppler")
 CHAIN_ID = 4663
 UNIVERSAL_ROUTER = "0x8876789976dEcBfCbBbe364623C63652db8C0904"
 PERMIT2 = "0x000000000022D473030F116dDEE9F6B43aC78BA3"
 V4_QUOTER = "0x8dc178efb8111bb0973dd9d722ebeff267c98f94"
-SPCX = "0x4a0e65a3eccec6dbe60ae065f2e7bb85fae35eea"
+SPCX = doppler_control.SPCX_TOKEN
 BPS = 10_000
 
 ROUTER_ABI = [{"inputs":[{"name":"commands","type":"bytes"},{"name":"inputs","type":"bytes[]"},{"name":"deadline","type":"uint256"}],"name":"execute","outputs":[],"stateMutability":"payable","type":"function"}]
@@ -86,12 +87,9 @@ class DopplerExecutionAdapter(ExecutionAdapter):
             pool_key = market.get("pool_key")
             if not pool_key or not _is_spcx(pool_key.get("currency0","")):
                 raise RuntimeError("Doppler SPCX pool key is unavailable or not SPCX/currency0")
-            configured = os.getenv("DOPPLER_BUY_SIZE_SPCX")
-            if configured is None:
-                raise RuntimeError("DOPPLER_BUY_SIZE_SPCX must be configured; admin wallet must be pre-funded with SPCX")
-            spend_spcx = float(configured)
+            spend_spcx = doppler_control.get_buy_size_spcx()
             if spend_spcx <= 0:
-                raise RuntimeError("DOPPLER_BUY_SIZE_SPCX must be greater than zero")
+                raise RuntimeError("DOPPLER_BUY_SIZE_SPCX must be configured to a value greater than zero")
             decimals = int(self._spcx.functions.decimals().call())
             amount_in = max(1, int(spend_spcx * (10 ** decimals)))
             await asyncio.to_thread(self._require_spcx_ready, amount_in)
