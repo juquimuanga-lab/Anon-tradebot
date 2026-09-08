@@ -1,6 +1,6 @@
 """Deterministic chart-structure entry timing for Pump.fun Smart Filter.
 
-This module deliberately does not call an LLM in the execution hot path.  It
+This module deliberately does not call an LLM in the execution hot path. It
 builds a short-lived, trader-like state machine from the snapshots the scanner
 already produces and separates *candidate quality* from *entry timing*.
 
@@ -24,25 +24,47 @@ logger = logging.getLogger("app.scanners.trader_brain")
 SOURCE_PUMPFUN = "pumpfun"
 SMART_STRATEGY = "smart"
 
-# The brain is deliberately conservative about chasing vertical moves.
+# Short-lived market structure. The brain is deliberately more permissive than
+# v1: it should reject bad/chased entries without requiring a perfect chart.
 MAX_OBSERVATIONS = 64
 MAX_HISTORY_SECONDS = 180.0
 MIN_OBSERVATIONS = 3
+
 BREAKOUT_MIN_PCT = 1.5
-BREAKOUT_MAX_PCT = 12.0
-PULLBACK_MIN_PCT = 6.0
-PULLBACK_MAX_PCT = 25.0
-RECLAIM_MIN_BOUNCE_PCT = 3.5
-RECLAIM_MAX_DISTANCE_FROM_PEAK_PCT = 8.0
-EXHAUSTION_SHORT_RUNUP_PCT = 8.0
-EXHAUSTION_FROM_LOW_PCT = 20.0
-MIN_HEALTHY_BUY_PRESSURE = 0.60
-MIN_RECLAIM_BUY_PRESSURE = 0.62
-MIN_BREAKOUT_BUY_PRESSURE = 0.65
-MIN_HEALTHY_BUY_SELL_RATIO = 1.20
-MIN_RECLAIM_BUY_SELL_RATIO = 1.35
-MIN_BREAKOUT_BUY_SELL_RATIO = 1.50
-MIN_VELOCITY_SOL_PER_SEC = 0.008
+BREAKOUT_MAX_PCT = 18.0
+
+PULLBACK_MIN_PCT = 4.0
+PULLBACK_MAX_PCT = 22.0
+RECLAIM_MIN_BOUNCE_PCT = 2.5
+RECLAIM_REQUIRED_RECOVERY_PCT = 85.0
+
+# Hard anti-chase veto. We keep this strict because it protects against the
+# exact late-entry pattern the original Trader Brain was built to prevent.
+EXHAUSTION_SHORT_RUNUP_PCT = 10.0
+EXHAUSTION_FROM_LOW_PCT = 25.0
+EXHAUSTION_NEAR_PEAK_PCT = 8.0
+
+# Flow thresholds are lower than v1 so the brain can act on good-but-not-
+# perfect demand while existing safety/risk layers remain authoritative.
+MIN_HEALTHY_BUY_PRESSURE = 0.58
+MIN_RECLAIM_BUY_PRESSURE = 0.58
+MIN_BREAKOUT_BUY_PRESSURE = 0.60
+MIN_MOMENTUM_BUY_PRESSURE = 0.60
+
+MIN_HEALTHY_BUY_SELL_RATIO = 1.15
+MIN_RECLAIM_BUY_SELL_RATIO = 1.20
+MIN_BREAKOUT_BUY_SELL_RATIO = 1.25
+MIN_MOMENTUM_BUY_SELL_RATIO = 1.30
+
+MIN_RECLAIM_VELOCITY_SOL_PER_SEC = 0.004
+MIN_BREAKOUT_VELOCITY_SOL_PER_SEC = 0.004
+MIN_MOMENTUM_VELOCITY_SOL_PER_SEC = 0.005
+
+# Momentum continuation prevents the brain from waiting forever for a
+# pullback on a genuinely healthy trend. It still has an anti-chase cap.
+MOMENTUM_MAX_SHORT_MOVE_PCT = 15.0
+MOMENTUM_MAX_FROM_RECENT_LOW_PCT = 22.0
+MOMENTUM_MIN_RECENT_RANGE_PCT = 2.0
 
 
 @dataclass
@@ -100,12 +122,7 @@ class TraderBrain:
             return default
 
     def observe(self, token: Any, rule: Any | None = None) -> dict[str, Any]:
-        """Record one Pump.fun Smart snapshot and classify its structure.
-
-        Observation is intentionally independent of whether Graduation Hunter
-        has passed yet. That lets the brain remember the earlier move and avoid
-        buying only because a later confirmation arrived at the top.
-        """
+        """Record one Pump.fun Smart snapshot and classify its structure."""
         if getattr(token, "source", "") != SOURCE_PUMPFUN:
             return {"phase": "not_applicable"}
         if rule is not None and getattr(rule, "strategy", SMART_STRATEGY) != SMART_STRATEGY:
@@ -141,6 +158,8 @@ class TraderBrain:
 
         result = self._classify(state)
         state.last_phase = result["phase"]
+        state.last_decision = result.get("decision", "wait")
+        state.last_reason = str(result.get("reason") or "")
         token.raw_enrichment["trader_brain"] = result
         return result
 
@@ -157,8 +176,9 @@ class TraderBrain:
         current = observations[-1]
         previous = observations[-2]
         recent = observations[-8:]
+        prior = observations[:-1]
         recent_low = min(item.market_cap for item in recent)
-        prior_high = max(item.market_cap for item in observations[:-1])
+        prior_high = max(item.market_cap for item in prior)
         peak = max(state.peak_market_cap, current.market_cap)
 
         short_change = self._pct_change(previous.market_cap, current.market_cap)
@@ -167,21 +187,20 @@ class TraderBrain:
         recent_range = self._range_pct(recent)
         pressure_delta = current.buy_pressure - previous.buy_pressure
         ratio_delta = current.buy_sell_ratio - previous.buy_sell_ratio
+        near_peak = abs(from_peak) <= EXHAUSTION_NEAR_PEAK_PCT
 
-        # A strong vertical move immediately followed by weakening flow is a
-        # classic "do not chase" setup. We treat this as distribution risk even
-        # if the Graduation score is still excellent.
+        # 1. Hard anti-chase veto.
         exhaustion = (
             from_recent_low >= EXHAUSTION_FROM_LOW_PCT
             and short_change >= EXHAUSTION_SHORT_RUNUP_PCT
+            and near_peak
             and (
                 current.buy_pressure < MIN_HEALTHY_BUY_PRESSURE
                 or pressure_delta <= -0.08
                 or ratio_delta <= -0.50
             )
         )
-        near_peak = abs(from_peak) <= RECLAIM_MAX_DISTANCE_FROM_PEAK_PCT
-        if exhaustion and near_peak:
+        if exhaustion:
             return {
                 "phase": "extended",
                 "decision": "wait",
@@ -194,29 +213,35 @@ class TraderBrain:
                 "buy_sell_ratio": round(current.buy_sell_ratio, 4),
             }
 
-        # Once price falls meaningfully from a peak, remember the pullback low.
-        # This is the setup we want to buy only after a healthy reclaim.
-        if PULLBACK_MIN_PCT <= -from_peak <= PULLBACK_MAX_PCT:
+        # 2. Pullback + reclaim.
+        pullback_pct = -from_peak
+        if PULLBACK_MIN_PCT <= pullback_pct <= PULLBACK_MAX_PCT:
             if state.pullback_low_market_cap <= 0.0 or current.market_cap < state.pullback_low_market_cap:
                 state.pullback_low_market_cap = current.market_cap
                 state.pullback_started_at = current.timestamp
 
             pullback_low = state.pullback_low_market_cap
             bounce = self._pct_change(pullback_low, current.market_cap)
+            prior_structure_recovery = (
+                current.market_cap / prior_high * 100.0
+                if prior_high > 0.0
+                else 0.0
+            )
             if (
                 bounce >= RECLAIM_MIN_BOUNCE_PCT
                 and current.buy_pressure >= MIN_RECLAIM_BUY_PRESSURE
                 and current.buy_sell_ratio >= MIN_RECLAIM_BUY_SELL_RATIO
-                and current.buy_velocity >= MIN_VELOCITY_SOL_PER_SEC
-                and current.market_cap >= prior_high * 0.90
+                and current.buy_velocity >= MIN_RECLAIM_VELOCITY_SOL_PER_SEC
+                and prior_structure_recovery >= RECLAIM_REQUIRED_RECOVERY_PCT
             ):
                 return {
                     "phase": "reclaim",
                     "decision": "enter",
-                    "confidence": 0.91,
-                    "reason": "healthy pullback followed by flow-backed reclaim of the prior structure",
-                    "pullback_from_peak_pct": round(-from_peak, 2),
+                    "confidence": 0.88,
+                    "reason": "healthy pullback followed by flow-backed reclaim of prior structure",
+                    "pullback_from_peak_pct": round(pullback_pct, 2),
                     "bounce_from_pullback_low_pct": round(bounce, 2),
+                    "structure_recovery_pct": round(prior_structure_recovery, 2),
                     "buy_pressure": round(current.buy_pressure, 4),
                     "buy_sell_ratio": round(current.buy_sell_ratio, 4),
                     "buy_velocity_sol_per_sec": round(current.buy_velocity, 6),
@@ -224,21 +249,21 @@ class TraderBrain:
             return {
                 "phase": "pullback",
                 "decision": "wait",
-                "confidence": 0.82,
-                "reason": "healthy pullback is forming; wait for a flow-backed reclaim",
-                "pullback_from_peak_pct": round(-from_peak, 2),
+                "confidence": 0.78,
+                "reason": "pullback is forming; wait for buyers to reclaim structure",
+                "pullback_from_peak_pct": round(pullback_pct, 2),
                 "bounce_from_pullback_low_pct": round(bounce, 2),
+                "structure_recovery_pct": round(prior_structure_recovery, 2),
             }
 
-        # Breakout entries are allowed, but only when the move is controlled.
-        # A 40% candle is not a breakout entry; it is a chase.
+        # 3. Controlled breakout.
         breakout_pct = self._pct_change(prior_high, current.market_cap)
         controlled_breakout = (
             breakout_pct >= BREAKOUT_MIN_PCT
             and breakout_pct <= BREAKOUT_MAX_PCT
             and current.buy_pressure >= MIN_BREAKOUT_BUY_PRESSURE
             and current.buy_sell_ratio >= MIN_BREAKOUT_BUY_SELL_RATIO
-            and current.buy_velocity >= MIN_VELOCITY_SOL_PER_SEC
+            and current.buy_velocity >= MIN_BREAKOUT_VELOCITY_SOL_PER_SEC
             and short_change <= BREAKOUT_MAX_PCT
         )
         if controlled_breakout:
@@ -246,8 +271,8 @@ class TraderBrain:
             return {
                 "phase": "breakout",
                 "decision": "enter",
-                "confidence": 0.88,
-                "reason": "controlled breakout with confirming buy pressure and capital velocity",
+                "confidence": 0.86,
+                "reason": "controlled breakout with confirming demand and capital velocity",
                 "breakout_pct": round(breakout_pct, 2),
                 "short_change_pct": round(short_change, 2),
                 "buy_pressure": round(current.buy_pressure, 4),
@@ -255,19 +280,60 @@ class TraderBrain:
                 "buy_velocity_sol_per_sec": round(current.buy_velocity, 6),
             }
 
-        # If the chart is rising but not yet breaking structure, keep watching.
-        rising = current.market_cap > previous.market_cap and current.buy_pressure >= MIN_HEALTHY_BUY_PRESSURE
-        if rising and recent_range <= 18.0:
+        # 4. Momentum continuation. This catches a healthy trend that keeps
+        # climbing without requiring a textbook pullback.
+        trend_observations = observations[-4:]
+        positive_steps = sum(
+            1
+            for left, right in zip(trend_observations, trend_observations[1:])
+            if right.market_cap > left.market_cap
+        )
+        momentum = (
+            positive_steps >= 2
+            and current.market_cap > previous.market_cap
+            and current.buy_pressure >= MIN_MOMENTUM_BUY_PRESSURE
+            and current.buy_sell_ratio >= MIN_MOMENTUM_BUY_SELL_RATIO
+            and current.buy_velocity >= MIN_MOMENTUM_VELOCITY_SOL_PER_SEC
+            and short_change <= MOMENTUM_MAX_SHORT_MOVE_PCT
+            and from_recent_low <= MOMENTUM_MAX_FROM_RECENT_LOW_PCT
+            and recent_range >= MOMENTUM_MIN_RECENT_RANGE_PCT
+            and -from_peak < PULLBACK_MIN_PCT
+        )
+        if momentum:
+            return {
+                "phase": "trending",
+                "decision": "enter",
+                "confidence": 0.82,
+                "reason": "healthy momentum continuation with sustained demand and controlled price action",
+                "positive_steps": positive_steps,
+                "short_change_pct": round(short_change, 2),
+                "from_recent_low_pct": round(from_recent_low, 2),
+                "recent_range_pct": round(recent_range, 2),
+                "buy_pressure": round(current.buy_pressure, 4),
+                "buy_sell_ratio": round(current.buy_sell_ratio, 4),
+                "buy_velocity_sol_per_sec": round(current.buy_velocity, 6),
+            }
+
+        # Healthy rising structure that is not yet an entry.
+        rising = (
+            current.market_cap > previous.market_cap
+            and current.buy_pressure >= MIN_HEALTHY_BUY_PRESSURE
+            and current.buy_sell_ratio >= MIN_HEALTHY_BUY_SELL_RATIO
+        )
+        if rising and recent_range <= 22.0:
             return {
                 "phase": "trending",
                 "decision": "wait",
-                "confidence": 0.70,
-                "reason": "trend is healthy but the entry is not yet confirmed",
+                "confidence": 0.68,
+                "reason": "trend is healthy but entry structure is not confirmed yet",
                 "recent_range_pct": round(recent_range, 2),
             }
 
         # Falling flow near a high is distribution, not a buy signal.
-        if near_peak and (current.buy_pressure < 0.55 or current.buy_sell_ratio < 1.0):
+        if near_peak and (
+            current.buy_pressure < 0.55
+            or current.buy_sell_ratio < 1.0
+        ):
             return {
                 "phase": "distribution",
                 "decision": "wait",
@@ -278,20 +344,20 @@ class TraderBrain:
                 "buy_sell_ratio": round(current.buy_sell_ratio, 4),
             }
 
-        if recent_range <= 10.0 and current.buy_pressure >= MIN_HEALTHY_BUY_PRESSURE:
+        if recent_range <= 12.0 and current.buy_pressure >= MIN_HEALTHY_BUY_PRESSURE:
             return {
                 "phase": "accumulation",
                 "decision": "wait",
-                "confidence": 0.74,
-                "reason": "compressed range with healthy demand; wait for breakout confirmation",
+                "confidence": 0.72,
+                "reason": "compressed range with healthy demand; wait for expansion",
                 "recent_range_pct": round(recent_range, 2),
             }
 
         return {
             "phase": "watch",
             "decision": "wait",
-            "confidence": 0.60,
-            "reason": "no professional-grade entry structure yet",
+            "confidence": 0.58,
+            "reason": "no acceptable entry structure yet",
         }
 
     @staticmethod
