@@ -31,30 +31,39 @@ SENDER_MODE = os.getenv(
     "swqos_only",
 ).strip().lower()
 
-# Helius currently accepts SWQoS-only Sender submissions from 0.000005 SOL.
-# Sender Max uses a 0.001 SOL minimum tip buffer. We default to SWQoS-only
-# because the bot currently trades very small positions where 0.001 SOL per
-# transaction is economically disproportionate.
 SWQOS_MIN_TIP_LAMPORTS = 5_000
 SENDER_MAX_MIN_TIP_LAMPORTS = 1_000_000
-DEFAULT_TIP_LAMPORTS = SWQOS_MIN_TIP_LAMPORTS
+DEFAULT_SWQOS_TIP_LAMPORTS = SWQOS_MIN_TIP_LAMPORTS
 
 try:
-    _configured_tip_lamports = int(
-        os.getenv("HELIUS_SENDER_TIP_LAMPORTS", DEFAULT_TIP_LAMPORTS)
+    _configured_swqos_tip_lamports = int(
+        os.getenv(
+            "HELIUS_SENDER_SWQOS_TIP_LAMPORTS",
+            DEFAULT_SWQOS_TIP_LAMPORTS,
+        )
     )
 except (TypeError, ValueError):
-    _configured_tip_lamports = DEFAULT_TIP_LAMPORTS
+    _configured_swqos_tip_lamports = DEFAULT_SWQOS_TIP_LAMPORTS
+
+try:
+    _configured_max_tip_lamports = int(
+        os.getenv("HELIUS_SENDER_TIP_LAMPORTS", SENDER_MAX_MIN_TIP_LAMPORTS)
+    )
+except (TypeError, ValueError):
+    _configured_max_tip_lamports = SENDER_MAX_MIN_TIP_LAMPORTS
 
 if SENDER_MODE == "max":
     SENDER_TIP_LAMPORTS = max(
         SENDER_MAX_MIN_TIP_LAMPORTS,
-        _configured_tip_lamports,
+        _configured_max_tip_lamports,
     )
 else:
+    # Do not inherit the old Sender-Max environment variable here. This is
+    # deliberate: deployments that already have HELIUS_SENDER_TIP_LAMPORTS=
+    # 1000000 must automatically become cost-optimized after redeploy.
     SENDER_TIP_LAMPORTS = max(
         SWQOS_MIN_TIP_LAMPORTS,
-        _configured_tip_lamports,
+        _configured_swqos_tip_lamports,
     )
 
 try:
