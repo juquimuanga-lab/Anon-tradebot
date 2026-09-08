@@ -31,7 +31,7 @@ const TIP_ACCOUNTS = [
 
 const SWQOS_MIN_TIP_LAMPORTS = 5_000;
 const SENDER_MAX_MIN_TIP_LAMPORTS = 1_000_000;
-const DEFAULT_TIP_LAMPORTS = SWQOS_MIN_TIP_LAMPORTS;
+const DEFAULT_SWQOS_TIP_LAMPORTS = SWQOS_MIN_TIP_LAMPORTS;
 
 function senderMode() {
   return String(process.env.HELIUS_SENDER_MODE || "swqos_only")
@@ -40,12 +40,19 @@ function senderMode() {
 }
 
 function tipLamports() {
-  const configured = Number(
-    process.env.HELIUS_SENDER_TIP_LAMPORTS || DEFAULT_TIP_LAMPORTS
-  );
-  const minimum = senderMode() === "max"
+  const mode = senderMode();
+  const minimum = mode === "max"
     ? SENDER_MAX_MIN_TIP_LAMPORTS
     : SWQOS_MIN_TIP_LAMPORTS;
+
+  // HELIUS_SENDER_TIP_LAMPORTS was historically the Sender Max setting.
+  // Do not reuse that old 0.001 SOL value in SWQoS-only mode. Use a separate
+  // variable so an existing Railway environment cannot silently reintroduce
+  // the expensive tip after deployment.
+  const configuredRaw = mode === "max"
+    ? process.env.HELIUS_SENDER_TIP_LAMPORTS
+    : process.env.HELIUS_SENDER_SWQOS_TIP_LAMPORTS;
+  const configured = Number(configuredRaw || DEFAULT_SWQOS_TIP_LAMPORTS);
 
   if (!Number.isSafeInteger(configured) || configured < minimum) {
     return minimum;
@@ -161,14 +168,15 @@ async function main() {
     verifySignatures: false,
   });
 
+  const mode = senderMode();
   const output = {
     ...result,
     transaction_b64: serialized.toString("base64"),
     sender_enabled: true,
-    sender_mode: senderMode(),
+    sender_mode: mode,
     sender_tip_lamports: tip,
     sender_tip_account: tipAccount.toBase58(),
-    sender_transport: senderMode() === "max" ? "helius_sender_max" : "helius_sender_swqos",
+    sender_transport: mode === "max" ? "helius_sender_max" : "helius_sender_swqos",
     instruction_count: tx.instructions.length,
   };
 
