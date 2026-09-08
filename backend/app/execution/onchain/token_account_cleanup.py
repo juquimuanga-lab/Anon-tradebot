@@ -24,7 +24,7 @@ TOKEN_PROGRAM_ID = Pubkey.from_string(
     "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"
 )
 TOKEN_2022_PROGRAM_ID = Pubkey.from_string(
-    "TokenzQdBNbLqP5VEh6kW1mM8q3fQnYv8w1q6p7s8t9u0"
+    "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb"
 )
 
 
