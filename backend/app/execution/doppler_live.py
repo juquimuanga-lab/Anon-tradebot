@@ -21,6 +21,7 @@ logger = logging.getLogger("app.execution.doppler")
 
 CHAIN_ID = 4663
 UNIVERSAL_ROUTER = "0x8876789976dEcBfCbBbe364623C63652db8C0904"
+V4_QUOTER = "0x8dc178efb8111bb0973dd9d722ebeff267c98f94"
 NATIVE = "0x0000000000000000000000000000000000000000"
 BPS = 10_000
 
@@ -33,6 +34,28 @@ ROUTER_ABI = [{
     "name": "execute",
     "outputs": [],
     "stateMutability": "payable",
+    "type": "function",
+}]
+
+QUOTER_ABI = [{
+    "inputs": [{"components": [
+        {"components": [
+            {"name": "currency0", "type": "address"},
+            {"name": "currency1", "type": "address"},
+            {"name": "fee", "type": "uint24"},
+            {"name": "tickSpacing", "type": "int24"},
+            {"name": "hooks", "type": "address"},
+        ], "name": "poolKey", "type": "tuple"},
+        {"name": "zeroForOne", "type": "bool"},
+        {"name": "exactAmount", "type": "uint128"},
+        {"name": "hookData", "type": "bytes"},
+    ], "name": "params", "type": "tuple"}],
+    "name": "quoteExactInputSingle",
+    "outputs": [
+        {"name": "amountOut", "type": "uint256"},
+        {"name": "gasEstimate", "type": "uint256"},
+    ],
+    "stateMutability": "nonpayable",
     "type": "function",
 }]
 
@@ -51,6 +74,10 @@ class DopplerExecutionAdapter(ExecutionAdapter):
         self._router = self._w3.eth.contract(
             address=Web3.to_checksum_address(UNIVERSAL_ROUTER),
             abi=ROUTER_ABI,
+        )
+        self._quoter = self._w3.eth.contract(
+            address=Web3.to_checksum_address(V4_QUOTER),
+            abi=QUOTER_ABI,
         )
 
     def _send(self, commands: bytes, inputs: list[bytes], value: int) -> str:
@@ -112,29 +139,20 @@ class DopplerExecutionAdapter(ExecutionAdapter):
                 )
 
             amount_in = max(1, int(float(amount_eth) * 10**18))
-            from app.connectors.doppler import DOPPLER_LENS_QUOTER, LENS_ABI
-            lens = self._w3.eth.contract(
-                address=Web3.to_checksum_address(DOPPLER_LENS_QUOTER),
-                abi=LENS_ABI,
-            )
             zero_for_one = str(pool_key["currency0"]).lower() == quote.lower()
-            quote_result = await asyncio.to_thread(lambda: lens.functions.quoteDopplerLensData({
+            quoted = await asyncio.to_thread(lambda: self._quoter.functions.quoteExactInputSingle({
                 "poolKey": pool_key,
                 "zeroForOne": zero_for_one,
                 "exactAmount": amount_in,
                 "hookData": b"",
             }).call())
-            sqrt_price = int(quote_result[0])
-            ratio = (sqrt_price * sqrt_price) / float(2 ** 192)
-            if ratio <= 0:
-                raise RuntimeError("Doppler pool returned zero price")
-            expected = int(amount_in * ratio) if zero_for_one else int(amount_in / ratio)
+            expected = int(quoted[0])
             if expected <= 0:
-                raise RuntimeError("Doppler quote returned zero tokens")
+                raise RuntimeError("Doppler V4 quoter returned zero tokens")
             min_out = expected * (BPS - self._buy_slippage_bps) // BPS
             commands, inputs = self._encode_v4_swap(pool_key, zero_for_one, amount_in, min_out)
             tx_hash = await asyncio.to_thread(self._send, commands, inputs, amount_in)
-            logger.info("doppler_buy_confirmed", extra={"mint": token.mint, "tx_signature": tx_hash, "amount_eth": float(amount_in) / 1e18, "min_tokens": min_out, "quote": quote})
+            logger.info("doppler_buy_confirmed", extra={"mint": token.mint, "tx_signature": tx_hash, "amount_eth": float(amount_in) / 1e18, "quoted_tokens": expected, "min_tokens": min_out, "quote": quote})
             return OrderResult(True, "filled", price_usd=float(token.price_usd or 0.0), tx_signature=tx_hash)
         except Exception as exc:
             logger.warning("doppler_buy_failed", extra={"mint": token.mint, "error": str(exc)})
