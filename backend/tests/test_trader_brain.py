@@ -37,7 +37,7 @@ def test_vertical_move_with_weakening_flow_is_not_chased():
     brain.observe(_token("mint-a", 10_000, 0.84, 3.2, 0.05), rule)
     result = brain.observe(_token("mint-a", 12_000, 0.72, 2.0, 0.03), rule)
 
-    assert result["phase"] in {"extended", "watch"}
+    assert result["phase"] == "extended"
     assert result["decision"] == "wait"
 
 
@@ -66,3 +66,18 @@ def test_controlled_breakout_can_trigger_entry():
 
     assert result["phase"] == "breakout"
     assert result["decision"] == "enter"
+
+
+def test_momentum_continuation_can_trigger_entry_without_breakout():
+    brain = TraderBrain()
+    rule = _rule()
+
+    brain.observe(_token("mint-d", 10_000, 0.68, 1.5, 0.008), rule)
+    brain.observe(_token("mint-d", 10_800, 0.70, 1.6, 0.010), rule)
+    brain.observe(_token("mint-d", 11_000, 0.71, 1.7, 0.010), rule)
+    brain.observe(_token("mint-d", 10_900, 0.64, 1.35, 0.007), rule)
+    result = brain.observe(_token("mint-d", 11_050, 0.68, 1.45, 0.008), rule)
+
+    assert result["phase"] == "trending"
+    assert result["decision"] == "enter"
+    assert result["positive_steps"] >= 2
