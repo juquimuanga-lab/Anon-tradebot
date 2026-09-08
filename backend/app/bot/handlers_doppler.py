@@ -1,13 +1,13 @@
 """Admin Telegram controls for the isolated Robinhood Doppler/SPCX sniper lane."""
 from __future__ import annotations
 
+import math
 import time
 
 from telegram import Update
 from telegram.ext import ContextTypes
 from web3 import Web3
 
-from app.bot.validation import is_plausible_api_key
 from app.security.allowlist import admin_required
 from app.security.secrets_manager import secrets_manager
 from app.storage import repository as repo
@@ -21,11 +21,6 @@ SPCX = doppler_control.SPCX_TOKEN
 SPCX_ABI = [{"inputs":[{"name":"spender","type":"address"},{"name":"amount","type":"uint256"}],"name":"approve","outputs":[{"type":"bool"}],"stateMutability":"nonpayable","type":"function"}]
 PERMIT2_ABI = [{"inputs":[{"name":"token","type":"address"},{"name":"spender","type":"address"},{"name":"amount","type":"uint160"},{"name":"expiration","type":"uint48"}],"name":"approve","outputs":[],"stateMutability":"nonpayable","type":"function"},{"inputs":[{"name":"owner","type":"address"},{"name":"token","type":"address"},{"name":"spender","type":"address"}],"name":"allowance","outputs":[{"name":"amount","type":"uint160"},{"name":"expiration","type":"uint48"},{"name":"nonce","type":"uint48"}],"stateMutability":"view","type":"function"}]
 BALANCE_ABI = [{"inputs":[{"name":"owner","type":"address"}],"name":"balanceOf","outputs":[{"type":"uint256"}],"stateMutability":"view","type":"function"},{"inputs":[{"name":"owner","type":"address"},{"name":"spender","type":"address"}],"name":"allowance","outputs":[{"type":"uint256"}],"stateMutability":"view","type":"function"},{"inputs":[],"name":"decimals","outputs":[{"type":"uint8"}],"stateMutability":"view","type":"function"}]
-
-
-def _account_and_w3(user_id: int):
-    raise RuntimeError("helper must be awaited")
-
 
 async def _get_account_and_w3(user_id: int):
     raw_key = await secrets_manager.get_robinhood_wallet_private_key(user_id)
@@ -57,7 +52,7 @@ def _send(w3, account, fn) -> str:
 
 @admin_required
 async def dopplerstatus_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Show Doppler switch, configured size, wallet and approval readiness."""
+    """Show Doppler switch, live size, wallet balance and approval readiness."""
     user_id = update.effective_user.id
     enabled = doppler_control.is_enabled()
     size = doppler_control.get_buy_size_spcx()
@@ -77,21 +72,23 @@ async def dopplerstatus_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) 
             "🎯 *Robinhood Doppler / SPCX Sniper*\n\n"
             f"Deployment gate: `{'ON' if deployment else 'OFF'}`\n"
             f"Doppler sniper: `{'ON' if enabled else 'OFF'}`\n"
-            f"Buy size: `{size:g} SPCX`\n"
+            f"Live snipe size: `{size:g} SPCX`\n"
             f"Wallet: `{account.address}`\n"
             f"SPCX balance: `{balance:.6f}`\n"
+            f"SPCX required per snipe: `{size:.6f}`\n"
             f"SPCX → Permit2: `{direct:.6f}`\n"
             f"Permit2 → Router: `{p2_amount:.6f}` ({'valid' if exp_ok else 'expired/missing'})\n"
             f"Overall readiness: `{'READY' if ready else 'NOT READY'}`\n\n"
             f"Canonical SPCX: `{SPCX}`\n"
-            "Only SPCX-quoted Doppler launches are accepted."
+            "Only SPCX-quoted Doppler launches are accepted.\n"
+            "The live snipe size is checked again immediately before every buy."
         )
     except Exception as exc:
         text = (
             "🎯 *Robinhood Doppler / SPCX Sniper*\n\n"
             f"Deployment gate: `{'ON' if deployment else 'OFF'}`\n"
             f"Doppler sniper: `{'ON' if enabled else 'OFF'}`\n"
-            f"Buy size: `{size:g} SPCX`\n"
+            f"Live snipe size: `{size:g} SPCX`\n"
             f"Wallet readiness: `NOT READY`\n"
             f"Reason: `{str(exc)}`"
         )
@@ -126,19 +123,19 @@ async def disable_doppler_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE
 @admin_required
 async def set_doppler_size_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not context.args:
-        await update.message.reply_text("Usage: /setdopplersize <SPCX>\nExample: /setdopplersize 1")
+        await update.message.reply_text("Usage: /setdopplersize <SPCX>\nExample: /setdopplersize 0.05")
         return
     try:
         value = float(context.args[0])
-    except ValueError:
+    except (TypeError, ValueError):
         await update.message.reply_text("❌ Buy size must be a number in SPCX.")
         return
-    if value <= 0 or value > 1_000_000:
-        await update.message.reply_text("❌ Buy size must be greater than 0 and no more than 1,000,000 SPCX.")
+    if not math.isfinite(value) or value <= 0 or value > 1_000_000:
+        await update.message.reply_text("❌ Buy size must be finite, greater than 0 and no more than 1,000,000 SPCX.")
         return
     doppler_control.set_buy_size_spcx(value)
     await repo.write_audit_log(str(update.effective_user.id), "set_doppler_buy_size", {"amount_spcx": value})
-    await update.message.reply_text(f"✅ Doppler buy size set to `{value:g} SPCX` per qualifying launch. This runtime setting resets to the Railway DOPPLER_BUY_SIZE_SPCX value after a restart.", parse_mode="Markdown")
+    await update.message.reply_text(f"✅ Live Doppler buy size is now `{value:g} SPCX` per qualifying launch. The executor will use exactly this runtime value and re-check the wallet balance immediately before each buy. It resets to the Railway DOPPLER_BUY_SIZE_SPCX startup default after a restart.", parse_mode="Markdown")
 
 
 @admin_required
