@@ -5,7 +5,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import List, Literal, Optional
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 BondingCurvePhase = Literal["any", "pre_graduation", "post_graduation"]
 SniperStrategy = Literal["smart", "fast", "smart_money"]
@@ -32,15 +32,31 @@ class RuleParams(BaseModel):
     bonding_curve_phase: BondingCurvePhase = "any"
     min_market_cap_usd: Optional[float] = 7000.0
     max_market_cap_usd: Optional[float] = 35000.0
-    max_slippage_pct: float = 2.0
+    max_slippage_pct: float = 12.0
     qualify_score_threshold: float = 55.0
     max_trades_per_hour: int = 5
     cooldown_seconds: int = 120
-    take_profit_levels: List[TakeProfitLevel] = Field(default_factory=lambda: [TakeProfitLevel(gain_pct=15.0, sell_pct=80.0)])
+    take_profit_levels: List[TakeProfitLevel] = Field(default_factory=lambda: [
+        TakeProfitLevel(gain_pct=10.0, sell_pct=25.0),
+        TakeProfitLevel(gain_pct=30.0, sell_pct=25.0),
+        TakeProfitLevel(gain_pct=45.0, sell_pct=50.0),
+    ])
     stop_loss_pct: float = 20.0
     trailing_stop_pct: Optional[float] = None
     sell_on_volume_drop_pct: Optional[float] = None
     time_based_exit_seconds: Optional[int] = None
+
+    @model_validator(mode="after")
+    def apply_solana_execution_profile(self):
+        """Keep every Solana rule on the current Pump.fun execution profile."""
+        if self.platform == "solana":
+            self.max_slippage_pct = 12.0
+            self.take_profit_levels = [
+                TakeProfitLevel(gain_pct=10.0, sell_pct=25.0),
+                TakeProfitLevel(gain_pct=30.0, sell_pct=25.0),
+                TakeProfitLevel(gain_pct=45.0, sell_pct=50.0),
+            ]
+        return self
 
     # Pump.fun anti-late-entry controls. These defaults are intentionally
     # conservative and apply without requiring a database migration.
