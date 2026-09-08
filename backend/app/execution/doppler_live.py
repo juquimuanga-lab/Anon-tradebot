@@ -1,12 +1,17 @@
 """Live execution for SPCX-quoted Doppler Uniswap-v4 launches on Robinhood Chain."""
 from __future__ import annotations
-import asyncio, logging, time
+
+import asyncio
+import logging
+import time
+
 from eth_abi import encode
 from eth_account.signers.local import LocalAccount
 from web3 import Web3
+
+from app.connectors import doppler_control
 from app.execution.base import ExecutionAdapter, OrderResult
 from app.scoring.rules import TokenSnapshot
-from app.connectors import doppler_control
 
 logger = logging.getLogger("app.execution.doppler")
 CHAIN_ID = 4663
@@ -25,15 +30,18 @@ ERC20_ABI = [
 ]
 PERMIT2_ABI = [{"inputs":[{"name":"owner","type":"address"},{"name":"token","type":"address"},{"name":"spender","type":"address"}],"name":"allowance","outputs":[{"name":"amount","type":"uint160"},{"name":"expiration","type":"uint48"},{"name":"nonce","type":"uint48"}],"stateMutability":"view","type":"function"}]
 
+
 def _is_spcx(address: str) -> bool:
     return str(address).lower() == SPCX.lower()
 
+
 class DopplerExecutionAdapter(ExecutionAdapter):
     mode = "live"
+
     def __init__(self, account: LocalAccount, rpc_url: str, buy_slippage_bps: int = 1000):
         self._account = account
         self._rpc_url = rpc_url
-        self._w3 = Web3(Web3.HTTPProvider(rpc_url, request_kwargs={"timeout":5}))
+        self._w3 = Web3(Web3.HTTPProvider(rpc_url, request_kwargs={"timeout": 5}))
         self._buy_slippage_bps = max(0, min(int(buy_slippage_bps), 3000))
         self._router = self._w3.eth.contract(address=Web3.to_checksum_address(UNIVERSAL_ROUTER), abi=ROUTER_ABI)
         self._quoter = self._w3.eth.contract(address=Web3.to_checksum_address(V4_QUOTER), abi=QUOTER_ABI)
@@ -47,7 +55,7 @@ class DopplerExecutionAdapter(ExecutionAdapter):
         if int(self._w3.eth.get_balance(self._account.address)) <= 0:
             raise RuntimeError("Robinhood admin wallet needs ETH for gas")
         nonce = self._w3.eth.get_transaction_count(self._account.address, "pending")
-        tx = fn.build_transaction({"from":self._account.address,"value":int(value),"nonce":nonce,"chainId":CHAIN_ID,"gasPrice":self._w3.eth.gas_price})
+        tx = fn.build_transaction({"from": self._account.address, "value": int(value), "nonce": nonce, "chainId": CHAIN_ID, "gasPrice": self._w3.eth.gas_price})
         tx["gas"] = int(self._w3.eth.estimate_gas(tx) * 1.20)
         signed = self._account.sign_transaction(tx)
         tx_hash = self._w3.eth.send_raw_transaction(signed.raw_transaction)
@@ -70,22 +78,35 @@ class DopplerExecutionAdapter(ExecutionAdapter):
     @staticmethod
     def _encode_v4_swap(pool_key: dict, amount_in: int, min_out: int) -> bytes:
         actions = bytes([0x06, 0x0c, 0x0f])
-        swap_param = encode(["(address,address,uint24,int24,address)","bool","uint128","uint128","uint256","bytes"], [[pool_key["currency0"],pool_key["currency1"],int(pool_key["fee"]),int(pool_key["tickSpacing"]),pool_key["hooks"]], True, int(amount_in), int(min_out), 0, b"") )
-        settle = encode(["address","uint256"],[pool_key["currency0"],int(amount_in)])
-        take = encode(["address","uint256"],[pool_key["currency1"],int(min_out)])
-        return encode(["bytes","bytes[]"],[actions,[swap_param,settle,take]])
+        pool_key_tuple = [
+            pool_key["currency0"],
+            pool_key["currency1"],
+            int(pool_key["fee"]),
+            int(pool_key["tickSpacing"]),
+            pool_key["hooks"],
+        ]
+        swap_param = encode(
+            ["(address,address,uint24,int24,address)", "bool", "uint128", "uint128", "uint256", "bytes"],
+            [pool_key_tuple, True, int(amount_in), int(min_out), 0, b""],
+        )
+        settle = encode(["address", "uint256"], [pool_key["currency0"], int(amount_in)])
+        take = encode(["address", "uint256"], [pool_key["currency1"], int(min_out)])
+        return encode(["bytes", "bytes[]"], [actions, [swap_param, settle, take]])
 
     @staticmethod
     def _encode_permit2_transfer(amount_in: int) -> bytes:
-        return encode(["address","address","uint160"],[Web3.to_checksum_address(SPCX),Web3.to_checksum_address(UNIVERSAL_ROUTER),int(amount_in)])
+        return encode(
+            ["address", "address", "uint160"],
+            [Web3.to_checksum_address(SPCX), Web3.to_checksum_address(UNIVERSAL_ROUTER), int(amount_in)],
+        )
 
     async def buy(self, token: TokenSnapshot, amount_spcx: float) -> OrderResult:
         try:
-            market = (getattr(token,"raw_enrichment",{}) or {}).get("pons",{}) or {}
-            if not _is_spcx(str(market.get("numeraire",""))):
+            market = (getattr(token, "raw_enrichment", {}) or {}).get("pons", {}) or {}
+            if not _is_spcx(str(market.get("numeraire", ""))):
                 raise RuntimeError("Doppler execution requires the canonical SPCX numeraire")
             pool_key = market.get("pool_key")
-            if not pool_key or not _is_spcx(pool_key.get("currency0","")):
+            if not pool_key or not _is_spcx(pool_key.get("currency0", "")):
                 raise RuntimeError("Doppler SPCX pool key is unavailable or not SPCX/currency0")
             spend_spcx = doppler_control.get_buy_size_spcx()
             if spend_spcx <= 0:
@@ -93,20 +114,20 @@ class DopplerExecutionAdapter(ExecutionAdapter):
             decimals = int(self._spcx.functions.decimals().call())
             amount_in = max(1, int(spend_spcx * (10 ** decimals)))
             await asyncio.to_thread(self._require_spcx_ready, amount_in)
-            quoted = await asyncio.to_thread(lambda:self._quoter.functions.quoteExactInputSingle({"poolKey":pool_key,"zeroForOne":True,"exactAmount":amount_in,"hookData":b""}).call())
+            quoted = await asyncio.to_thread(lambda: self._quoter.functions.quoteExactInputSingle({"poolKey": pool_key, "zeroForOne": True, "exactAmount": amount_in, "hookData": b""}).call())
             expected = int(quoted[0])
             if expected <= 0:
                 raise RuntimeError("Doppler SPCX quoter returned zero tokens")
-            min_out = expected * (BPS-self._buy_slippage_bps) // BPS
+            min_out = expected * (BPS - self._buy_slippage_bps) // BPS
             v4_input = self._encode_v4_swap(pool_key, amount_in, min_out)
-            commands = bytes([0x02,0x10])
+            commands = bytes([0x02, 0x10])
             inputs = [self._encode_permit2_transfer(amount_in), v4_input]
-            tx_hash = await asyncio.to_thread(self._send,self._router.functions.execute(commands,inputs,int(time.time())+20),0)
-            logger.info("doppler_spcx_buy_confirmed",extra={"mint":token.mint,"tx_signature":tx_hash,"amount_spcx":spend_spcx,"quoted_tokens":expected,"min_tokens":min_out})
-            return OrderResult(True,"filled",price_usd=float(token.price_usd or 0.0),tx_signature=tx_hash)
+            tx_hash = await asyncio.to_thread(self._send, self._router.functions.execute(commands, inputs, int(time.time()) + 20), 0)
+            logger.info("doppler_spcx_buy_confirmed", extra={"mint": token.mint, "tx_signature": tx_hash, "amount_spcx": spend_spcx, "quoted_tokens": expected, "min_tokens": min_out})
+            return OrderResult(True, "filled", price_usd=float(token.price_usd or 0.0), tx_signature=tx_hash)
         except Exception as exc:
-            logger.warning("doppler_spcx_buy_failed",extra={"mint":token.mint,"error":str(exc)})
-            return OrderResult(False,"failed",error_message=str(exc))
+            logger.warning("doppler_spcx_buy_failed", extra={"mint": token.mint, "error": str(exc)})
+            return OrderResult(False, "failed", error_message=str(exc))
 
     async def sell(self, token: TokenSnapshot, amount_tokens: float, sell_pct: float) -> OrderResult:
-        return OrderResult(False,"failed",error_message="Doppler SPCX sell routing is not enabled yet; sniper is buy-only.")
+        return OrderResult(False, "failed", error_message="Doppler SPCX sell routing is not enabled yet; sniper is buy-only.")
