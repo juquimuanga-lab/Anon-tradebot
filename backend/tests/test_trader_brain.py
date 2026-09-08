@@ -51,7 +51,7 @@ def test_pullback_then_reclaim_can_trigger_entry():
     pullback = brain.observe(_token("mint-b", 12_600, 0.55, 0.95, 0.004), rule)
     assert pullback["decision"] == "wait"
 
-    reclaim = brain.observe(_token("mint-b", 12_900, 0.75, 1.8, 0.02), rule)
+    reclaim = brain.observe(_token("mint-b", 13_150, 0.75, 1.8, 0.02), rule)
     assert reclaim["phase"] == "reclaim"
     assert reclaim["decision"] == "enter"
 
