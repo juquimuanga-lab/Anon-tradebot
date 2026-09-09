@@ -71,3 +71,9 @@ try:
     from app.connectors import doppler_direct_lane as _doppler_direct_lane  # noqa: F401
 except Exception:
     logger.exception("doppler_direct_lane_bootstrap_failed")
+
+# Diagnostics are telemetry-only and use the same runtime-safe bootstrap.
+try:
+    from app.connectors import doppler_diagnostics as _doppler_diagnostics  # noqa: F401
+except Exception:
+    logger.exception("doppler_diagnostics_bootstrap_failed")
