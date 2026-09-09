@@ -28,14 +28,10 @@ try:
         except Exception:
             logger.exception("trader_brain_bootstrap_failed")
 
-        # One shared Pump.fun preconf firehose feeds both Fast Sniper and Smart
-        # Money Copy. We deliberately do not create a second subscription per lane.
         _preconf.ensure_started(settings.smart_money_wallets)
         preconf_events = _preconf.drain_launches()
         existing = await _original_poll_new_pumpfun_mints(rpc_url, watermarks, limit)
 
-        # Preconf wins on duplicate signatures because it is the earlier signal.
-        # Existing WSS/RPC recovery remains responsible for coverage gaps.
         merged = []
         seen = set()
         for item in preconf_events + existing:
@@ -72,15 +68,8 @@ try:
     _onchain_watcher.drain_smart_money_buys = _preconf_aware_drain_smart_money_buys
 
 except Exception:
-    # Never make scanner imports fail because an optional low-latency transport
-    # is unavailable. The original watcher remains fully operational.
     logger.exception("preconf_bootstrap_failed")
 
-# Robinhood Chain Doppler/Long launch lane. Importing it here guarantees the
-# direct lane is loaded whenever the scanner package is loaded. The lane has a
-# retrying installer because ScannerService itself is imported after this package
-# initializer during normal Python module loading.
-try:
-    from app.connectors import doppler_direct_lane as _doppler_direct_lane  # noqa: F401
-except Exception:
-    logger.exception("doppler_direct_lane_bootstrap_failed")
+# Doppler is deliberately not imported here. It is bootstrapped by the
+# runtime-safe direct lane without relying on ScannerService package import
+# ordering.
