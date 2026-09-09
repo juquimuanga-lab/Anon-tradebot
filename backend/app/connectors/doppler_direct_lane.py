@@ -27,6 +27,7 @@ from app.security.secrets_manager import secrets_manager
 
 logger = logging.getLogger("app.connectors.doppler_direct_lane")
 SOURCE_DOPPLER = "doppler"
+_INSTALL_RETRY_SECONDS = 2.0
 
 
 def _suffix_matches(mint: str) -> bool:
@@ -36,9 +37,8 @@ def _suffix_matches(mint: str) -> bool:
 
 
 async def _watch_doppler_for_new_mints(scanner) -> None:
-    # IMPORTANT: discovery must never be disabled by /enabledoppler or the
-    # trading deployment gate. Those are execution controls, not scanners.
-    # Otherwise a disabled sniper silently stops observing the chain.
+    # Discovery must never be disabled by /enabledoppler or the trading
+    # deployment gate. Those are execution controls, not scanners.
     try:
         discovered = await doppler_client.poll_new_launches()
     except Exception as exc:
@@ -47,6 +47,11 @@ async def _watch_doppler_for_new_mints(scanner) -> None:
             extra={"error": str(exc)},
         )
         return
+
+    logger.info(
+        "doppler_direct_polling",
+        extra={"discovered": len(discovered or [])},
+    )
 
     if not discovered:
         return
@@ -86,7 +91,6 @@ async def _watch_doppler_for_new_mints(scanner) -> None:
 
         fingerprint_matches += 1
 
-        # Discovery/qualification is logged even while trading is disabled.
         if not doppler_control.deployment_enabled() or not doppler_control.is_enabled():
             logger.info(
                 "doppler_qualified_launch_trading_disabled",
@@ -158,7 +162,7 @@ async def _snapshot_doppler(mint: str, metadata: dict, first_seen: datetime):
     )
 
 
-def _install() -> None:
+def _install() -> bool:
     try:
         from app.scanners.scanner import ScannerService
         from app.storage import repository as repo
@@ -167,7 +171,7 @@ def _install() -> None:
         from app.config.settings import settings
 
         if getattr(ScannerService, "_doppler_direct_lane_installed", False):
-            return
+            return True
 
         original_watch_all = ScannerService._watch_wallets_for_new_mints
         original_snapshot = ScannerService._build_onchain_snapshot
@@ -259,15 +263,31 @@ def _install() -> None:
                 "discovery_independent_of_trading_gate": True,
             },
         )
-    except Exception:
-        logger.exception("doppler_direct_lane_install_failed")
+        return True
+    except Exception as exc:
+        logger.warning(
+            "doppler_direct_lane_install_retry",
+            extra={"error": str(exc)},
+        )
+        return False
 
 
-try:
-    loop = asyncio.get_running_loop()
-    loop.call_soon(_install)
-except RuntimeError:
+def _schedule_install_retry() -> None:
     try:
-        asyncio.get_event_loop().call_soon(_install)
-    except Exception:
-        logger.exception("doppler_direct_lane_schedule_failed")
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        try:
+            loop = asyncio.get_event_loop()
+        except Exception:
+            logger.exception("doppler_direct_lane_schedule_failed")
+            return
+
+    def _attempt() -> None:
+        if _install():
+            return
+        loop.call_later(_INSTALL_RETRY_SECONDS, _attempt)
+
+    loop.call_soon(_attempt)
+
+
+_schedule_install_retry()
