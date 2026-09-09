@@ -42,7 +42,10 @@ def _send(w3, account, fn) -> str:
     base_fee = latest.get("baseFeePerGas")
     if base_fee is not None:
         base_fee = int(base_fee)
-        priority_fee = max(1, int(getattr(w3.eth, "max_priority_fee", 0) or 0))
+        try:
+            priority_fee = max(1, int(w3.eth.max_priority_fee or 0))
+        except Exception:
+            priority_fee = max(1, int(base_fee // 10))
         max_fee = base_fee * 2 + priority_fee
         tx_params = {"from": account.address, "nonce": nonce, "chainId": 4663, "maxPriorityFeePerGas": priority_fee, "maxFeePerGas": max_fee, "type": 2}
     else:
@@ -62,7 +65,7 @@ async def dopplerstatus_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     user_id = update.effective_user.id
     enabled = doppler_control.is_enabled()
     size = doppler_control.get_buy_size_spcx()
-    deployment = bool(getattr(settings, "robinhood_pons_trading_enabled", False))
+    deployment = doppler_control.deployment_enabled()
     try:
         account, w3 = await _get_account_and_w3(user_id)
         spcx = w3.eth.contract(address=Web3.to_checksum_address(SPCX), abi=BALANCE_ABI)
@@ -74,7 +77,7 @@ async def dopplerstatus_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         p2_amount = int(p2_amount) / 10**decimals
         exp_ok = int(expiration) > int(time.time())
         ready = deployment and enabled and size > 0 and balance >= size and direct >= size and p2_amount >= size and exp_ok
-        text = ("🎯 *Robinhood Doppler / SPCX Sniper*\n\n" f"Deployment gate: `{'ON' if deployment else 'OFF'}`\n" f"Doppler sniper: `{'ON' if enabled else 'OFF'}`\n" f"Live snipe size: `{size:g} SPCX`\n" f"Wallet: `{account.address}`\n" f"SPCX balance: `{balance:.6f}`\n" f"SPCX required per snipe: `{size:.6f}`\n" f"SPCX → Permit2: `{direct:.6f}`\n" f"Permit2 → Router: `{p2_amount:.6f}` ({'valid' if exp_ok else 'expired/missing'})\n" f"Overall readiness: `{'READY' if ready else 'NOT READY'}`\n\n" f"Canonical SPCX: `{SPCX}`\n" "Only SPCX-quoted Doppler launches are accepted.\n" "The live snipe size is checked again immediately before every buy.")
+        text = ("🎯 *Robinhood Doppler / SPCX Sniper*\n\n" f"Deployment gate: `{'ON' if deployment else 'OFF'}`\n" f"Doppler sniper: `{'ON' if enabled else 'OFF'}`\n" f"Live snipe size: `{size:g} SPCX`\n" f"Wallet: `{account.address}`\n" f"SPCX balance: `{balance:.6f}`\n" f"SPCX required per snipe: `{size:.6f}`\n" f"SPCX → Permit2: `{direct:.6f}`\n" f"Permit2 → Router: `{p2_amount:.6f}` ({'valid' if exp_ok else 'expired/missing'})\n" f"Overall readiness: `{'READY' if ready else 'NOT READY'}`\n\n" f"Canonical SPCX: `{SPCX}`\n" f"Anoncoin fingerprint: token address ends in `{doppler_control.ANONCOIN_ADDRESS_SUFFIX}`\n" "Only canonical SPCX-quoted launches matching the fingerprint are accepted.\n" "The live snipe size is checked again immediately before every buy.")
     except Exception as exc:
         text = ("🎯 *Robinhood Doppler / SPCX Sniper*\n\n" f"Deployment gate: `{'ON' if deployment else 'OFF'}`\n" f"Doppler sniper: `{'ON' if enabled else 'OFF'}`\n" f"Live snipe size: `{size:g} SPCX`\n" f"Wallet readiness: `NOT READY`\n" f"Reason: `{str(exc)}`")
     await update.message.reply_text(text, parse_mode="Markdown")
@@ -82,8 +85,8 @@ async def dopplerstatus_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) 
 
 @admin_required
 async def enable_doppler_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not getattr(settings, "robinhood_pons_trading_enabled", False):
-        await update.message.reply_text("Doppler is blocked by the deployment gate. Set ROBINHOOD_PONS_TRADING_ENABLED=true in Railway first.")
+    if not doppler_control.deployment_enabled():
+        await update.message.reply_text("Doppler is blocked by the deployment gate. Set ROBINHOOD_DOPPLER_TRADING_ENABLED=true in Railway first.")
         return
     try:
         await _get_account_and_w3(update.effective_user.id)
@@ -102,7 +105,7 @@ async def enable_doppler_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE)
 async def disable_doppler_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     doppler_control.set_enabled(False)
     await repo.write_audit_log(str(update.effective_user.id), "disable_doppler", {})
-    await update.message.reply_text("🔴 Doppler/SPCX sniper is OFF. Existing Pump.fun/Pons controls are unchanged.")
+    await update.message.reply_text("🔴 Doppler/SPCX sniper is OFF. The direct Doppler lane is disabled; the existing Solana/Pump.fun lanes are unchanged.")
 
 
 @admin_required
