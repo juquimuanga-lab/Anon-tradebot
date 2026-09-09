@@ -75,3 +75,12 @@ except Exception:
     # Never make scanner imports fail because an optional low-latency transport
     # is unavailable. The original watcher remains fully operational.
     logger.exception("preconf_bootstrap_failed")
+
+# Robinhood Chain Doppler/Long launch lane. Importing it here guarantees the
+# direct lane is loaded whenever the scanner package is loaded. The lane has a
+# retrying installer because ScannerService itself is imported after this package
+# initializer during normal Python module loading.
+try:
+    from app.connectors import doppler_direct_lane as _doppler_direct_lane  # noqa: F401
+except Exception:
+    logger.exception("doppler_direct_lane_bootstrap_failed")
