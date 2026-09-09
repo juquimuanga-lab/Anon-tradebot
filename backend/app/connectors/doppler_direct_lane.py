@@ -12,6 +12,7 @@ live sniper queue.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
 import threading
@@ -39,6 +40,7 @@ def _suffix_matches(mint: str) -> bool:
 
 async def _watch_doppler_for_new_mints(scanner) -> None:
     """Poll the independent Doppler detector and feed qualified launches."""
+    poll_started = datetime.now(timezone.utc)
     try:
         discovered = await doppler_client.poll_new_launches()
     except Exception as exc:
@@ -54,10 +56,16 @@ async def _watch_doppler_for_new_mints(scanner) -> None:
             "discovered": len(discovered or []),
             "deployment_enabled": doppler_control.deployment_enabled(),
             "sniper_enabled": doppler_control.is_enabled(),
+            "pending_before": len(scanner._pending_watch),
+            "poll_started": poll_started.isoformat(),
         },
     )
 
     if not discovered:
+        logger.info(
+            "doppler_direct_no_launches",
+            extra={"pending_total": len(scanner._pending_watch)},
+        )
         return
 
     accepted = 0
@@ -66,7 +74,27 @@ async def _watch_doppler_for_new_mints(scanner) -> None:
 
     for item in discovered:
         mint = item.get("mint")
+        logger.info(
+            "doppler_launch_candidate_seen",
+            extra={
+                "mint": mint,
+                "numeraire": item.get("numeraire"),
+                "initializer": item.get("initializer"),
+                "pool_or_hook": item.get("pool_or_hook"),
+                "launcher": item.get("launcher"),
+                "creator": item.get("creator"),
+                "tx_hash": item.get("tx_hash"),
+                "block_number": item.get("block_number"),
+                "source": item.get("source"),
+                "venue": item.get("venue"),
+            },
+        )
+
         if not mint:
+            logger.warning(
+                "doppler_launch_rejected_missing_mint",
+                extra={"item": item},
+            )
             continue
 
         numeraire = str(item.get("numeraire", "")).lower()
@@ -77,34 +105,93 @@ async def _watch_doppler_for_new_mints(scanner) -> None:
                     "mint": mint,
                     "numeraire": numeraire,
                     "required_numeraire": doppler_control.SPCX_TOKEN,
+                    "stage": "numeraire_filter",
                 },
             )
             continue
 
         spcx_candidates += 1
+        logger.info(
+            "doppler_spcx_candidate_passed",
+            extra={
+                "mint": mint,
+                "numeraire": numeraire,
+                "spcx_candidates": spcx_candidates,
+            },
+        )
 
-        if not _suffix_matches(mint):
+        suffix_match = _suffix_matches(mint)
+        logger.info(
+            "doppler_fingerprint_evaluated",
+            extra={
+                "mint": mint,
+                "required_suffix": doppler_control.ANONCOIN_ADDRESS_SUFFIX,
+                "suffix_match": suffix_match,
+            },
+        )
+        if not suffix_match:
             logger.info(
                 "doppler_spcx_launch_rejected_fingerprint",
                 extra={
                     "mint": mint,
                     "required_suffix": doppler_control.ANONCOIN_ADDRESS_SUFFIX,
+                    "stage": "fingerprint_filter",
                 },
             )
             continue
 
         fingerprint_matches += 1
+        deployment_enabled = doppler_control.deployment_enabled()
+        sniper_enabled = doppler_control.is_enabled()
+        logger.info(
+            "doppler_qualified_launch_gate_evaluated",
+            extra={
+                "mint": mint,
+                "deployment_enabled": deployment_enabled,
+                "sniper_enabled": sniper_enabled,
+                "stage": "trading_gate",
+            },
+        )
 
-        if not doppler_control.deployment_enabled() or not doppler_control.is_enabled():
+        if not deployment_enabled or not sniper_enabled:
             logger.info(
                 "doppler_qualified_launch_trading_disabled",
-                extra={"mint": mint, "trading_enabled": doppler_control.is_enabled()},
+                extra={
+                    "mint": mint,
+                    "deployment_enabled": deployment_enabled,
+                    "trading_enabled": sniper_enabled,
+                    "stage": "trading_gate_rejected",
+                },
             )
             continue
 
         if mint in scanner._pending_watch:
+            logger.info(
+                "doppler_launch_already_pending",
+                extra={
+                    "mint": mint,
+                    "stage": "pending_dedup",
+                },
+            )
             continue
-        if await scanner._pending_repo_token_seen(mint):
+
+        try:
+            already_seen = await scanner._pending_repo_token_seen(mint)
+        except Exception as exc:
+            logger.exception(
+                "doppler_repo_duplicate_check_failed",
+                extra={"mint": mint, "error": str(exc)},
+            )
+            continue
+
+        if already_seen:
+            logger.info(
+                "doppler_launch_rejected_already_seen",
+                extra={
+                    "mint": mint,
+                    "stage": "repository_dedup",
+                },
+            )
             continue
 
         scanner._pending_watch[mint] = {
@@ -113,6 +200,18 @@ async def _watch_doppler_for_new_mints(scanner) -> None:
             "metadata": item,
         }
         accepted += 1
+
+        logger.info(
+            "doppler_launch_queued",
+            extra={
+                "mint": mint,
+                "source": SOURCE_DOPPLER,
+                "accepted": accepted,
+                "pending_total": len(scanner._pending_watch),
+                "tx_hash": item.get("tx_hash"),
+                "block_number": item.get("block_number"),
+            },
+        )
 
     logger.info(
         "doppler_direct_launch_batch",
@@ -123,6 +222,7 @@ async def _watch_doppler_for_new_mints(scanner) -> None:
             "accepted": accepted,
             "deployment_enabled": doppler_control.deployment_enabled(),
             "sniper_enabled": doppler_control.is_enabled(),
+            "pending_after": len(scanner._pending_watch),
         },
     )
 
@@ -130,20 +230,58 @@ async def _watch_doppler_for_new_mints(scanner) -> None:
 async def _snapshot_doppler(mint: str, metadata: dict, first_seen: datetime):
     from app.scoring.rules import TokenSnapshot
 
+    logger.info(
+        "doppler_snapshot_started",
+        extra={
+            "mint": mint,
+            "tx_hash": metadata.get("tx_hash"),
+            "block_number": metadata.get("block_number"),
+            "numeraire": metadata.get("numeraire"),
+            "initializer": metadata.get("initializer"),
+            "pool_or_hook": metadata.get("pool_or_hook"),
+        },
+    )
+
     try:
         market = await doppler_client.market_snapshot(mint, metadata)
     except Exception as exc:
-        logger.warning(
+        logger.exception(
             "doppler_direct_snapshot_not_ready",
             extra={"mint": mint, "error": str(exc)},
         )
         return None
 
     price_usd = float(market.get("price_usd", 0.0) or 0.0)
+    logger.info(
+        "doppler_snapshot_result",
+        extra={
+            "mint": mint,
+            "price_usd": price_usd,
+            "price_quote": market.get("price_quote"),
+            "quote_usd": market.get("quote_usd"),
+            "market_cap_usd": market.get("market_cap_usd"),
+            "liquidity_usd": market.get("liquidity_usd"),
+            "holders": market.get("holders"),
+            "holders_ready": market.get("holders_ready"),
+            "status": market.get("status"),
+            "tokens_on_curve": market.get("tokens_on_curve"),
+            "quote_symbol": market.get("quote_symbol"),
+            "pool_key": market.get("pool_key"),
+        },
+    )
     if price_usd <= 0:
+        logger.warning(
+            "doppler_snapshot_rejected_invalid_price",
+            extra={
+                "mint": mint,
+                "price_usd": price_usd,
+                "market_cap_usd": market.get("market_cap_usd"),
+                "liquidity_usd": market.get("liquidity_usd"),
+            },
+        )
         return None
 
-    return TokenSnapshot(
+    token = TokenSnapshot(
         mint=mint,
         ticker_name=market.get("name", metadata.get("symbol", "")),
         ticker_symbol=market.get("symbol", metadata.get("symbol", "")),
@@ -164,6 +302,20 @@ async def _snapshot_doppler(mint: str, metadata: dict, first_seen: datetime):
             "numeraire": metadata.get("numeraire"),
         },
     )
+    logger.info(
+        "doppler_snapshot_built",
+        extra={
+            "mint": mint,
+            "ticker": token.ticker_symbol,
+            "price_usd": token.price_usd,
+            "market_cap_usd": token.market_cap_usd,
+            "liquidity_usd": token.liquidity_usd,
+            "holders": token.holders,
+            "age_seconds": token.age_seconds,
+            "source": token.source,
+        },
+    )
+    return token
 
 
 def _install() -> bool:
@@ -194,11 +346,27 @@ def _install() -> bool:
 
         async def _build_snapshot(self, mint, source, metadata, first_seen):
             if source == SOURCE_DOPPLER:
+                logger.info(
+                    "doppler_snapshot_dispatch",
+                    extra={
+                        "mint": mint,
+                        "source": source,
+                        "pending_metadata_keys": sorted(metadata.keys()),
+                    },
+                )
                 return await _snapshot_doppler(mint, metadata, first_seen)
             return await original_snapshot(self, mint, source, metadata, first_seen)
 
         async def _enrich(self, token):
             if getattr(token, "source", "") == SOURCE_DOPPLER:
+                logger.info(
+                    "doppler_holder_enrichment_skipped",
+                    extra={
+                        "mint": token.mint,
+                        "holders": getattr(token, "holders", None),
+                        "reason": "direct_doppler_lane_does_not_use_solana_helius_enrichment",
+                    },
+                )
                 return token
             return await original_enrich(self, token)
 
@@ -208,15 +376,37 @@ def _install() -> bool:
                     self, mode, owner_user_id, source=source
                 )
 
+            logger.info(
+                "doppler_execution_adapter_requested",
+                extra={
+                    "mode": mode,
+                    "owner_user_id": owner_user_id,
+                    "source": source,
+                    "deployment_enabled": doppler_control.deployment_enabled(),
+                },
+            )
+
             if mode == "paper":
+                logger.info(
+                    "doppler_execution_adapter_paper",
+                    extra={"owner_user_id": owner_user_id},
+                )
                 return self._paper_adapter
 
             if owner_user_id is None:
+                logger.warning(
+                    "doppler_execution_adapter_rejected_no_owner",
+                    extra={"source": source},
+                )
                 return NoWalletConnectedAdapter(
                     "No wallet owner is associated with this trade."
                 )
 
             if not doppler_control.deployment_enabled():
+                logger.warning(
+                    "doppler_execution_adapter_rejected_deployment_disabled",
+                    extra={"owner_user_id": owner_user_id},
+                )
                 return NoWalletConnectedAdapter(
                     "Doppler live trading is disabled; set "
                     "ROBINHOOD_DOPPLER_TRADING_ENABLED=true."
@@ -226,6 +416,10 @@ def _install() -> bool:
                 owner_user_id
             )
             if not raw_key:
+                logger.warning(
+                    "doppler_execution_adapter_rejected_no_wallet_key",
+                    extra={"owner_user_id": owner_user_id},
+                )
                 return NoWalletConnectedAdapter(
                     "No Robinhood Chain wallet connected. "
                     "Use /connectrobinhoodwallet first."
@@ -235,6 +429,10 @@ def _install() -> bool:
                 account = load_robinhood_account(raw_key)
                 rpc_url = resolve_robinhood_rpc_url(settings)
             except (InvalidRobinhoodWalletKeyError, RuntimeError, ValueError) as exc:
+                logger.exception(
+                    "doppler_execution_adapter_wallet_error",
+                    extra={"owner_user_id": owner_user_id, "error": str(exc)},
+                )
                 return NoWalletConnectedAdapter(str(exc))
 
             slippage = int(
@@ -242,7 +440,12 @@ def _install() -> bool:
             )
             logger.info(
                 "doppler_direct_execution_adapter_selected",
-                extra={"owner_user_id": owner_user_id, "wallet": account.address},
+                extra={
+                    "owner_user_id": owner_user_id,
+                    "wallet": account.address,
+                    "slippage_bps": slippage,
+                    "rpc_url_configured": bool(rpc_url),
+                },
             )
             return DopplerExecutionAdapter(
                 account=account,
