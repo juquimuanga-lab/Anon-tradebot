@@ -38,6 +38,13 @@ HELP_TEXT = (
     "/setrulepons - create a separate ROBINHOOD / Pons rule set (ETH)\n"
     "/ponslive - switch Pons to LIVE mode (confirm)\n"
     "/ponspaper - switch Pons to PAPER mode\n\n"
+    "*Robinhood Chain / Doppler / SPCX:*\n"
+    "/dopplerstatus - show Doppler/SPCX sniper readiness, balance and approvals\n"
+    "/enable_doppler - enable the Doppler/SPCX sniper\n"
+    "/disable_doppler - disable the Doppler/SPCX sniper\n"
+    "/setdopplersize <SPCX> - set the live SPCX amount used per snipe\n"
+    "/approvespcx - approve canonical SPCX to Permit2 and the Universal Router\n"
+    "Only Doppler launches paired against canonical SPCX are accepted.\n\n"
     "*Four.meme / BSC:*\n"
     "/connectbscwallet - connect the BSC trading wallet\n"
     "/disconnectbscwallet - remove the stored BSC wallet key (confirm)\n"
@@ -53,7 +60,7 @@ HELP_TEXT = (
     "/disableanoncoin - pause Anoncoin trading only (confirm)\n"
     "/guardian - GO Guardian AI health dashboard\n\n"
     "Solana uses SOL. Four.meme uses BNB. Robinhood/Pons uses ETH. "
-    "Each network has its own wallet and trading mode."
+    "Doppler/SPCX uses canonical SPCX as the quote asset. Each network has its own wallet and trading mode."
 )
 
 
@@ -186,7 +193,7 @@ async def listrules(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
     lines = [f"- {'[ACTIVE] ' if r.is_active else ''}{r.name} (id {r.id}) [{getattr(r, 'platform', 'solana')}]" for r in my_rules]
     await update.message.reply_text(
-        "*Your saved rule sets:*\n" + "\n".join(lines) + "\n\nSwitch with `/activaterule <id>`.",
+        "*Your saved rule sets:*\n" + "\n".join(lines) + "\n\nSwitch with `/activaterule <id>`." ,
         parse_mode="Markdown",
     )
 
@@ -263,10 +270,8 @@ async def positions_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
             return
         position_id = int(args[1])
         from app.bot.confirmations import confirmation_store
-
         token = confirmation_store.create("close_position", {"position_id": position_id})
         from telegram import InlineKeyboardButton, InlineKeyboardMarkup
-
         keyboard = InlineKeyboardMarkup(
             [[InlineKeyboardButton("Confirm close", callback_data=f"confirm:{token}:yes"),
               InlineKeyboardButton("Cancel", callback_data=f"confirm:{token}:no")]]
