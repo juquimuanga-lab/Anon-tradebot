@@ -15,7 +15,6 @@ from typing import Any
 from web3 import Web3
 
 from app.config.settings import settings
-from app.execution.onchain.robinhood_wallet import resolve_robinhood_rpc_url
 from app.connectors.doppler import (
     DOPPLER_INITIALIZER,
     LONG_LAUNCHER,
@@ -25,19 +24,19 @@ from app.connectors.doppler import (
 
 logger = logging.getLogger("app.connectors.doppler_long_discovery")
 
-# Verified event shape documented for Robinhood LongLauncher.
-# The event contains a dynamic string, so the fields are decoded by position.
+# Verified LongLauncher event shape. The first three fields are indexed;
+# deployedAt/reservedUntil are uint48 values on the canonical contract.
 LAUNCH_CREATED_ABI = [{
     "anonymous": False,
     "inputs": [
-        {"indexed": False, "name": "poolOrHook", "type": "address"},
-        {"indexed": False, "name": "asset", "type": "address"},
-        {"indexed": False, "name": "numeraire", "type": "address"},
+        {"indexed": True, "name": "poolOrHook", "type": "address"},
+        {"indexed": True, "name": "asset", "type": "address"},
+        {"indexed": True, "name": "numeraire", "type": "address"},
         {"indexed": False, "name": "poolInitializer", "type": "address"},
         {"indexed": False, "name": "launcher", "type": "address"},
         {"indexed": False, "name": "tickerKey", "type": "bytes32"},
-        {"indexed": False, "name": "deployedAt", "type": "uint256"},
-        {"indexed": False, "name": "reservedUntil", "type": "uint256"},
+        {"indexed": False, "name": "deployedAt", "type": "uint48"},
+        {"indexed": False, "name": "reservedUntil", "type": "uint48"},
         {"indexed": False, "name": "normalizedTicker", "type": "string"},
     ],
     "name": "LaunchCreated",
@@ -66,7 +65,7 @@ def _launch_from_log(log: Any, tx: Any) -> dict[str, Any]:
         "numeraire": _normalise_address(args["numeraire"]),
         "initializer": _normalise_address(args["poolInitializer"]),
         "pool_or_hook": _normalise_address(args["poolOrHook"]),
-        # The LaunchCreated field is the front-end/launcher attribution.
+        # Long's event records the integrator/front-end attribution here.
         "launcher": _normalise_address(args["launcher"]),
         "long_launcher": LONG_LAUNCHER,
         "ticker_key": "0x" + bytes(args["tickerKey"]).hex(),
