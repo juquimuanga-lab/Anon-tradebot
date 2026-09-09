@@ -20,8 +20,6 @@ try:
     _original_drain_smart_money_buys = _onchain_watcher.drain_smart_money_buys
 
     async def _preconf_aware_poll_new_pumpfun_mints(rpc_url, watermarks, limit=20):
-        # ScannerService is fully imported by the time the watcher is called.
-        # Install the entry-timing layer lazily here to avoid an import cycle.
         try:
             from .trader_brain import install_trader_brain
             install_trader_brain()
@@ -42,17 +40,13 @@ try:
                 seen.add(sig)
             merged.append(item)
         if preconf_events:
-            logger.info(
-                "pumpfun_preconf_fastpath_batch",
-                extra={"count": len(preconf_events)},
-            )
+            logger.info("pumpfun_preconf_fastpath_batch", extra={"count": len(preconf_events)})
         return merged
 
     def _preconf_aware_drain_smart_money_buys(rpc_url, wallets):
         _preconf.ensure_started(wallets)
         preconf_events = _preconf.drain_smart_money(wallets)
         existing = _original_drain_smart_money_buys(rpc_url, wallets)
-
         merged = []
         seen = set()
         for item in preconf_events + existing:
@@ -70,6 +64,10 @@ try:
 except Exception:
     logger.exception("preconf_bootstrap_failed")
 
-# Doppler is deliberately not imported here. It is bootstrapped by the
-# runtime-safe direct lane without relying on ScannerService package import
-# ordering.
+# Doppler uses a runtime-safe timer bootstrap. The lane itself retries until
+# ScannerService is fully defined, so this import no longer depends on Python's
+# package import order or a running asyncio loop.
+try:
+    from app.connectors import doppler_direct_lane as _doppler_direct_lane  # noqa: F401
+except Exception:
+    logger.exception("doppler_direct_lane_bootstrap_failed")
