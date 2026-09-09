@@ -1,11 +1,13 @@
 """Direct Robinhood Chain Doppler/Long launch lane.
 
 This module bypasses the Pons launch detector. It attaches the Doppler watcher
-directly to ScannerService at runtime so the existing screening pipeline can
-be reused without copying the large scanner module.
+ directly to ScannerService so launch discovery remains independent of the
+existing Pons scanner.
 
-Only canonical SPCX-quoted launches with the observed Anoncoin vanity suffix
-are admitted to the sniper queue.
+Discovery is intentionally independent from the runtime sniper switch:
+we must continue seeing/logging launches even when live trading is OFF.
+Only SPCX + the observed Anoncoin vanity fingerprint are admitted to the
+live sniper queue.
 """
 from __future__ import annotations
 
@@ -34,9 +36,9 @@ def _suffix_matches(mint: str) -> bool:
 
 
 async def _watch_doppler_for_new_mints(scanner) -> None:
-    if not doppler_control.deployment_enabled() or not doppler_control.is_enabled():
-        return
-
+    # IMPORTANT: discovery must never be disabled by /enabledoppler or the
+    # trading deployment gate. Those are execution controls, not scanners.
+    # Otherwise a disabled sniper silently stops observing the chain.
     try:
         discovered = await doppler_client.poll_new_launches()
     except Exception as exc:
@@ -46,7 +48,13 @@ async def _watch_doppler_for_new_mints(scanner) -> None:
         )
         return
 
+    if not discovered:
+        return
+
     accepted = 0
+    spcx_candidates = 0
+    fingerprint_matches = 0
+
     for item in discovered:
         mint = item.get("mint")
         if not mint:
@@ -54,19 +62,35 @@ async def _watch_doppler_for_new_mints(scanner) -> None:
 
         numeraire = str(item.get("numeraire", "")).lower()
         if numeraire != doppler_control.SPCX_TOKEN.lower():
-            logger.debug(
+            logger.info(
                 "doppler_launch_rejected_non_spcx",
-                extra={"mint": mint, "numeraire": numeraire},
+                extra={
+                    "mint": mint,
+                    "numeraire": numeraire,
+                    "required_numeraire": doppler_control.SPCX_TOKEN,
+                },
             )
             continue
 
+        spcx_candidates += 1
+
         if not _suffix_matches(mint):
-            logger.debug(
-                "doppler_launch_rejected_non_anoncoin_fingerprint",
+            logger.info(
+                "doppler_spcx_launch_rejected_fingerprint",
                 extra={
                     "mint": mint,
                     "required_suffix": doppler_control.ANONCOIN_ADDRESS_SUFFIX,
                 },
+            )
+            continue
+
+        fingerprint_matches += 1
+
+        # Discovery/qualification is logged even while trading is disabled.
+        if not doppler_control.deployment_enabled() or not doppler_control.is_enabled():
+            logger.info(
+                "doppler_qualified_launch_trading_disabled",
+                extra={"mint": mint, "trading_enabled": doppler_control.is_enabled()},
             )
             continue
 
@@ -82,11 +106,17 @@ async def _watch_doppler_for_new_mints(scanner) -> None:
         }
         accepted += 1
 
-    if discovered or accepted:
-        logger.info(
-            "doppler_direct_launch_batch",
-            extra={"discovered": len(discovered), "accepted": accepted},
-        )
+    logger.info(
+        "doppler_direct_launch_batch",
+        extra={
+            "discovered": len(discovered),
+            "spcx_candidates": spcx_candidates,
+            "fingerprint_matches": fingerprint_matches,
+            "accepted": accepted,
+            "deployment_enabled": doppler_control.deployment_enabled(),
+            "sniper_enabled": doppler_control.is_enabled(),
+        },
+    )
 
 
 async def _snapshot_doppler(mint: str, metadata: dict, first_seen: datetime):
@@ -226,6 +256,7 @@ def _install() -> None:
                 "quote": doppler_control.SPCX_TOKEN,
                 "address_suffix": doppler_control.ANONCOIN_ADDRESS_SUFFIX,
                 "pons_dependency": False,
+                "discovery_independent_of_trading_gate": True,
             },
         )
     except Exception:
