@@ -1,8 +1,8 @@
 """Doppler / Long-style launch connector for Robinhood Chain.
 
-This is intentionally separate from the existing Pons connector.  Doppler
-launches are not bonding-curve launches: the token is created directly into a
-Uniswap v4 pool by the canonical Airlock/Long launcher flow.
+This connector is intentionally independent from Pons. It watches the
+canonical Doppler Airlock Create events emitted by Long and other Doppler
+front-ends on Robinhood Chain.
 """
 from __future__ import annotations
 
@@ -104,9 +104,6 @@ def _w3() -> Web3:
 def _price_from_sqrt(sqrt_price_x96: int) -> float:
     if not sqrt_price_x96:
         return 0.0
-    # Doppler's canonical pool is currency0=numeraire, currency1=asset.
-    # sqrtPrice^2 / 2^192 is asset-per-numeraire, so invert it to get
-    # numeraire-per-asset.
     return (2 ** 192) / float(sqrt_price_x96 * sqrt_price_x96)
 
 
@@ -130,7 +127,6 @@ def _alchemy_symbol_price(symbol: str) -> float:
 class DopplerClient:
     def __init__(self) -> None:
         self._watermark = 0
-        self._initialized = False
 
     async def _logs(self, event, start: int, end: int) -> list[Any]:
         out: list[Any] = []
@@ -152,7 +148,6 @@ class DopplerClient:
                     last = exc
             if last is not None:
                 if chunk_end > cursor:
-                    # Retry a smaller range instead of losing the launch lane.
                     half = max(1, (chunk_end - cursor + 1) // 2)
                     out.extend(await self._logs(event, cursor, cursor + half - 1))
                     cursor += half
@@ -165,18 +160,30 @@ class DopplerClient:
         w3 = await asyncio.to_thread(_w3)
         latest = int(await asyncio.to_thread(lambda: w3.eth.block_number))
         configured = int(getattr(settings, "doppler_factory_start_block", 0) or 0)
-        start = self._watermark or configured or max(0, latest - 3)
+        start = self._watermark or configured or max(0, latest - 10)
         if latest - start > max_blocks:
             start = latest - max_blocks
         if start > latest:
             return []
 
-        airlock = w3.eth.contract(address=Web3.to_checksum_address(AIRLOCK), abi=CREATE_ABI)
+        airlock = w3.eth.contract(
+            address=Web3.to_checksum_address(AIRLOCK),
+            abi=CREATE_ABI,
+        )
         logs = await self._logs(airlock.events.Create(), start, latest)
         self._watermark = latest + 1
-        if not self._initialized:
-            self._initialized = True
-            return []
+
+        logger.info(
+            "doppler_airlock_poll",
+            extra={
+                "latest_block": latest,
+                "from_block": start,
+                "to_block": latest,
+                "create_logs": len(logs),
+                "airlock": AIRLOCK,
+                "initializer": DOPPLER_INITIALIZER,
+            },
+        )
 
         result: list[dict[str, Any]] = []
         for log in logs:
@@ -184,15 +191,24 @@ class DopplerClient:
             initializer = Web3.to_checksum_address(args["initializer"])
             if initializer.lower() != DOPPLER_INITIALIZER.lower():
                 continue
+
             tx_hash = log["transactionHash"].hex()
+            tx = None
+            tx_to = ""
+            creator = ""
             try:
                 tx = await asyncio.to_thread(lambda h=tx_hash: w3.eth.get_transaction(h))
                 tx_to = Web3.to_checksum_address(tx["to"]) if tx.get("to") else ""
-            except Exception:
-                tx_to = ""
+                creator = tx.get("from") or ""
+            except Exception as exc:
+                logger.warning(
+                    "doppler_launch_transaction_lookup_failed",
+                    extra={"tx_hash": tx_hash, "error": str(exc)},
+                )
+
             result.append({
                 "mint": Web3.to_checksum_address(args["asset"]),
-                "creator": tx.get("from") if 'tx' in locals() and tx.get("from") else "",
+                "creator": creator,
                 "numeraire": Web3.to_checksum_address(args["numeraire"]),
                 "initializer": initializer,
                 "pool_or_hook": Web3.to_checksum_address(args["poolOrHook"]),
@@ -205,6 +221,11 @@ class DopplerClient:
                 "source": "doppler",
                 "venue": "doppler_v4",
             })
+
+        logger.info(
+            "doppler_airlock_launches_decoded",
+            extra={"create_logs": len(logs), "doppler_launches": len(result)},
+        )
         return result
 
     async def market_snapshot(self, token: str, metadata: dict[str, Any]) -> dict[str, Any]:
@@ -240,8 +261,6 @@ class DopplerClient:
             "tickSpacing": int(key[3]),
             "hooks": Web3.to_checksum_address(key[4]),
         }
-        # A one-unit quote-side simulation returns the live Doppler lens state,
-        # including virtual liquidity across the Dutch-auction positions.
         lens_result = await asyncio.to_thread(lambda: lens.functions.quoteDopplerLensData({
             "poolKey": pool_key,
             "zeroForOne": True,
