@@ -72,6 +72,14 @@ try:
 except Exception:
     logger.exception("doppler_direct_lane_bootstrap_failed")
 
+# LongLauncher is a second Doppler discovery path. It is intentionally loaded
+# after the direct lane so it can wrap the existing DopplerClient poll without
+# changing the scanner or execution architecture.
+try:
+    from app.connectors import doppler_long_discovery as _doppler_long_discovery  # noqa: F401
+except Exception:
+    logger.exception("doppler_long_discovery_bootstrap_failed")
+
 # Diagnostics are telemetry-only and use the same runtime-safe bootstrap.
 try:
     from app.connectors import doppler_diagnostics as _doppler_diagnostics  # noqa: F401
