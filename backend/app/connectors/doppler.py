@@ -184,12 +184,45 @@ class DopplerClient:
                 "initializer": DOPPLER_INITIALIZER,
             },
         )
+        logger.info(
+            "doppler_airlock_raw_events",
+            extra={
+                "create_logs": len(logs),
+                "from_block": start,
+                "to_block": latest,
+                "events": [
+                    {
+                        "asset": str(log["args"].get("asset")),
+                        "numeraire": str(log["args"].get("numeraire")),
+                        "initializer": str(log["args"].get("initializer")),
+                        "pool_or_hook": str(log["args"].get("poolOrHook")),
+                        "tx_hash": log["transactionHash"].hex(),
+                        "block_number": int(log["blockNumber"]),
+                        "log_index": int(log["logIndex"]),
+                    }
+                    for log in logs
+                ],
+            },
+        )
 
         result: list[dict[str, Any]] = []
+        initializer_rejected = 0
         for log in logs:
             args = log["args"]
             initializer = Web3.to_checksum_address(args["initializer"])
             if initializer.lower() != DOPPLER_INITIALIZER.lower():
+                initializer_rejected += 1
+                logger.info(
+                    "doppler_airlock_event_rejected_initializer",
+                    extra={
+                        "asset": Web3.to_checksum_address(args["asset"]),
+                        "numeraire": Web3.to_checksum_address(args["numeraire"]),
+                        "initializer": initializer,
+                        "required_initializer": DOPPLER_INITIALIZER,
+                        "tx_hash": log["transactionHash"].hex(),
+                        "block_number": int(log["blockNumber"]),
+                    },
+                )
                 continue
 
             tx_hash = log["transactionHash"].hex()
@@ -206,7 +239,7 @@ class DopplerClient:
                     extra={"tx_hash": tx_hash, "error": str(exc)},
                 )
 
-            result.append({
+            launch = {
                 "mint": Web3.to_checksum_address(args["asset"]),
                 "creator": creator,
                 "numeraire": Web3.to_checksum_address(args["numeraire"]),
@@ -220,21 +253,57 @@ class DopplerClient:
                 "created_on": datetime.now(timezone.utc),
                 "source": "doppler",
                 "venue": "doppler_v4",
-            })
+            }
+            result.append(launch)
+            logger.info(
+                "doppler_airlock_event_accepted",
+                extra=launch,
+            )
 
         logger.info(
             "doppler_airlock_launches_decoded",
-            extra={"create_logs": len(logs), "doppler_launches": len(result)},
+            extra={
+                "create_logs": len(logs),
+                "doppler_launches": len(result),
+                "initializer_rejected": initializer_rejected,
+            },
         )
         return result
 
     async def market_snapshot(self, token: str, metadata: dict[str, Any]) -> dict[str, Any]:
+        logger.info(
+            "doppler_market_snapshot_started",
+            extra={
+                "mint": token,
+                "tx_hash": metadata.get("tx_hash"),
+                "block_number": metadata.get("block_number"),
+                "numeraire": metadata.get("numeraire"),
+                "initializer": metadata.get("initializer"),
+                "pool_or_hook": metadata.get("pool_or_hook"),
+            },
+        )
         w3 = await asyncio.to_thread(_w3)
         token_addr = Web3.to_checksum_address(token)
         initializer = w3.eth.contract(address=Web3.to_checksum_address(DOPPLER_INITIALIZER), abi=INITIALIZER_ABI)
         state = await asyncio.to_thread(lambda: initializer.functions.getState(token_addr).call())
         numeraire, tokens_on_curve, hook, _calldata, status, key, far_tick = state
         key = tuple(key)
+        logger.info(
+            "doppler_market_state_read",
+            extra={
+                "mint": token,
+                "numeraire": str(numeraire),
+                "tokens_on_curve": int(tokens_on_curve),
+                "hook": str(hook),
+                "status": int(status),
+                "currency0": str(key[0]),
+                "currency1": str(key[1]),
+                "fee": int(key[2]),
+                "tick_spacing": int(key[3]),
+                "hooks": str(key[4]),
+                "far_tick": int(far_tick),
+            },
+        )
         if str(key[0]).lower() != str(numeraire).lower():
             raise RuntimeError("Doppler pool key is not in canonical numeraire/asset order")
         if str(key[1]).lower() != token_addr.lower():
@@ -270,16 +339,36 @@ class DopplerClient:
         sqrt_price = int(lens_result[0])
         amount0 = int(lens_result[1])
         amount1 = int(lens_result[2])
+        logger.info(
+            "doppler_lens_quote_received",
+            extra={
+                "mint": token,
+                "sqrt_price_x96": sqrt_price,
+                "amount0": amount0,
+                "amount1": amount1,
+                "tick": int(lens_result[3]),
+            },
+        )
 
         quote_usd = 0.0
         if numeraire.lower() == "0x0000000000000000000000000000000000000000" or numeraire.lower() == WETH.lower():
             try:
-                from app.connectors.pons import get_eth_usd_price
-                quote_usd = await get_eth_usd_price()
-            except Exception:
+                quote_usd = await asyncio.to_thread(_alchemy_symbol_price, "ETH")
+            except Exception as exc:
+                logger.warning(
+                    "doppler_eth_usd_price_failed",
+                    extra={"mint": token, "error": str(exc)},
+                )
                 quote_usd = 0.0
         else:
-            quote_usd = await asyncio.to_thread(_alchemy_symbol_price, quote_symbol)
+            try:
+                quote_usd = await asyncio.to_thread(_alchemy_symbol_price, quote_symbol)
+            except Exception as exc:
+                logger.warning(
+                    "doppler_quote_usd_price_failed",
+                    extra={"mint": token, "quote_symbol": quote_symbol, "error": str(exc)},
+                )
+                quote_usd = 0.0
 
         price_quote = _price_from_sqrt(sqrt_price)
         price_usd = price_quote * quote_usd
@@ -289,7 +378,7 @@ class DopplerClient:
         asset_reserve = amount1 / (10 ** decimals)
         liquidity_usd = quote_reserve * quote_usd + asset_reserve * price_usd
 
-        return {
+        snapshot = {
             "venue": "doppler_v4",
             "price_usd": price_usd,
             "price_quote": price_quote,
@@ -319,6 +408,23 @@ class DopplerClient:
             "tx_hash": metadata.get("tx_hash"),
             "launcher": metadata.get("launcher"),
         }
+        logger.info(
+            "doppler_market_snapshot_ready",
+            extra={
+                "mint": token,
+                "symbol": symbol,
+                "price_quote": price_quote,
+                "quote_usd": quote_usd,
+                "price_usd": price_usd,
+                "market_cap_usd": market_cap_usd,
+                "liquidity_usd": liquidity_usd,
+                "quote_reserve": quote_reserve,
+                "asset_reserve": asset_reserve,
+                "status": int(status),
+                "tokens_on_curve": int(tokens_on_curve),
+            },
+        )
+        return snapshot
 
 
 doppler_client = DopplerClient()
