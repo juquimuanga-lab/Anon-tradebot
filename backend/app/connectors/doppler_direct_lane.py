@@ -14,6 +14,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import threading
 from datetime import datetime, timezone
 
 from app.connectors import doppler_control
@@ -37,8 +38,7 @@ def _suffix_matches(mint: str) -> bool:
 
 
 async def _watch_doppler_for_new_mints(scanner) -> None:
-    # Discovery must never be disabled by /enabledoppler or the trading
-    # deployment gate. Those are execution controls, not scanners.
+    """Poll the independent Doppler detector and feed qualified launches."""
     try:
         discovered = await doppler_client.poll_new_launches()
     except Exception as exc:
@@ -50,7 +50,11 @@ async def _watch_doppler_for_new_mints(scanner) -> None:
 
     logger.info(
         "doppler_direct_polling",
-        extra={"discovered": len(discovered or [])},
+        extra={
+            "discovered": len(discovered or []),
+            "deployment_enabled": doppler_control.deployment_enabled(),
+            "sniper_enabled": doppler_control.is_enabled(),
+        },
     )
 
     if not discovered:
@@ -273,21 +277,20 @@ def _install() -> bool:
 
 
 def _schedule_install_retry() -> None:
-    try:
-        loop = asyncio.get_running_loop()
-    except RuntimeError:
-        try:
-            loop = asyncio.get_event_loop()
-        except Exception:
-            logger.exception("doppler_direct_lane_schedule_failed")
-            return
+    """Install from a timer so import-time event-loop state cannot block it."""
+    logger.info("doppler_direct_lane_bootstrap_scheduled")
 
     def _attempt() -> None:
         if _install():
+            logger.info("doppler_direct_lane_bootstrap_complete")
             return
-        loop.call_later(_INSTALL_RETRY_SECONDS, _attempt)
+        timer = threading.Timer(_INSTALL_RETRY_SECONDS, _attempt)
+        timer.daemon = True
+        timer.start()
 
-    loop.call_soon(_attempt)
+    timer = threading.Timer(0.0, _attempt)
+    timer.daemon = True
+    timer.start()
 
 
 _schedule_install_retry()
