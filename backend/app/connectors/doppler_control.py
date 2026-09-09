@@ -5,6 +5,7 @@ import math
 import os
 
 SPCX_TOKEN = "0x4a0e65a3eccec6dbe60ae065f2e7bb85fae35eea"
+ANONCOIN_ADDRESS_SUFFIX = "d09e"
 
 _enabled = False
 _buy_size_spcx: float | None = None
@@ -19,13 +20,16 @@ def set_enabled(value: bool) -> None:
     _enabled = bool(value)
 
 
-def get_buy_size_spcx() -> float:
-    """Return the live per-launch SPCX spend.
+def deployment_enabled() -> bool:
+    """Return the deployment-level Doppler gate."""
+    raw = os.getenv("ROBINHOOD_DOPPLER_TRADING_ENABLED")
+    if raw is None:
+        raw = os.getenv("ROBINHOOD_PONS_TRADING_ENABLED", "false")
+    return str(raw).strip().lower() in {"1", "true", "yes", "on"}
 
-    Telegram's /setdopplersize value takes precedence for the current process.
-    The Railway environment variable is only the startup default after a
-    process restart; it is never a separate per-trade override.
-    """
+
+def get_buy_size_spcx() -> float:
+    """Return the live per-launch SPCX spend."""
     if _buy_size_spcx is not None:
         return _buy_size_spcx
 
