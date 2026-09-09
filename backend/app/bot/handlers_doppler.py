@@ -27,8 +27,6 @@ async def _get_account_and_w3(user_id: int):
     if not raw_key:
         raise RuntimeError("No Robinhood Chain wallet is connected. Run /connectrobinhoodwallet first.")
     rpc_url = resolve_robinhood_rpc_url(settings)
-    if not rpc_url:
-        raise RuntimeError("Robinhood RPC is not configured. Set ROBINHOOD_RPC_URL or ROBINHOOD_ALCHEMY_API_KEY in Railway.")
     account = load_robinhood_account(raw_key)
     w3 = build_robinhood_web3(rpc_url)
     if int(w3.eth.chain_id) != 4663:
@@ -40,7 +38,16 @@ def _send(w3, account, fn) -> str:
     if int(w3.eth.get_balance(account.address)) <= 0:
         raise RuntimeError("Robinhood wallet needs ETH for gas.")
     nonce = w3.eth.get_transaction_count(account.address, "pending")
-    tx = fn.build_transaction({"from": account.address, "nonce": nonce, "chainId": 4663, "gasPrice": w3.eth.gas_price})
+    latest = w3.eth.get_block("latest")
+    base_fee = latest.get("baseFeePerGas")
+    if base_fee is not None:
+        base_fee = int(base_fee)
+        priority_fee = max(1, int(getattr(w3.eth, "max_priority_fee", 0) or 0))
+        max_fee = base_fee * 2 + priority_fee
+        tx_params = {"from": account.address, "nonce": nonce, "chainId": 4663, "maxPriorityFeePerGas": priority_fee, "maxFeePerGas": max_fee, "type": 2}
+    else:
+        tx_params = {"from": account.address, "nonce": nonce, "chainId": 4663, "gasPrice": int(w3.eth.gas_price)}
+    tx = fn.build_transaction(tx_params)
     tx["gas"] = int(w3.eth.estimate_gas(tx) * 1.20)
     signed = account.sign_transaction(tx)
     tx_hash = w3.eth.send_raw_transaction(signed.raw_transaction)
@@ -52,7 +59,6 @@ def _send(w3, account, fn) -> str:
 
 @admin_required
 async def dopplerstatus_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Show Doppler switch, live size, wallet balance and approval readiness."""
     user_id = update.effective_user.id
     enabled = doppler_control.is_enabled()
     size = doppler_control.get_buy_size_spcx()
@@ -68,30 +74,9 @@ async def dopplerstatus_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         p2_amount = int(p2_amount) / 10**decimals
         exp_ok = int(expiration) > int(time.time())
         ready = deployment and enabled and size > 0 and balance >= size and direct >= size and p2_amount >= size and exp_ok
-        text = (
-            "🎯 *Robinhood Doppler / SPCX Sniper*\n\n"
-            f"Deployment gate: `{'ON' if deployment else 'OFF'}`\n"
-            f"Doppler sniper: `{'ON' if enabled else 'OFF'}`\n"
-            f"Live snipe size: `{size:g} SPCX`\n"
-            f"Wallet: `{account.address}`\n"
-            f"SPCX balance: `{balance:.6f}`\n"
-            f"SPCX required per snipe: `{size:.6f}`\n"
-            f"SPCX → Permit2: `{direct:.6f}`\n"
-            f"Permit2 → Router: `{p2_amount:.6f}` ({'valid' if exp_ok else 'expired/missing'})\n"
-            f"Overall readiness: `{'READY' if ready else 'NOT READY'}`\n\n"
-            f"Canonical SPCX: `{SPCX}`\n"
-            "Only SPCX-quoted Doppler launches are accepted.\n"
-            "The live snipe size is checked again immediately before every buy."
-        )
+        text = ("🎯 *Robinhood Doppler / SPCX Sniper*\n\n" f"Deployment gate: `{'ON' if deployment else 'OFF'}`\n" f"Doppler sniper: `{'ON' if enabled else 'OFF'}`\n" f"Live snipe size: `{size:g} SPCX`\n" f"Wallet: `{account.address}`\n" f"SPCX balance: `{balance:.6f}`\n" f"SPCX required per snipe: `{size:.6f}`\n" f"SPCX → Permit2: `{direct:.6f}`\n" f"Permit2 → Router: `{p2_amount:.6f}` ({'valid' if exp_ok else 'expired/missing'})\n" f"Overall readiness: `{'READY' if ready else 'NOT READY'}`\n\n" f"Canonical SPCX: `{SPCX}`\n" "Only SPCX-quoted Doppler launches are accepted.\n" "The live snipe size is checked again immediately before every buy.")
     except Exception as exc:
-        text = (
-            "🎯 *Robinhood Doppler / SPCX Sniper*\n\n"
-            f"Deployment gate: `{'ON' if deployment else 'OFF'}`\n"
-            f"Doppler sniper: `{'ON' if enabled else 'OFF'}`\n"
-            f"Live snipe size: `{size:g} SPCX`\n"
-            f"Wallet readiness: `NOT READY`\n"
-            f"Reason: `{str(exc)}`"
-        )
+        text = ("🎯 *Robinhood Doppler / SPCX Sniper*\n\n" f"Deployment gate: `{'ON' if deployment else 'OFF'}`\n" f"Doppler sniper: `{'ON' if enabled else 'OFF'}`\n" f"Live snipe size: `{size:g} SPCX`\n" f"Wallet readiness: `NOT READY`\n" f"Reason: `{str(exc)}`")
     await update.message.reply_text(text, parse_mode="Markdown")
 
 
@@ -135,7 +120,7 @@ async def set_doppler_size_cmd(update: Update, context: ContextTypes.DEFAULT_TYP
         return
     doppler_control.set_buy_size_spcx(value)
     await repo.write_audit_log(str(update.effective_user.id), "set_doppler_buy_size", {"amount_spcx": value})
-    await update.message.reply_text(f"✅ Live Doppler buy size is now `{value:g} SPCX` per qualifying launch. The executor will use exactly this runtime value and re-check the wallet balance immediately before each buy. It resets to the Railway DOPPLER_BUY_SIZE_SPCX startup default after a restart.", parse_mode="Markdown")
+    await update.message.reply_text(f"✅ Live Doppler buy size is now {value:g} SPCX per qualifying launch.\n\nThe executor uses this runtime value and re-checks the wallet balance immediately before each buy.\nIt resets to the Railway DOPPLER_BUY_SIZE_SPCX startup default after a restart.")
 
 
 @admin_required
@@ -147,10 +132,10 @@ async def approve_spcx_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         permit2 = w3.eth.contract(address=Web3.to_checksum_address(PERMIT2), abi=PERMIT2_ABI)
         max_uint256 = (1 << 256) - 1
         max_uint160 = (1 << 160) - 1
-        await update.message.reply_text("⏳ Sending SPCX approval transactions. Keep the bot running until both confirm.")
+        await update.message.reply_text("Sending SPCX approval transactions. Keep the bot running until both confirm.")
         tx1 = _send(w3, account, spcx.functions.approve(Web3.to_checksum_address(PERMIT2), max_uint256))
         tx2 = _send(w3, account, permit2.functions.approve(Web3.to_checksum_address(SPCX), Web3.to_checksum_address(UNIVERSAL_ROUTER), max_uint160, (1 << 48) - 1))
         await repo.write_audit_log(str(update.effective_user.id), "approve_doppler_spcx", {"tx1": tx1, "tx2": tx2})
-        await update.message.reply_text(f"✅ SPCX approvals complete.\n\nSPCX → Permit2: `{tx1}`\nPermit2 → UniversalRouter: `{tx2}`\n\nRun /dopplerstatus to verify readiness.", parse_mode="Markdown")
+        await update.message.reply_text(f"SPCX approvals complete.\n\nSPCX → Permit2: {tx1}\nPermit2 → UniversalRouter: {tx2}\n\nRun /dopplerstatus to verify readiness.")
     except Exception as exc:
-        await update.message.reply_text(f"❌ SPCX approval failed: {exc}")
+        await update.message.reply_text(f"SPCX approval failed: {exc}")
