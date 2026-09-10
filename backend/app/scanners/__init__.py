@@ -64,32 +64,30 @@ try:
 except Exception:
     logger.exception("preconf_bootstrap_failed")
 
-# Doppler uses a runtime-safe timer bootstrap. The lane itself retries until
-# ScannerService is fully defined, so this import no longer depends on Python's
-# package import order or a running asyncio loop.
 try:
     from app.connectors import doppler_direct_lane as _doppler_direct_lane  # noqa: F401
 except Exception:
     logger.exception("doppler_direct_lane_bootstrap_failed")
 
-# LongLauncher is a second Doppler discovery path. It is intentionally loaded
-# after the direct lane so it can wrap the existing DopplerClient poll without
-# changing the scanner or execution architecture.
 try:
     from app.connectors import doppler_long_discovery as _doppler_long_discovery  # noqa: F401
 except Exception:
     logger.exception("doppler_long_discovery_bootstrap_failed")
 
-# Diagnostics are telemetry-only and use the same runtime-safe bootstrap.
 try:
     from app.connectors import doppler_diagnostics as _doppler_diagnostics  # noqa: F401
 except Exception:
     logger.exception("doppler_diagnostics_bootstrap_failed")
 
-# Doppler execution is intentionally independent of the generic rule dispatcher.
-# A qualifying SPCX + d09e launch is consumed immediately using the dedicated
-# runtime SPCX spend size, while normal Solana/Pump.fun rule behavior is untouched.
+# A qualifying SPCX + d09e Doppler launch is executed by its dedicated lane,
+# rather than waiting for an unrelated generic rule to match source="doppler".
 try:
     from app.connectors import doppler_execution_bridge as _doppler_execution_bridge  # noqa: F401
 except Exception:
     logger.exception("doppler_execution_bridge_bootstrap_failed")
+
+# Robinhood Chain live execution must use EIP-1559 when baseFeePerGas is present.
+try:
+    from app.connectors import doppler_gas_patch as _doppler_gas_patch  # noqa: F401
+except Exception:
+    logger.exception("doppler_gas_patch_bootstrap_failed")
