@@ -85,9 +85,3 @@ try:
     from app.connectors import doppler_execution_bridge as _doppler_execution_bridge  # noqa: F401
 except Exception:
     logger.exception("doppler_execution_bridge_bootstrap_failed")
-
-# Robinhood Chain live execution must use EIP-1559 when baseFeePerGas is present.
-try:
-    from app.connectors import doppler_gas_patch as _doppler_gas_patch  # noqa: F401
-except Exception:
-    logger.exception("doppler_gas_patch_bootstrap_failed")
