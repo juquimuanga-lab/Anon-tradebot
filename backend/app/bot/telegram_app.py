@@ -15,6 +15,7 @@ from app.config.settings import settings
 from app.arbitrage import telegram as arbitrage_telegram
 from app.arbitrage import discovery_telegram
 from app.arbitrage import continuous_telegram
+from app.arbitrage import robinhood_telegram
 
 
 async def set_bot_commands(application: Application) -> None:
@@ -37,6 +38,8 @@ async def set_bot_commands(application: Application) -> None:
         BotCommand("arbdiscover", "Discover best Jupiter routes"), BotCommand("arbhunt", "Start continuous arbitrage hunter"), BotCommand("arbstatus", "Show arbitrage hunter status"),
         BotCommand("arbstop", "Stop continuous arbitrage hunter"), BotCommand("arbvenues", "Show arbitrage venues"), BotCommand("arblivestatus", "Show live arbitrage gate"),
         BotCommand("arblive", "Submit one atomic arbitrage bundle"), BotCommand("arbhelp", "Show arbitrage commands"),
+        BotCommand("rharb", "Robinhood arbitrage status"), BotCommand("rharbscan", "Scan a Robinhood token for arbitrage"),
+        BotCommand("rharbhunt", "Start Robinhood arbitrage hunter"), BotCommand("rharbstop", "Stop Robinhood arbitrage hunter"),
     ]
     await application.bot.set_my_commands(commands)
 
@@ -49,12 +52,12 @@ def build_application() -> Application:
 
     application.add_handler(CommandHandler("arbitrage", arbitrage_telegram.arbitrage_cmd)); application.add_handler(CommandHandler("enablearbitrage", arbitrage_telegram.enable_arbitrage_cmd)); application.add_handler(CommandHandler("disablearbitrage", arbitrage_telegram.disable_arbitrage_cmd)); application.add_handler(CommandHandler("arbscan", arbitrage_telegram.arbitrage_scan_cmd)); application.add_handler(CommandHandler("arbdiscover", discovery_telegram.arbitrage_discover_cmd)); application.add_handler(CommandHandler("arbhunt", continuous_telegram.arbitrage_hunt_start_cmd)); application.add_handler(CommandHandler("arbstatus", continuous_telegram.arbitrage_hunt_status_cmd)); application.add_handler(CommandHandler("arbstop", continuous_telegram.arbitrage_hunt_stop_cmd)); application.add_handler(CommandHandler("arbvenues", arbitrage_telegram.arbitrage_venues_cmd)); application.add_handler(CommandHandler("arblivestatus", arbitrage_telegram.arbitrage_live_status_cmd)); application.add_handler(CommandHandler("arblive", arbitrage_telegram.arbitrage_live_execute_cmd)); application.add_handler(CommandHandler("arbhelp", arbitrage_telegram.arbitrage_help_cmd))
 
+    application.add_handler(CommandHandler("rharb", robinhood_telegram.robinhood_arbitrage_status_cmd)); application.add_handler(CommandHandler("rharbscan", robinhood_telegram.robinhood_arbitrage_scan_cmd)); application.add_handler(CommandHandler("rharbhunt", robinhood_telegram.robinhood_arbitrage_hunt_cmd)); application.add_handler(CommandHandler("rharbstop", robinhood_telegram.robinhood_arbitrage_stop_cmd))
+
     application.add_handler(CommandHandler("enable", handlers_admin.enable_cmd)); application.add_handler(CommandHandler("disable", handlers_admin.disable_cmd)); application.add_handler(CommandHandler("enableanoncoin", handlers_admin.enableanoncoin_cmd)); application.add_handler(CommandHandler("disableanoncoin", handlers_admin.disableanoncoin_cmd)); application.add_handler(CommandHandler("enablepumpfun", handlers_admin.enablepumpfun_cmd)); application.add_handler(CommandHandler("disablepumpfun", handlers_admin.disablepumpfun_cmd))
     application.add_handler(CommandHandler("pumpfunsnipers", handlers_admin.pumpfun_snipers_cmd)); application.add_handler(CommandHandler("setfast", handlers_admin.setfast_cmd)); application.add_handler(CommandHandler("setsmart", handlers_admin.setsmart_cmd)); application.add_handler(CommandHandler("setsmartmoney", handlers_admin.setsmartmoney_cmd)); application.add_handler(CommandHandler("enablesmartmoney", handlers_admin.enablesmartmoney_cmd)); application.add_handler(CommandHandler("disablesmartmoney", handlers_admin.disablesmartmoney_cmd))
     application.add_handler(CommandHandler("enablefourmeme", handlers_admin.enablefourmeme_cmd)); application.add_handler(CommandHandler("disablefourmeme", handlers_admin.disablefourmeme_cmd)); application.add_handler(CommandHandler("paper", handlers_admin.paper_cmd)); application.add_handler(CommandHandler("live", handlers_admin.live_cmd)); application.add_handler(CommandHandler("ponslive", handlers_admin.ponslive_cmd)); application.add_handler(CommandHandler("ponspaper", handlers_admin.ponspaper_cmd)); application.add_handler(CommandHandler("ponsstatus", handlers_admin.ponsstatus_cmd))
 
-    # Isolated Robinhood Doppler/SPCX sniper controls.
-    # Register the canonical no-underscore commands plus underscore aliases for backward compatibility.
     application.add_handler(CommandHandler("dopplerstatus", handlers_doppler.dopplerstatus_cmd)); application.add_handler(CommandHandler("enabledoppler", handlers_doppler.enable_doppler_cmd)); application.add_handler(CommandHandler("enable_doppler", handlers_doppler.enable_doppler_cmd)); application.add_handler(CommandHandler("disabledoppler", handlers_doppler.disable_doppler_cmd)); application.add_handler(CommandHandler("disable_doppler", handlers_doppler.disable_doppler_cmd)); application.add_handler(CommandHandler("setdopplersize", handlers_doppler.set_doppler_size_cmd)); application.add_handler(CommandHandler("approvespcx", handlers_doppler.approve_spcx_cmd))
 
     application.add_handler(CommandHandler("disconnectwallet", handlers_wallet.disconnectwallet_cmd)); application.add_handler(CommandHandler("disconnectbscwallet", handlers_wallet.disconnectbscwallet_cmd)); application.add_handler(CommandHandler("disconnectrobinhoodwallet", handlers_wallet.disconnectrobinhoodwallet_cmd)); application.add_handler(CommandHandler("robinhoodwallet", handlers_wallet.robinhoodwallet_cmd))
