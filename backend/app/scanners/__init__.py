@@ -85,3 +85,11 @@ try:
     from app.connectors import doppler_diagnostics as _doppler_diagnostics  # noqa: F401
 except Exception:
     logger.exception("doppler_diagnostics_bootstrap_failed")
+
+# Doppler execution is intentionally independent of the generic rule dispatcher.
+# A qualifying SPCX + d09e launch is consumed immediately using the dedicated
+# runtime SPCX spend size, while normal Solana/Pump.fun rule behavior is untouched.
+try:
+    from app.connectors import doppler_execution_bridge as _doppler_execution_bridge  # noqa: F401
+except Exception:
+    logger.exception("doppler_execution_bridge_bootstrap_failed")
