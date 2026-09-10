@@ -17,7 +17,7 @@ logger = logging.getLogger("app.execution.doppler")
 CHAIN_ID = 4663
 UNIVERSAL_ROUTER = "0x8876789976dEcBfCbBbe364623C63652db8C0904"
 PERMIT2 = "0x000000000022D473030F116dDEE9F6B43aC78BA3"
-V4_QUOTER = "0x8dc178efb8111bb0973dd9d722ebeff267c98f94"
+V4_QUOTER = "0x8dc178efb8111bb0973dd9d722ebeFF267c98f94"
 SPCX = doppler_control.SPCX_TOKEN
 BPS = 10_000
 
@@ -54,8 +54,38 @@ class DopplerExecutionAdapter(ExecutionAdapter):
             raise RuntimeError(f"Refusing to sign: RPC chain ID {chain_id} is not Robinhood Chain {CHAIN_ID}")
         if int(self._w3.eth.get_balance(self._account.address)) <= 0:
             raise RuntimeError("Robinhood admin wallet needs ETH for gas")
+
         nonce = self._w3.eth.get_transaction_count(self._account.address, "pending")
-        tx = fn.build_transaction({"from": self._account.address, "value": int(value), "nonce": nonce, "chainId": CHAIN_ID, "gasPrice": self._w3.eth.gas_price})
+        latest = self._w3.eth.get_block("latest")
+        base_fee = latest.get("baseFeePerGas")
+
+        if base_fee is not None:
+            base_fee = int(base_fee)
+            try:
+                priority_fee = max(1, int(self._w3.eth.max_priority_fee or 0))
+            except Exception:
+                priority_fee = max(1, base_fee // 10)
+            max_fee = base_fee * 2 + priority_fee
+            tx_params = {
+                "from": self._account.address,
+                "value": int(value),
+                "nonce": nonce,
+                "chainId": CHAIN_ID,
+                "maxPriorityFeePerGas": priority_fee,
+                "maxFeePerGas": max_fee,
+                "type": 2,
+            }
+            logger.info("doppler_eip1559_transaction", extra={"base_fee_per_gas": base_fee, "max_fee_per_gas": max_fee, "priority_fee_per_gas": priority_fee})
+        else:
+            tx_params = {
+                "from": self._account.address,
+                "value": int(value),
+                "nonce": nonce,
+                "chainId": CHAIN_ID,
+                "gasPrice": int(self._w3.eth.gas_price),
+            }
+
+        tx = fn.build_transaction(tx_params)
         tx["gas"] = int(self._w3.eth.estimate_gas(tx) * 1.20)
         signed = self._account.sign_transaction(tx)
         tx_hash = self._w3.eth.send_raw_transaction(signed.raw_transaction)
@@ -102,7 +132,8 @@ class DopplerExecutionAdapter(ExecutionAdapter):
 
     async def buy(self, token: TokenSnapshot, amount_spcx: float) -> OrderResult:
         try:
-            market = (getattr(token, "raw_enrichment", {}) or {}).get("pons", {}) or {}
+            raw = getattr(token, "raw_enrichment", {}) or {}
+            market = raw.get("doppler") or raw.get("pons") or {}
             if not _is_spcx(str(market.get("numeraire", ""))):
                 raise RuntimeError("Doppler execution requires the canonical SPCX numeraire")
             pool_key = market.get("pool_key")
