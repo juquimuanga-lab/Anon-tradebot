@@ -1,14 +1,25 @@
-"""Patch the Doppler executor to use EIP-1559 fees on Robinhood Chain."""
+"""Patch the Doppler executor to use EIP-1559 fees on Robinhood Chain.
+
+This module is imported from the scanner bootstrap, which can run while
+``app.execution.doppler_live`` is still being initialized. Keep the executor
+import lazy so this module cannot create a circular import during startup.
+"""
 from __future__ import annotations
 
 import logging
-
-from app.execution.doppler_live import DopplerExecutionAdapter, CHAIN_ID
+import threading
 
 logger = logging.getLogger("app.connectors.doppler_gas_patch")
 
+MAX_RETRIES = 20
+RETRY_DELAY_SECONDS = 0.5
+
 
 def _send_eip1559(self, fn, value: int = 0) -> str:
+    # Import at call time so the patch itself never participates in the
+    # doppler_live module initialization/import graph.
+    from app.execution.doppler_live import CHAIN_ID
+
     chain_id = int(self._w3.eth.chain_id)
     if chain_id != CHAIN_ID:
         raise RuntimeError(
@@ -56,7 +67,34 @@ def _send_eip1559(self, fn, value: int = 0) -> str:
     return tx_hash.hex()
 
 
-if not getattr(DopplerExecutionAdapter, "_eip1559_send_patched", False):
-    DopplerExecutionAdapter._send = _send_eip1559
-    DopplerExecutionAdapter._eip1559_send_patched = True
-    logger.info("doppler_eip1559_send_patched")
+def _apply_patch(attempt: int = 0) -> None:
+    try:
+        from app.execution.doppler_live import DopplerExecutionAdapter
+
+        if getattr(DopplerExecutionAdapter, "_eip1559_send_patched", False):
+            return
+
+        DopplerExecutionAdapter._send = _send_eip1559
+        DopplerExecutionAdapter._eip1559_send_patched = True
+        logger.info("doppler_eip1559_send_patched")
+    except (ImportError, AttributeError) as exc:
+        if attempt >= MAX_RETRIES:
+            logger.exception("doppler_gas_patch_failed_after_retries")
+            return
+        logger.debug(
+            "doppler_gas_patch_waiting_for_executor",
+            extra={"attempt": attempt + 1, "error": str(exc)},
+        )
+        threading.Timer(
+            RETRY_DELAY_SECONDS,
+            _apply_patch,
+            kwargs={"attempt": attempt + 1},
+        ).start()
+    except Exception:
+        logger.exception("doppler_gas_patch_apply_failed")
+
+
+# Apply asynchronously so importing scanners/__init__.py cannot race with the
+# definition of DopplerExecutionAdapter itself.
+threading.Timer(RETRY_DELAY_SECONDS, _apply_patch).start()
+logger.info("doppler_gas_patch_bootstrap_scheduled")
