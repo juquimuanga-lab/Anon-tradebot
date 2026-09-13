@@ -1,13 +1,14 @@
 """Direct Robinhood Chain Doppler/Long launch lane.
 
 This module bypasses the Pons launch detector. It attaches the Doppler watcher
- directly to ScannerService so launch discovery remains independent of the
+ directly to ScannerService so launch discovery remains independent from the
 existing Pons scanner.
 
-Discovery is intentionally independent from the runtime sniper switch:
-we must continue seeing/logging launches even when live trading is OFF.
-Only SPCX + the observed Anoncoin vanity fingerprint are admitted to the
-live sniper queue.
+Discovery remains independent from the runtime sniper switch. Live admission
+is controlled by the canonical SPCX numeraire plus an optional configurable
+address fingerprint. The default fingerprint remains d09e; setting
+DOPPLER_REQUIRED_SUFFIX empty disables the fingerprint for diagnostic/broader
+SPCX mode.
 """
 from __future__ import annotations
 
@@ -33,9 +34,10 @@ _INSTALL_RETRY_SECONDS = 2.0
 
 
 def _suffix_matches(mint: str) -> bool:
-    return str(mint or "").lower().endswith(
-        doppler_control.ANONCOIN_ADDRESS_SUFFIX.lower()
-    )
+    required = doppler_control.ANONCOIN_ADDRESS_SUFFIX
+    if not required:
+        return True
+    return str(mint or "").lower().endswith(required)
 
 
 async def _watch_doppler_for_new_mints(scanner) -> None:
@@ -57,6 +59,8 @@ async def _watch_doppler_for_new_mints(scanner) -> None:
             "deployment_enabled": doppler_control.deployment_enabled(),
             "sniper_enabled": doppler_control.is_enabled(),
             "pending_before": len(scanner._pending_watch),
+            "required_suffix": doppler_control.ANONCOIN_ADDRESS_SUFFIX or None,
+            "fingerprint_mode": "disabled" if not doppler_control.ANONCOIN_ADDRESS_SUFFIX else "required",
             "poll_started": poll_started.isoformat(),
         },
     )
@@ -120,21 +124,23 @@ async def _watch_doppler_for_new_mints(scanner) -> None:
             },
         )
 
+        required_suffix = doppler_control.ANONCOIN_ADDRESS_SUFFIX
         suffix_match = _suffix_matches(mint)
         logger.info(
             "doppler_fingerprint_evaluated",
             extra={
                 "mint": mint,
-                "required_suffix": doppler_control.ANONCOIN_ADDRESS_SUFFIX,
+                "required_suffix": required_suffix or None,
                 "suffix_match": suffix_match,
+                "fingerprint_mode": "disabled" if not required_suffix else "required",
             },
         )
-        if not suffix_match:
+        if required_suffix and not suffix_match:
             logger.info(
                 "doppler_spcx_launch_rejected_fingerprint",
                 extra={
                     "mint": mint,
-                    "required_suffix": doppler_control.ANONCOIN_ADDRESS_SUFFIX,
+                    "required_suffix": required_suffix,
                     "stage": "fingerprint_filter",
                 },
             )
@@ -168,10 +174,7 @@ async def _watch_doppler_for_new_mints(scanner) -> None:
         if mint in scanner._pending_watch:
             logger.info(
                 "doppler_launch_already_pending",
-                extra={
-                    "mint": mint,
-                    "stage": "pending_dedup",
-                },
+                extra={"mint": mint, "stage": "pending_dedup"},
             )
             continue
 
@@ -187,10 +190,7 @@ async def _watch_doppler_for_new_mints(scanner) -> None:
         if already_seen:
             logger.info(
                 "doppler_launch_rejected_already_seen",
-                extra={
-                    "mint": mint,
-                    "stage": "repository_dedup",
-                },
+                extra={"mint": mint, "stage": "repository_dedup"},
             )
             continue
 
@@ -222,6 +222,8 @@ async def _watch_doppler_for_new_mints(scanner) -> None:
             "accepted": accepted,
             "deployment_enabled": doppler_control.deployment_enabled(),
             "sniper_enabled": doppler_control.is_enabled(),
+            "required_suffix": doppler_control.ANONCOIN_ADDRESS_SUFFIX or None,
+            "fingerprint_mode": "disabled" if not doppler_control.ANONCOIN_ADDRESS_SUFFIX else "required",
             "pending_after": len(scanner._pending_watch),
         },
     )
@@ -272,12 +274,7 @@ async def _snapshot_doppler(mint: str, metadata: dict, first_seen: datetime):
     if price_usd <= 0:
         logger.warning(
             "doppler_snapshot_rejected_invalid_price",
-            extra={
-                "mint": mint,
-                "price_usd": price_usd,
-                "market_cap_usd": market.get("market_cap_usd"),
-                "liquidity_usd": market.get("liquidity_usd"),
-            },
+            extra={"mint": mint, "price_usd": price_usd},
         )
         return None
 
@@ -346,112 +343,42 @@ def _install() -> bool:
 
         async def _build_snapshot(self, mint, source, metadata, first_seen):
             if source == SOURCE_DOPPLER:
-                logger.info(
-                    "doppler_snapshot_dispatch",
-                    extra={
-                        "mint": mint,
-                        "source": source,
-                        "pending_metadata_keys": sorted(metadata.keys()),
-                    },
-                )
+                logger.info("doppler_snapshot_dispatch", extra={"mint": mint, "source": source})
                 return await _snapshot_doppler(mint, metadata, first_seen)
             return await original_snapshot(self, mint, source, metadata, first_seen)
 
         async def _enrich(self, token):
             if getattr(token, "source", "") == SOURCE_DOPPLER:
-                logger.info(
-                    "doppler_holder_enrichment_skipped",
-                    extra={
-                        "mint": token.mint,
-                        "holders": getattr(token, "holders", None),
-                        "reason": "direct_doppler_lane_does_not_use_solana_helius_enrichment",
-                    },
-                )
+                logger.info("doppler_holder_enrichment_skipped", extra={"mint": token.mint, "holders": getattr(token, "holders", None), "reason": "direct_doppler_lane_does_not_use_solana_helius_enrichment"})
                 return token
             return await original_enrich(self, token)
 
         async def _get_adapter(self, mode, owner_user_id, source="anoncoin_onchain"):
             if source != SOURCE_DOPPLER:
-                return await original_get_adapter(
-                    self, mode, owner_user_id, source=source
-                )
-
-            logger.info(
-                "doppler_execution_adapter_requested",
-                extra={
-                    "mode": mode,
-                    "owner_user_id": owner_user_id,
-                    "source": source,
-                    "deployment_enabled": doppler_control.deployment_enabled(),
-                },
-            )
-
+                return await original_get_adapter(self, mode, owner_user_id, source=source)
+            logger.info("doppler_execution_adapter_requested", extra={"mode": mode, "owner_user_id": owner_user_id, "source": source, "deployment_enabled": doppler_control.deployment_enabled()})
             if mode == "paper":
-                logger.info(
-                    "doppler_execution_adapter_paper",
-                    extra={"owner_user_id": owner_user_id},
-                )
+                logger.info("doppler_execution_adapter_paper", extra={"owner_user_id": owner_user_id})
                 return self._paper_adapter
-
             if owner_user_id is None:
-                logger.warning(
-                    "doppler_execution_adapter_rejected_no_owner",
-                    extra={"source": source},
-                )
-                return NoWalletConnectedAdapter(
-                    "No wallet owner is associated with this trade."
-                )
-
+                logger.warning("doppler_execution_adapter_rejected_no_owner", extra={"source": source})
+                return NoWalletConnectedAdapter("No wallet owner is associated with this trade.")
             if not doppler_control.deployment_enabled():
-                logger.warning(
-                    "doppler_execution_adapter_rejected_deployment_disabled",
-                    extra={"owner_user_id": owner_user_id},
-                )
-                return NoWalletConnectedAdapter(
-                    "Doppler live trading is disabled; set "
-                    "ROBINHOOD_DOPPLER_TRADING_ENABLED=true."
-                )
-
-            raw_key = await secrets_manager.get_robinhood_wallet_private_key(
-                owner_user_id
-            )
+                logger.warning("doppler_execution_adapter_rejected_deployment_disabled", extra={"owner_user_id": owner_user_id})
+                return NoWalletConnectedAdapter("Doppler live trading is disabled; set ROBINHOOD_DOPPLER_TRADING_ENABLED=true.")
+            raw_key = await secrets_manager.get_robinhood_wallet_private_key(owner_user_id)
             if not raw_key:
-                logger.warning(
-                    "doppler_execution_adapter_rejected_no_wallet_key",
-                    extra={"owner_user_id": owner_user_id},
-                )
-                return NoWalletConnectedAdapter(
-                    "No Robinhood Chain wallet connected. "
-                    "Use /connectrobinhoodwallet first."
-                )
-
+                logger.warning("doppler_execution_adapter_rejected_no_wallet_key", extra={"owner_user_id": owner_user_id})
+                return NoWalletConnectedAdapter("No Robinhood Chain wallet connected. Use /connectrobinhoodwallet first.")
             try:
                 account = load_robinhood_account(raw_key)
                 rpc_url = resolve_robinhood_rpc_url(settings)
             except (InvalidRobinhoodWalletKeyError, RuntimeError, ValueError) as exc:
-                logger.exception(
-                    "doppler_execution_adapter_wallet_error",
-                    extra={"owner_user_id": owner_user_id, "error": str(exc)},
-                )
+                logger.exception("doppler_execution_adapter_wallet_error", extra={"owner_user_id": owner_user_id, "error": str(exc)})
                 return NoWalletConnectedAdapter(str(exc))
-
-            slippage = int(
-                os.getenv("DOPPLER_BUY_SLIPPAGE_BPS", "1000") or 1000
-            )
-            logger.info(
-                "doppler_direct_execution_adapter_selected",
-                extra={
-                    "owner_user_id": owner_user_id,
-                    "wallet": account.address,
-                    "slippage_bps": slippage,
-                    "rpc_url_configured": bool(rpc_url),
-                },
-            )
-            return DopplerExecutionAdapter(
-                account=account,
-                rpc_url=rpc_url,
-                buy_slippage_bps=slippage,
-            )
+            slippage = int(os.getenv("DOPPLER_BUY_SLIPPAGE_BPS", "1000") or 1000)
+            logger.info("doppler_direct_execution_adapter_selected", extra={"owner_user_id": owner_user_id, "wallet": account.address, "slippage_bps": slippage, "rpc_url_configured": bool(rpc_url)})
+            return DopplerExecutionAdapter(account=account, rpc_url=rpc_url, buy_slippage_bps=slippage)
 
         ScannerService._watch_pons_for_new_mints = _noop_pons_watch
         ScannerService._watch_wallets_for_new_mints = _watch_all
@@ -460,40 +387,17 @@ def _install() -> bool:
         ScannerService._pending_repo_token_seen = _pending_repo_token_seen
         ExecutionRouter.get_adapter = _get_adapter
         ScannerService._doppler_direct_lane_installed = True
-
-        logger.info(
-            "doppler_direct_lane_installed",
-            extra={
-                "quote": doppler_control.SPCX_TOKEN,
-                "address_suffix": doppler_control.ANONCOIN_ADDRESS_SUFFIX,
-                "pons_dependency": False,
-                "discovery_independent_of_trading_gate": True,
-            },
-        )
+        logger.info("doppler_direct_lane_installed", extra={"quote": doppler_control.SPCX_TOKEN, "address_suffix": doppler_control.ANONCOIN_ADDRESS_SUFFIX or None, "fingerprint_mode": "disabled" if not doppler_control.ANONCOIN_ADDRESS_SUFFIX else "required", "pons_dependency": False})
         return True
-    except Exception as exc:
-        logger.warning(
-            "doppler_direct_lane_install_retry",
-            extra={"error": str(exc)},
-        )
+    except Exception:
+        logger.exception("doppler_direct_lane_install_failed")
         return False
 
 
-def _schedule_install_retry() -> None:
-    """Install from a timer so import-time event-loop state cannot block it."""
-    logger.info("doppler_direct_lane_bootstrap_scheduled")
-
-    def _attempt() -> None:
-        if _install():
-            logger.info("doppler_direct_lane_bootstrap_complete")
-            return
-        timer = threading.Timer(_INSTALL_RETRY_SECONDS, _attempt)
-        timer.daemon = True
-        timer.start()
-
-    timer = threading.Timer(0.0, _attempt)
-    timer.daemon = True
-    timer.start()
+def install_direct_lane() -> None:
+    if _install():
+        return
+    threading.Timer(_INSTALL_RETRY_SECONDS, install_direct_lane).start()
 
 
-_schedule_install_retry()
+install_direct_lane()
