@@ -5,7 +5,10 @@ import math
 import os
 
 SPCX_TOKEN = "0x4a0e65a3eccec6dbe60ae065f2e7bb85fae35eea"
-ANONCOIN_ADDRESS_SUFFIX = "d09e"
+DEFAULT_ANONCOIN_ADDRESS_SUFFIX = "d09e"
+ANONCOIN_ADDRESS_SUFFIX = str(
+    os.getenv("DOPPLER_REQUIRED_SUFFIX", DEFAULT_ANONCOIN_ADDRESS_SUFFIX) or ""
+).strip().lower().removeprefix("0x")
 
 _enabled = False
 _buy_size_spcx: float | None = None
