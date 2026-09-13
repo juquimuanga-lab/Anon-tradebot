@@ -5,7 +5,9 @@ import math
 import os
 
 SPCX_TOKEN = "0x4a0e65a3eccec6dbe60ae065f2e7bb85fae35eea"
-DEFAULT_ANONCOIN_ADDRESS_SUFFIX = "d09e"
+# Fingerprinting is opt-in. Canonical SPCX is the mandatory launch filter;
+# DOPPLER_REQUIRED_SUFFIX may be set when a specific vanity suffix is desired.
+DEFAULT_ANONCOIN_ADDRESS_SUFFIX = ""
 ANONCOIN_ADDRESS_SUFFIX = str(
     os.getenv("DOPPLER_REQUIRED_SUFFIX", DEFAULT_ANONCOIN_ADDRESS_SUFFIX) or ""
 ).strip().lower().removeprefix("0x")
