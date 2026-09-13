@@ -4,6 +4,10 @@ The canonical Doppler Airlock emits Create events, but most Robinhood
 Doppler/Long launches are routed through LongLauncher first. This module
 adds the LongLauncher LaunchCreated event as a second discovery path without
 coupling the trading lane to Pons.
+
+Airlock is the primary handoff path. LongLauncher is supplementary and is
+strictly time-bounded so a slow/rate-limited RPC cannot prevent an already
+decoded Airlock launch from reaching the direct sniper lane.
 """
 from __future__ import annotations
 
@@ -42,6 +46,10 @@ LAUNCH_CREATED_ABI = [{
     "name": "LaunchCreated",
     "type": "event",
 }]
+
+# LongLauncher is supplementary discovery. Never allow it to block the
+# primary Airlock handoff for more than this amount of time.
+LONG_DISCOVERY_TIMEOUT_SECONDS = 4.0
 
 
 def _window_end_start(previous_watermark: int, max_blocks: int, latest: int) -> tuple[int, int]:
@@ -180,18 +188,56 @@ def install_long_discovery() -> None:
         previous_watermark = int(getattr(self, "_watermark", 0) or 0)
         airlock_launches = await original(self, max_blocks=max_blocks)
 
+        # Critical invariant: Airlock discovery has already completed. A
+        # LongLauncher RPC problem must never turn a valid Airlock discovery
+        # into a stalled poll that blocks ScannerService.
+        logger.info(
+            "doppler_airlock_handoff",
+            extra={
+                "airlock_launches": len(airlock_launches or []),
+                "handoff_ready": True,
+                "longlauncher_timeout_seconds": LONG_DISCOVERY_TIMEOUT_SECONDS,
+            },
+        )
+
         try:
-            w3 = await asyncio.to_thread(_w3)
-            latest = int(await asyncio.to_thread(lambda: w3.eth.block_number))
+            w3 = await asyncio.wait_for(
+                asyncio.to_thread(_w3),
+                timeout=LONG_DISCOVERY_TIMEOUT_SECONDS,
+            )
+            latest = await asyncio.wait_for(
+                asyncio.to_thread(lambda: w3.eth.block_number),
+                timeout=LONG_DISCOVERY_TIMEOUT_SECONDS,
+            )
+            latest = int(latest)
             start, end = _window_end_start(previous_watermark, max_blocks, latest)
             if start > end:
+                logger.info(
+                    "doppler_longlauncher_skipped_empty_window",
+                    extra={"from_block": start, "to_block": end},
+                )
                 return airlock_launches
 
-            long_launches = await _poll_long_launches(self, w3, start, end)
+            long_launches = await asyncio.wait_for(
+                _poll_long_launches(self, w3, start, end),
+                timeout=LONG_DISCOVERY_TIMEOUT_SECONDS,
+            )
+        except asyncio.TimeoutError:
+            logger.warning(
+                "doppler_longlauncher_timeout",
+                extra={
+                    "timeout_seconds": LONG_DISCOVERY_TIMEOUT_SECONDS,
+                    "airlock_launches_preserved": len(airlock_launches or []),
+                },
+            )
+            return airlock_launches
         except Exception as exc:
             logger.exception(
                 "doppler_longlauncher_poll_failed",
-                extra={"error": str(exc)},
+                extra={
+                    "error": str(exc),
+                    "airlock_launches_preserved": len(airlock_launches or []),
+                },
             )
             return airlock_launches
 
