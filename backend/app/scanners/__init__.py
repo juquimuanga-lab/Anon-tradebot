@@ -106,8 +106,7 @@ try:
 except Exception:
     logger.exception("doppler_position_patch_bootstrap_failed")
 
-# Emit explicit rejection diagnostics after the authoritative admission patch
-# has been loaded. This only observes decisions; it does not alter admission.
+# Observe authoritative SPCX admission decisions without changing the gate.
 try:
     from app.connectors import doppler_admission_diagnostics as _doppler_admission_diagnostics  # noqa: F401
 except Exception:
