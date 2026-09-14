@@ -78,8 +78,13 @@ async def _execute_one(scanner, mint: str, watch: dict, owner_user_id: int) -> b
         logger.warning("doppler_buy_blocked_invalid_size", extra={"mint": mint, "owner_user_id": owner_user_id})
         return False
 
+    # Doppler has a dedicated deployment/runtime gate and uses the EVM
+    # Robinhood wallet. It must not inherit the global paper mode used by the
+    # existing Solana sniper. When the dedicated Doppler switch is enabled,
+    # execute this lane through the live adapter only.
+    execution_mode = "live" if doppler_control.is_enabled() else state.mode
     adapter = await scanner._execution_router.get_adapter(
-        state.mode,
+        execution_mode,
         owner_user_id,
         source=SOURCE_DOPPLER,
     )
@@ -87,7 +92,7 @@ async def _execute_one(scanner, mint: str, watch: dict, owner_user_id: int) -> b
     order = await repo.create_order(
         mint,
         "buy",
-        state.mode,
+        execution_mode,
         "pending",
         amount_spcx,
         float(token.price_usd or 0.0),
@@ -102,7 +107,9 @@ async def _execute_one(scanner, mint: str, watch: dict, owner_user_id: int) -> b
             "owner_user_id": owner_user_id,
             "order_id": order.id,
             "amount_spcx": amount_spcx,
-            "mode": state.mode,
+            "mode": execution_mode,
+            "global_mode": state.mode,
+            "dedicated_live_execution": execution_mode == "live",
             "numeraire": metadata.get("numeraire"),
             "tx_hash": metadata.get("tx_hash"),
         },
@@ -139,7 +146,7 @@ async def _execute_one(scanner, mint: str, watch: dict, owner_user_id: int) -> b
     await repo.create_position(
         mint,
         None,
-        state.mode,
+        execution_mode,
         fill_price,
         amount_tokens,
         amount_spcx,
@@ -160,6 +167,7 @@ async def _execute_one(scanner, mint: str, watch: dict, owner_user_id: int) -> b
             "amount_tokens": amount_tokens,
             "price_usd": fill_price,
             "tx_signature": result.tx_signature,
+            "mode": execution_mode,
         },
     )
     await guardian.record("buy_success", owner_id=owner_user_id, mint=mint, tx_signature=result.tx_signature)
