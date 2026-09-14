@@ -68,8 +68,6 @@ def _pool_id(key: tuple) -> bytes:
 def _price_from_sqrt(sqrt_price_x96: int, quote_decimals: int, asset_decimals: int) -> float:
     if not sqrt_price_x96:
         return 0.0
-    # V4 sqrt price is token1/token0 in raw units. Convert to quote per whole
-    # asset token because currency0 is the numeraire and currency1 is the asset.
     raw_ratio = (float(sqrt_price_x96) ** 2) / float(2 ** 192)
     return raw_ratio * (10 ** asset_decimals) / (10 ** quote_decimals)
 
@@ -79,7 +77,6 @@ def _virtual_reserves(sqrt_price_x96: int, liquidity: int) -> tuple[float, float
         return 0.0, 0.0
     q96 = float(2 ** 96)
     sqrt_p = float(sqrt_price_x96) / q96
-    # Active virtual reserves represented by the current Uniswap v4 liquidity.
     amount0 = float(liquidity) / sqrt_p
     amount1 = float(liquidity) * sqrt_p
     return amount0, amount1
@@ -90,8 +87,6 @@ def install() -> None:
 
     if getattr(DopplerClient, "_stateview_snapshot_patch_installed", False):
         return
-
-    original = DopplerClient.market_snapshot
 
     async def market_snapshot(self, token: str, metadata: dict) -> dict:
         logger.info(
@@ -104,8 +99,6 @@ def install() -> None:
             },
         )
 
-        # Import the existing connector constants/ABI so discovery and state
-        # decoding remain centralized in doppler.py.
         from app.connectors import doppler as base
 
         w3 = await asyncio.to_thread(_w3)
@@ -152,7 +145,12 @@ def install() -> None:
         lp_fee = int(slot0[3])
         liquidity = int(liquidity)
 
-        if sqrt_price <= 0 or liquidity <= 0:
+        # A freshly created Doppler pool can expose its initialized sqrt price
+        # before StateView reports active liquidity. Do not block the dedicated
+        # sniper on liquidity here: the live Universal Router path performs its
+        # own fresh V4 quote immediately before the buy. Zero liquidity is kept
+        # as a snapshot diagnostic rather than treated as a hard rejection.
+        if sqrt_price <= 0:
             raise RuntimeError(
                 f"Doppler pool state not initialized: sqrt_price={sqrt_price} liquidity={liquidity}"
             )
