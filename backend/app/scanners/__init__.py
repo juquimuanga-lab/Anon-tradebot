@@ -69,6 +69,14 @@ try:
 except Exception:
     logger.exception("doppler_direct_lane_bootstrap_failed")
 
+# The launch event's numeraire is cross-checked against Doppler initializer
+# state before the direct lane applies the canonical SPCX filter.
+try:
+    from app.connectors import doppler_spcx_numeraire_patch as _doppler_spcx_numeraire_patch
+    _doppler_spcx_numeraire_patch.install()
+except Exception:
+    logger.exception("doppler_spcx_numeraire_patch_bootstrap_failed")
+
 try:
     from app.connectors import doppler_long_discovery as _doppler_long_discovery  # noqa: F401
 except Exception:
@@ -79,7 +87,7 @@ try:
 except Exception:
     logger.exception("doppler_diagnostics_bootstrap_failed")
 
-# A qualifying SPCX + d09e Doppler launch is executed by its dedicated lane,
+# A qualifying SPCX Doppler launch is executed by its dedicated lane,
 # rather than waiting for an unrelated generic rule to match source="doppler".
 try:
     from app.connectors import doppler_execution_bridge as _doppler_execution_bridge  # noqa: F401
