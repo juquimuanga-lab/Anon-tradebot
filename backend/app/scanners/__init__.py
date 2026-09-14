@@ -77,6 +77,14 @@ try:
 except Exception:
     logger.exception("doppler_spcx_numeraire_patch_bootstrap_failed")
 
+# Use Uniswap v4 StateView for launch-time pool price/liquidity. This avoids
+# making the sniper depend on a DopplerLens simulated quote during the brief
+# initialization window when the hook may still reject quote simulation.
+try:
+    from app.connectors import doppler_stateview_patch as _doppler_stateview_patch
+except Exception:
+    logger.exception("doppler_stateview_patch_bootstrap_failed")
+
 try:
     from app.connectors import doppler_long_discovery as _doppler_long_discovery  # noqa: F401
 except Exception:
