@@ -11,9 +11,6 @@ import logging
 
 from web3 import Web3
 
-from app.connectors import doppler_live
-from app.connectors import doppler_control
-
 logger = logging.getLogger("app.connectors.doppler_quoter_patch")
 
 QUOTER_ABI = [{
@@ -48,6 +45,11 @@ QUOTER_ABI = [{
 
 
 def install() -> None:
+    # Import these lazily. scanners.__init__ imports this patch while the
+    # app.connectors package is still initializing; importing doppler_live at
+    # module scope creates a package-level circular import on cold startup.
+    from app.connectors import doppler_control, doppler_live
+
     cls = doppler_live.DopplerExecutionAdapter
     if getattr(cls, "_robinhood_quoter_patch_installed", False):
         return
@@ -63,27 +65,6 @@ def install() -> None:
 
     cls.__init__ = patched_init
 
-    original_buy = cls.buy
-
-    async def patched_buy(self, token, amount_spcx):
-        raw = getattr(token, "raw_enrichment", {}) or {}
-        market = raw.get("doppler") or raw.get("pons") or {}
-        pool_key = market.get("pool_key")
-        if pool_key:
-            # Preserve the adapter's existing execution logic while supplying
-            # the newly required Robinhood quoter field through a temporary
-            # pool-key copy exposed by the contract ABI.
-            self._doppler_quoter_default_min_hop_price = 0
-        return await original_buy(self, token, amount_spcx)
-
-    # Replace the adapter's quote call by making the pool-key dict subclass
-    # provide the additional tuple member expected by Web3's ABI encoder.
-    class _PoolKey(dict):
-        pass
-
-    # The buy implementation builds the quote params inline, so patch the
-    # method source path explicitly below rather than altering unrelated swap
-    # encoding or router behavior.
     async def robinhood_buy(self, token, amount_spcx):
         import asyncio
         import time
