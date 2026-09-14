@@ -146,4 +146,14 @@ def _install() -> bool:
     return True
 
 
-_install()
+def install() -> bool:
+    """Install the Doppler-only reconciliation patch when PositionManager is ready."""
+    return _install()
+
+
+# Keep the original import-time behavior for normal startup. The dedicated
+# bootstrap module retries this installer if an import-order race occurs.
+try:
+    _install()
+except Exception:
+    logger.exception("doppler_position_patch_install_deferred")
