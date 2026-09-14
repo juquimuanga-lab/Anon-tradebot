@@ -93,6 +93,14 @@ try:
 except Exception:
     logger.exception("doppler_execution_bridge_bootstrap_failed")
 
+# PositionManager can import after scanner bootstrap. Load the retrying
+# bootstrap so the Doppler-only EVM reconciliation patch is not lost to an
+# import-order race. Generic Solana reconciliation remains untouched.
+try:
+    from app.connectors import doppler_position_patch_bootstrap as _doppler_position_patch_bootstrap  # noqa: F401
+except Exception:
+    logger.exception("doppler_position_patch_bootstrap_loader_failed")
+
 try:
     from app.connectors import doppler_position_patch as _doppler_position_patch  # noqa: F401
 except Exception:
