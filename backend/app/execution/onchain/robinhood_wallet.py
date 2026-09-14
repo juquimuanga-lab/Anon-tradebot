@@ -36,24 +36,39 @@ def checksum(address: str) -> str:
 
 
 def _normalize_rpc_value(value: str) -> str:
-    """Accept either a raw Alchemy key or a complete Robinhood RPC URL.
+    """Accept a complete RPC URL only when it is structurally usable.
 
-    Railway deployments sometimes receive the full Alchemy app URL in the
-    API-key variable. The old resolver blindly appended that URL to `/v2/`,
-    producing an invalid address such as:
-      .../v2/https://robinhood-mainnet.g.alchemy.com/v2/<key>
+    Railway deployments may provide either a raw Alchemy key or a complete
+    Alchemy URL. A value such as
+    ``https://robinhood-mainnet.g.alchemy.com/v2/`` is *not* usable and must
+    not be returned as an RPC URL because Alchemy answers it with HTTP 400.
     """
     text = str(value).strip()
     if not text:
         return ""
     parsed = urlparse(text)
-    if parsed.scheme in {"http", "https"} and parsed.netloc:
-        return text.rstrip("/")
-    return ""
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        return ""
+
+    # Alchemy Robinhood URLs require a non-empty key after /v2/.
+    if parsed.netloc.lower() == "robinhood-mainnet.g.alchemy.com":
+        path = parsed.path.rstrip("/")
+        if not path.startswith("/v2/") or len(path.removeprefix("/v2/")) < 8:
+            return ""
+
+    return text.rstrip("/")
+
+
+def _alchemy_url_from_key(value: str) -> str:
+    """Build an Alchemy URL from a raw key, rejecting obvious placeholders."""
+    key = str(value).strip()
+    if not key or key.lower() in {"your_alchemy_key", "your_alchemy_api_key", "changeme"}:
+        return ""
+    return ROBINHOOD_ALCHEMY_RPC_TEMPLATE.format(api_key=key)
 
 
 def resolve_robinhood_rpc_url(settings_obj) -> str:
-    """Resolve Robinhood RPC without requiring a wallet private key in env.
+    """Resolve Robinhood RPC safely.
 
     Priority:
       1. Explicit Robinhood RPC URL
@@ -62,8 +77,10 @@ def resolve_robinhood_rpc_url(settings_obj) -> str:
       4. Generic Alchemy API key
       5. Robinhood public RPC
 
-    A setting containing a complete HTTP(S) URL is used directly. A raw
-    Alchemy key is expanded into the Robinhood Alchemy endpoint.
+    Complete URLs are used directly only when structurally valid. Raw Alchemy
+    keys are expanded into the Robinhood Alchemy endpoint. Malformed/empty
+    Alchemy configuration falls back to the public Robinhood RPC instead of
+    constructing a guaranteed HTTP 400 URL.
     """
     explicit = (
         getattr(settings_obj, "robinhood_rpc_url", None)
@@ -83,7 +100,9 @@ def resolve_robinhood_rpc_url(settings_obj) -> str:
         normalized = _normalize_rpc_value(api_key)
         if normalized:
             return normalized
-        return ROBINHOOD_ALCHEMY_RPC_TEMPLATE.format(api_key=str(api_key).strip())
+        alchemy_url = _alchemy_url_from_key(api_key)
+        if alchemy_url:
+            return alchemy_url
 
     return ROBINHOOD_PUBLIC_RPC_URL
 
