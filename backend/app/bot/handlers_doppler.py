@@ -14,10 +14,12 @@ from app.storage import repository as repo
 from app.config.settings import settings
 from app.connectors import doppler_control
 from app.execution.onchain.robinhood_wallet import load_robinhood_account, build_robinhood_web3, resolve_robinhood_rpc_url
+from app.execution.robinhood_weth_live import RobinhoodWethExecution, WETH
 
 PERMIT2 = "0x000000000022D473030F116dDEE9F6B43aC78BA3"
 UNIVERSAL_ROUTER = "0x8876789976dEcBfCbBbe364623C63652db8C0904"
 SPCX = doppler_control.SPCX_TOKEN
+DEFAULT_WETH_TARGET = "0xE4BEF9d0845a13bD39C57C7ee4463ff5D0cc20B6"
 SPCX_ABI = [{"inputs":[{"name":"spender","type":"address"},{"name":"amount","type":"uint256"}],"name":"approve","outputs":[{"type":"bool"}],"stateMutability":"nonpayable","type":"function"}]
 PERMIT2_ABI = [{"inputs":[{"name":"token","type":"address"},{"name":"spender","type":"address"},{"name":"amount","type":"uint160"},{"name":"expiration","type":"uint48"}],"name":"approve","outputs":[],"stateMutability":"nonpayable","type":"function"},{"inputs":[{"name":"owner","type":"address"},{"name":"token","type":"address"},{"name":"spender","type":"address"}],"name":"allowance","outputs":[{"name":"amount","type":"uint160"},{"name":"expiration","type":"uint48"},{"name":"nonce","type":"uint48"}],"stateMutability":"view","type":"function"}]
 BALANCE_ABI = [{"inputs":[{"name":"owner","type":"address"}],"name":"balanceOf","outputs":[{"type":"uint256"}],"stateMutability":"view","type":"function"},{"inputs":[{"name":"owner","type":"address"},{"name":"spender","type":"address"}],"name":"allowance","outputs":[{"type":"uint256"}],"stateMutability":"view","type":"function"},{"inputs":[],"name":"decimals","outputs":[{"type":"uint8"}],"stateMutability":"view","type":"function"}]
@@ -142,3 +144,57 @@ async def approve_spcx_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         await update.message.reply_text(f"SPCX approvals complete.\n\nSPCX → Permit2: {tx1}\nPermit2 → UniversalRouter: {tx2}\n\nRun /dopplerstatus to verify readiness.")
     except Exception as exc:
         await update.message.reply_text(f"SPCX approval failed: {exc}")
+
+
+@admin_required
+async def approve_weth_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Pre-approve Robinhood WETH to Permit2 and Permit2 to UniversalRouter."""
+    try:
+        account, w3 = await _get_account_and_w3(update.effective_user.id)
+        weth = w3.eth.contract(address=Web3.to_checksum_address(WETH), abi=SPCX_ABI + BALANCE_ABI)
+        permit2 = w3.eth.contract(address=Web3.to_checksum_address(PERMIT2), abi=PERMIT2_ABI)
+        max_uint256 = (1 << 256) - 1
+        max_uint160 = (1 << 160) - 1
+        balance = int(weth.functions.balanceOf(account.address).call()) / 1e18
+        if balance <= 0:
+            raise RuntimeError("Wallet has no WETH on Robinhood Chain.")
+        await update.message.reply_text(f"WETH balance detected: {balance:.8f}. Sending WETH approvals...")
+        tx1 = _send(w3, account, weth.functions.approve(Web3.to_checksum_address(PERMIT2), max_uint256))
+        tx2 = _send(w3, account, permit2.functions.approve(Web3.to_checksum_address(WETH), Web3.to_checksum_address(UNIVERSAL_ROUTER), max_uint160, (1 << 48) - 1))
+        await repo.write_audit_log(str(update.effective_user.id), "approve_robinhood_weth", {"tx1": tx1, "tx2": tx2})
+        await update.message.reply_text(f"✅ WETH approvals complete.\n\nWETH → Permit2: `{tx1}`\nPermit2 → UniversalRouter: `{tx2}`\n\nYou can now use /wethsnipe.")
+    except Exception as exc:
+        await update.message.reply_text(f"❌ WETH approval failed: {exc}")
+
+
+@admin_required
+async def weth_snipe_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """One-shot exact-token WETH snipe with pool discovery + router simulation."""
+    token = DEFAULT_WETH_TARGET
+    amount = 0.01
+    if context.args:
+        token = context.args[0]
+    if len(context.args) >= 2:
+        try:
+            amount = float(context.args[1])
+        except (TypeError, ValueError):
+            await update.message.reply_text("❌ WETH amount must be a number. Usage: /wethsnipe <token> <weth_amount>")
+            return
+    if not math.isfinite(amount) or amount <= 0:
+        await update.message.reply_text("❌ WETH amount must be greater than zero.")
+        return
+    try:
+        checksum_token = Web3.to_checksum_address(token)
+    except ValueError:
+        await update.message.reply_text("❌ Invalid token address.")
+        return
+    await update.message.reply_text(f"🔎 Inspecting `{checksum_token}` for a Robinhood V4 WETH pool and quoting `{amount:g} WETH`.\nNo transaction will be signed unless the exact Universal Router call first simulates successfully.", parse_mode="Markdown")
+    try:
+        account, _w3 = await _get_account_and_w3(update.effective_user.id)
+        executor = RobinhoodWethExecution(account=account, rpc_url=resolve_robinhood_rpc_url(settings), slippage_bps=1000)
+        result = await __import__("asyncio").to_thread(executor.buy, checksum_token, amount)
+        await repo.write_audit_log(str(update.effective_user.id), "robinhood_weth_snipe", result)
+        await update.message.reply_text(f"🟢 WETH snipe filled.\n\nToken: `{result['token']}`\nWETH spent: `{result['amount_weth']}`\nQuoted tokens: `{result['quoted_tokens']}`\nMinimum tokens: `{result['min_tokens']}`\nPool: `{result['pool_key']}`\nTX: `{result['tx_hash']}`", parse_mode="Markdown")
+    except Exception as exc:
+        await repo.write_audit_log(str(update.effective_user.id), "robinhood_weth_snipe_failed", {"token": checksum_token, "amount_weth": amount, "error": str(exc)})
+        await update.message.reply_text(f"🛑 WETH snipe NOT sent.\n\nReason: `{str(exc)}`", parse_mode="Markdown")
