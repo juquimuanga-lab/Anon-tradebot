@@ -3,8 +3,10 @@ from __future__ import annotations
 import logging
 import time
 from typing import Any
+from urllib.parse import urlparse
 from eth_abi import encode
 from web3 import Web3
+
 CHAIN_ID=4663
 RPC_DEFAULT="https://rpc.mainnet.chain.robinhood.com"
 WETH="0x0Bd7D308f8E1639FAb988df18A8011f41EAcAD73"
@@ -20,10 +22,37 @@ ERC20_ABI=[{"inputs":[],"name":"decimals","outputs":[{"type":"uint8"}],"stateMut
 PERMIT2_ABI=[{"inputs":[{"name":"owner","type":"address"},{"name":"token","type":"address"},{"name":"spender","type":"address"}],"name":"allowance","outputs":[{"name":"amount","type":"uint160"},{"name":"expiration","type":"uint48"},{"name":"nonce","type":"uint48"}],"stateMutability":"view","type":"function"}]
 INITIALIZE_TOPIC=Web3.keccak(text="Initialize(bytes32,address,address,uint24,int24,address,uint160,int24)").hex()
 def _addr(value:str)->str:return Web3.to_checksum_address(value)
+
+def _usable_rpc(value:str)->str:
+    text=str(value or "").strip()
+    if not text:return ""
+    parsed=urlparse(text)
+    if parsed.scheme not in {"http","https"} or not parsed.netloc:return ""
+    if parsed.netloc.lower()=="robinhood-mainnet.g.alchemy.com":
+        path=parsed.path.rstrip("/")
+        if not path.startswith("/v2/") or len(path.removeprefix("/v2/"))<8:return ""
+    return text.rstrip("/")
+
 class RobinhoodWethExecution:
     def __init__(self,account,rpc_url:str=RPC_DEFAULT,slippage_bps:int=1000):
-        self.account=account; self.w3=Web3(Web3.HTTPProvider(rpc_url,request_kwargs={"timeout":8}))
-        if int(self.w3.eth.chain_id)!=CHAIN_ID: raise RuntimeError(f"RPC chain ID {self.w3.eth.chain_id} is not Robinhood Chain {CHAIN_ID}")
+        self.account=account
+        requested=_usable_rpc(rpc_url)
+        candidates=[requested] if requested else []
+        if RPC_DEFAULT not in candidates:candidates.append(RPC_DEFAULT)
+        last_error=None
+        for candidate in candidates:
+            try:
+                w3=Web3(Web3.HTTPProvider(candidate,request_kwargs={"timeout":8}))
+                chain_id=int(w3.eth.chain_id)
+                if chain_id!=CHAIN_ID: raise RuntimeError(f"RPC chain ID {chain_id} is not Robinhood Chain {CHAIN_ID}")
+                self.w3=w3
+                if candidate==RPC_DEFAULT and requested!=RPC_DEFAULT:
+                    logger.warning("robinhood_weth_rpc_fallback",extra={"reason":"configured RPC unavailable or malformed","provider":"public"})
+                break
+            except Exception as exc:
+                last_error=exc
+        else:
+            raise RuntimeError("could not reach Robinhood Chain RPC") from last_error
         self.slippage_bps=max(0,min(int(slippage_bps),3000)); self.router=self.w3.eth.contract(address=_addr(UNIVERSAL_ROUTER),abi=ROUTER_ABI); self.quoter=self.w3.eth.contract(address=_addr(QUOTER),abi=QUOTER_ABI); self.weth=self.w3.eth.contract(address=_addr(WETH),abi=ERC20_ABI); self.permit2=self.w3.eth.contract(address=_addr(PERMIT2),abi=PERMIT2_ABI)
     def discover_pool(self,token:str,lookback_blocks:int=100_000)->dict[str,Any]:
         token=_addr(token); weth=_addr(WETH); latest=int(self.w3.eth.block_number); start=max(0,latest-int(lookback_blocks)); step=5_000
