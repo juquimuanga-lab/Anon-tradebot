@@ -15,21 +15,17 @@ try:
     from app.config.settings import settings
     from . import onchain_watcher as _onchain_watcher
     from . import preconf_fastpath as _preconf
-
     _original_poll_new_pumpfun_mints = _onchain_watcher.poll_new_pumpfun_mints
     _original_drain_smart_money_buys = _onchain_watcher.drain_smart_money_buys
-
     async def _preconf_aware_poll_new_pumpfun_mints(rpc_url, watermarks, limit=20):
         try:
             from .trader_brain import install_trader_brain
             install_trader_brain()
         except Exception:
             logger.exception("trader_brain_bootstrap_failed")
-
         _preconf.ensure_started(settings.smart_money_wallets)
         preconf_events = _preconf.drain_launches()
         existing = await _original_poll_new_pumpfun_mints(rpc_url, watermarks, limit)
-
         merged = []
         seen = set()
         for item in preconf_events + existing:
@@ -42,7 +38,6 @@ try:
         if preconf_events:
             logger.info("pumpfun_preconf_fastpath_batch", extra={"count": len(preconf_events)})
         return merged
-
     def _preconf_aware_drain_smart_money_buys(rpc_url, wallets):
         _preconf.ensure_started(wallets)
         preconf_events = _preconf.drain_smart_money(wallets)
@@ -57,17 +52,11 @@ try:
                 seen.add(sig)
             merged.append(item)
         return merged
-
     _onchain_watcher.poll_new_pumpfun_mints = _preconf_aware_poll_new_pumpfun_mints
     _onchain_watcher.drain_smart_money_buys = _preconf_aware_drain_smart_money_buys
-
 except Exception:
     logger.exception("preconf_bootstrap_failed")
 
-# Normalize the launch numeraire before importing the direct lane. The direct
-# lane installs itself during module import, so this ordering is intentional:
-# it guarantees its poll_new_launches() call sees authoritative initializer
-# state instead of relying on the raw Airlock event numeraire.
 try:
     from app.connectors import doppler_spcx_numeraire_patch as _doppler_spcx_numeraire_patch
     _doppler_spcx_numeraire_patch.install()
@@ -79,13 +68,15 @@ try:
 except Exception:
     logger.exception("doppler_direct_lane_bootstrap_failed")
 
-# Use Uniswap v4 StateView for launch-time pool price/liquidity. This avoids
-# making the sniper depend on a DopplerLens simulated quote during the brief
-# initialization window when the hook may still reject quote simulation.
 try:
     from app.connectors import doppler_stateview_patch as _doppler_stateview_patch
 except Exception:
     logger.exception("doppler_stateview_patch_bootstrap_failed")
+
+try:
+    from app.connectors import doppler_quoter_patch as _doppler_quoter_patch
+except Exception:
+    logger.exception("doppler_quoter_patch_bootstrap_failed")
 
 try:
     from app.connectors import doppler_long_discovery as _doppler_long_discovery  # noqa: F401
@@ -97,8 +88,6 @@ try:
 except Exception:
     logger.exception("doppler_diagnostics_bootstrap_failed")
 
-# A qualifying SPCX Doppler launch is executed by its dedicated lane,
-# rather than waiting for an unrelated generic rule to match source="doppler".
 try:
     from app.connectors import doppler_execution_bridge as _doppler_execution_bridge  # noqa: F401
 except Exception:
