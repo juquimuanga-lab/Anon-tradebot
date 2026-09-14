@@ -52,6 +52,8 @@ def install() -> None:
     # connectors package may still be initializing.
     doppler_control = importlib.import_module("app.connectors.doppler_control")
     doppler_live = importlib.import_module("app.connectors.doppler_live")
+    admission_patch = importlib.import_module("app.connectors.doppler_spcx_admission_patch")
+    admission_patch.install()
 
     cls = doppler_live.DopplerExecutionAdapter
     if getattr(cls, "_robinhood_quoter_patch_installed", False):
