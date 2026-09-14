@@ -7,6 +7,7 @@ startup, defaulting minHopPriceX36 to zero for the existing buy strategy.
 """
 from __future__ import annotations
 
+import importlib
 import logging
 import threading
 
@@ -46,11 +47,11 @@ QUOTER_ABI = [{
 
 
 def install() -> None:
-    # Import lazily and only after the connector package has finished
-    # initializing. scanners.__init__ imports this module while
-    # app.connectors is still being initialized, so importing doppler_live
-    # synchronously here can still create a circular import.
-    from app.connectors import doppler_control, doppler_live
+    # Import concrete modules rather than relying on app.connectors package
+    # re-exports. This module is imported during scanners bootstrap, while the
+    # connectors package may still be initializing.
+    doppler_control = importlib.import_module("app.connectors.doppler_control")
+    doppler_live = importlib.import_module("app.connectors.doppler_live")
 
     cls = doppler_live.DopplerExecutionAdapter
     if getattr(cls, "_robinhood_quoter_patch_installed", False):
