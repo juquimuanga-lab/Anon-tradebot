@@ -64,18 +64,20 @@ try:
 except Exception:
     logger.exception("preconf_bootstrap_failed")
 
-try:
-    from app.connectors import doppler_direct_lane as _doppler_direct_lane  # noqa: F401
-except Exception:
-    logger.exception("doppler_direct_lane_bootstrap_failed")
-
-# The launch event's numeraire is cross-checked against Doppler initializer
-# state before the direct lane applies the canonical SPCX filter.
+# Normalize the launch numeraire before importing the direct lane. The direct
+# lane installs itself during module import, so this ordering is intentional:
+# it guarantees its poll_new_launches() call sees authoritative initializer
+# state instead of relying on the raw Airlock event numeraire.
 try:
     from app.connectors import doppler_spcx_numeraire_patch as _doppler_spcx_numeraire_patch
     _doppler_spcx_numeraire_patch.install()
 except Exception:
     logger.exception("doppler_spcx_numeraire_patch_bootstrap_failed")
+
+try:
+    from app.connectors import doppler_direct_lane as _doppler_direct_lane  # noqa: F401
+except Exception:
+    logger.exception("doppler_direct_lane_bootstrap_failed")
 
 # Use Uniswap v4 StateView for launch-time pool price/liquidity. This avoids
 # making the sniper depend on a DopplerLens simulated quote during the brief
