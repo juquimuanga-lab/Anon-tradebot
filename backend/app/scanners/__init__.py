@@ -105,3 +105,10 @@ try:
     from app.connectors import doppler_position_patch as _doppler_position_patch  # noqa: F401
 except Exception:
     logger.exception("doppler_position_patch_bootstrap_failed")
+
+# Emit explicit rejection diagnostics after the authoritative admission patch
+# has been loaded. This only observes decisions; it does not alter admission.
+try:
+    from app.connectors import doppler_admission_diagnostics as _doppler_admission_diagnostics  # noqa: F401
+except Exception:
+    logger.exception("doppler_admission_diagnostics_bootstrap_failed")
