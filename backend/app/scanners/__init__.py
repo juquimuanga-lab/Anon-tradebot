@@ -92,3 +92,8 @@ try:
     from app.connectors import doppler_execution_bridge as _doppler_execution_bridge  # noqa: F401
 except Exception:
     logger.exception("doppler_execution_bridge_bootstrap_failed")
+
+try:
+    from app.connectors import doppler_position_patch as _doppler_position_patch  # noqa: F401
+except Exception:
+    logger.exception("doppler_position_patch_bootstrap_failed")
