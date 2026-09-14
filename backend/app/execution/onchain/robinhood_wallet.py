@@ -108,16 +108,36 @@ def resolve_robinhood_rpc_url(settings_obj) -> str:
 
 
 def build_robinhood_web3(rpc_url: str) -> Web3:
-    if not rpc_url:
-        raise RuntimeError("Robinhood Chain RPC is not configured")
-    w3 = Web3(Web3.HTTPProvider(rpc_url, request_kwargs={"timeout": 5}))
-    try:
-        chain_id = int(w3.eth.chain_id)
-    except Exception as exc:
-        raise RuntimeError("could not reach Robinhood Chain RPC") from exc
-    if chain_id != ROBINHOOD_CHAIN_ID:
-        raise RuntimeError(f"wrong chain ID {chain_id}; expected Robinhood Chain {ROBINHOOD_CHAIN_ID}")
-    return w3
+    """Build a Robinhood Web3 client with a safe public-RPC fallback.
+
+    An older Railway environment may still contain a malformed Alchemy URL
+    even after the resolver has been updated. Never let that stale value block
+    the wallet/trading lane: validate it first and fall back to Robinhood's
+    official public mainnet RPC when necessary.
+    """
+    requested = _normalize_rpc_value(rpc_url)
+    candidates = []
+    if requested:
+        candidates.append(requested)
+    if ROBINHOOD_PUBLIC_RPC_URL not in candidates:
+        candidates.append(ROBINHOOD_PUBLIC_RPC_URL)
+
+    last_error = None
+    for candidate in candidates:
+        w3 = Web3(Web3.HTTPProvider(candidate, request_kwargs={"timeout": 8}))
+        try:
+            chain_id = int(w3.eth.chain_id)
+        except Exception as exc:
+            last_error = exc
+            continue
+        if chain_id != ROBINHOOD_CHAIN_ID:
+            last_error = RuntimeError(
+                f"wrong chain ID {chain_id}; expected Robinhood Chain {ROBINHOOD_CHAIN_ID}"
+            )
+            continue
+        return w3
+
+    raise RuntimeError("could not reach Robinhood Chain RPC") from last_error
 
 
 def get_native_balance_eth(rpc_url: str, address: str) -> float:
