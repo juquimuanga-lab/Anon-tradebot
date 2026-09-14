@@ -8,6 +8,7 @@ startup, defaulting minHopPriceX36 to zero for the existing buy strategy.
 from __future__ import annotations
 
 import logging
+import threading
 
 from web3 import Web3
 
@@ -45,9 +46,10 @@ QUOTER_ABI = [{
 
 
 def install() -> None:
-    # Import these lazily. scanners.__init__ imports this patch while the
-    # app.connectors package is still initializing; importing doppler_live at
-    # module scope creates a package-level circular import on cold startup.
+    # Import lazily and only after the connector package has finished
+    # initializing. scanners.__init__ imports this module while
+    # app.connectors is still being initialized, so importing doppler_live
+    # synchronously here can still create a circular import.
     from app.connectors import doppler_control, doppler_live
 
     cls = doppler_live.DopplerExecutionAdapter
@@ -106,15 +108,43 @@ def install() -> None:
                 self._router.functions.execute(commands, inputs, int(time.time()) + 20),
                 0,
             )
-            logger.info("doppler_spcx_buy_confirmed", extra={"mint": token.mint, "tx_signature": tx_hash, "amount_spcx": spend_spcx, "quoted_tokens": expected, "min_tokens": min_out})
+            logger.info(
+                "doppler_spcx_buy_confirmed",
+                extra={
+                    "mint": token.mint,
+                    "tx_signature": tx_hash,
+                    "amount_spcx": spend_spcx,
+                    "quoted_tokens": expected,
+                    "min_tokens": min_out,
+                },
+            )
             return OrderResult(True, "filled", price_usd=float(token.price_usd or 0.0), tx_signature=tx_hash)
         except Exception as exc:
-            logger.warning("doppler_spcx_buy_failed", extra={"mint": token.mint, "error": str(exc)})
+            logger.warning(
+                "doppler_spcx_buy_failed",
+                extra={"mint": token.mint, "error": str(exc)},
+            )
             return OrderResult(False, "failed", error_message=str(exc))
 
     cls.buy = robinhood_buy
     cls._robinhood_quoter_patch_installed = True
-    logger.info("doppler_quoter_patch_installed", extra={"quoter": doppler_live.V4_QUOTER, "min_hop_price_x36": 0})
+    logger.info(
+        "doppler_quoter_patch_installed",
+        extra={"quoter": doppler_live.V4_QUOTER, "min_hop_price_x36": 0},
+    )
 
 
-install()
+def _bootstrap_later() -> None:
+    try:
+        install()
+    except Exception:
+        logger.exception("doppler_quoter_patch_bootstrap_failed")
+
+
+# Do not call install() synchronously. This module is imported from
+# scanners.__init__, which itself participates in the application bootstrap.
+# A short daemon timer moves installation until after package/module imports
+# have settled, matching the runtime-safe bootstrap pattern used elsewhere.
+_timer = threading.Timer(0.5, _bootstrap_later)
+_timer.daemon = True
+_timer.start()
