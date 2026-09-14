@@ -75,6 +75,7 @@ def install() -> None:
         import time
         from app.execution.base import OrderResult
 
+        phase = "start"
         try:
             raw = getattr(token, "raw_enrichment", {}) or {}
             market = raw.get("doppler") or raw.get("pons") or {}
@@ -88,7 +89,10 @@ def install() -> None:
                 raise RuntimeError("DOPPLER_BUY_SIZE_SPCX must be configured to a value greater than zero")
             decimals = int(self._spcx.functions.decimals().call())
             amount_in = max(1, int(spend_spcx * (10 ** decimals)))
+
+            phase = "spcx_preflight"
             await asyncio.to_thread(self._require_spcx_ready, amount_in)
+
             quote_params = {
                 "poolKey": pool_key,
                 "zeroForOne": True,
@@ -96,6 +100,7 @@ def install() -> None:
                 "minHopPriceX36": 0,
                 "hookData": b"",
             }
+            phase = "quoter_call"
             quoted = await asyncio.to_thread(
                 lambda: self._quoter.functions.quoteExactInputSingle(quote_params).call()
             )
@@ -103,14 +108,21 @@ def install() -> None:
             if expected <= 0:
                 raise RuntimeError("Doppler SPCX quoter returned zero tokens")
             min_out = expected * (doppler_live.BPS - self._buy_slippage_bps) // doppler_live.BPS
+
+            phase = "router_calldata"
             v4_input = self._encode_v4_swap(pool_key, amount_in, min_out)
             commands = bytes([0x02, 0x10])
             inputs = [self._encode_permit2_transfer(amount_in), v4_input]
-            tx_hash = await asyncio.to_thread(
-                self._send,
-                self._router.functions.execute(commands, inputs, int(time.time()) + 20),
-                0,
-            )
+            fn = self._router.functions.execute(commands, inputs, int(time.time()) + 20)
+
+            # Simulate the exact router call before signing. This turns opaque
+            # on-chain reverts into actionable diagnostics and prevents a
+            # known-to-revert live transaction from consuming gas.
+            phase = "router_simulation"
+            await asyncio.to_thread(self._simulate_router_call, fn)
+
+            phase = "transaction_send"
+            tx_hash = await asyncio.to_thread(self._send, fn, 0)
             logger.info(
                 "doppler_spcx_buy_confirmed",
                 extra={
@@ -119,15 +131,31 @@ def install() -> None:
                     "amount_spcx": spend_spcx,
                     "quoted_tokens": expected,
                     "min_tokens": min_out,
+                    "execution_phase": phase,
                 },
             )
             return OrderResult(True, "filled", price_usd=float(token.price_usd or 0.0), tx_signature=tx_hash)
         except Exception as exc:
+            # Include the phase in the message itself because the production
+            # log formatter may omit structured `extra` fields.
+            message = f"{phase}: {exc}"
             logger.warning(
-                "doppler_spcx_buy_failed",
-                extra={"mint": token.mint, "error": str(exc)},
+                "doppler_spcx_buy_failed %s",
+                message,
+                extra={"mint": token.mint, "error": str(exc), "execution_phase": phase},
             )
-            return OrderResult(False, "failed", error_message=str(exc))
+            return OrderResult(False, "failed", error_message=message)
+
+    def _simulate_router_call(self, fn):
+        tx = fn.build_transaction({
+            "from": self._account.address,
+            "value": 0,
+            "chainId": doppler_live.CHAIN_ID,
+        })
+        try:
+            self._w3.eth.call(tx)
+        except Exception as exc:
+            raise RuntimeError(f"UniversalRouter eth_call reverted: {exc}") from exc
 
     cls.buy = robinhood_buy
     cls._robinhood_quoter_patch_installed = True
